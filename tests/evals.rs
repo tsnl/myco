@@ -72,9 +72,10 @@ impl Fixture {
             "test".into(),
             "--output".into(),
             self.path("runs"),
-            "--timeout-secs".into(),
-            "5".into(),
         ];
+        if !extra.contains(&"--timeout-secs") {
+            args.extend(["--timeout-secs".into(), "5".into()]);
+        }
         args.extend(extra.iter().map(|value| (*value).into()));
         self.cli(args).await
     }
@@ -87,6 +88,21 @@ impl Fixture {
             }
         }
         results
+    }
+
+    fn run_path(&self) -> PathBuf {
+        std::fs::read_dir(self.root.join("runs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.join("result.json").is_file())
+            .unwrap()
+    }
+    fn events(&self) -> Vec<Value> {
+        std::fs::read_to_string(self.run_path().join("events.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
     }
 }
 impl Drop for Fixture {
@@ -116,6 +132,151 @@ fn report(output: &std::process::Output) -> Value {
     );
     serde_json::from_slice(&output.stdout)
         .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&output.stdout)))
+}
+
+fn git(path: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(["-c", "init.templateDir=", "-C"])
+        .arg(path)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().into()
+}
+
+#[tokio::test]
+async fn git_run_replays_after_moving_artifacts_and_deleting_original_sources() {
+    let fixture = Fixture::new();
+    let source = fixture.root.join("fixture");
+    git(&source, &["init", "--quiet"]);
+    git(&source, &["add", "input.txt"]);
+    git(
+        &source,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "Pinned input",
+        ],
+    );
+    let revision = git(&source, &["rev-parse", "HEAD"]);
+    git(
+        &source,
+        &[
+            "config",
+            "http.extraHeader",
+            "Authorization: LOCAL_CONFIG_SECRET",
+        ],
+    );
+    git(
+        &source,
+        &[
+            "config",
+            "remote.private.url",
+            "https://user:LOCAL_URL_SECRET@example.invalid/private",
+        ],
+    );
+    // The snapshot includes only ancestry of the pinned commit, not later refs.
+    std::fs::write(source.join("unrelated.txt"), "UNRELATED_COMMIT_SECRET").unwrap();
+    git(&source, &["add", "unrelated.txt"]);
+    git(
+        &source,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "Unrelated later commit",
+        ],
+    );
+    let later = git(&source, &["rev-parse", "HEAD"]);
+    let created = fixture
+        .cli(vec![
+            "create".into(),
+            fixture.path("case"),
+            "--task-file".into(),
+            fixture.path("task.txt"),
+            "--repo".into(),
+            fixture.path("fixture"),
+            "--revision".into(),
+            revision.clone(),
+            "--grader".into(),
+            fixture.path("grader.py"),
+        ])
+        .await;
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let mut replies = vec![];
+    for _ in 0..2 {
+        replies.extend([
+            tool(
+                "test -f input.txt && test ! -e unrelated.txt && printf done > result.txt",
+                100,
+                5,
+            ),
+            answer(70, 7),
+        ]);
+    }
+    let server = StubHttpServer::sequence(replies).await;
+    fixture.configure(&server);
+    assert_eq!(
+        report(&fixture.run(&[]).await)["groups"][0]["success_rate"],
+        1.0
+    );
+
+    let moved = fixture.root.join("moved-run");
+    std::fs::rename(fixture.run_path(), &moved).unwrap();
+    std::fs::remove_dir_all(&source).unwrap();
+    std::fs::remove_dir_all(fixture.root.join("case")).unwrap();
+    std::fs::remove_file(fixture.root.join("config.toml")).unwrap();
+    let workspace = moved.join("workspace");
+    assert!(!workspace.join(".git/objects/info/alternates").exists());
+    assert_eq!(git(&workspace, &["rev-parse", "HEAD"]), revision);
+    git(&workspace, &["fsck", "--full"]);
+    assert!(!git(&workspace, &["rev-list", "--all"]).contains(&later));
+    let local_config = std::fs::read_to_string(workspace.join(".git/config")).unwrap();
+    assert!(!local_config.contains("SECRET"));
+    let frozen: Value =
+        serde_json::from_slice(&std::fs::read(moved.join("case/case.json")).unwrap()).unwrap();
+    assert_eq!(frozen["workspace"]["repo"], "source.bundle");
+    let provenance: Value =
+        serde_json::from_slice(&std::fs::read(moved.join("provenance.json")).unwrap()).unwrap();
+    assert_ne!(provenance["case_hash"], provenance["frozen_case_hash"]);
+    myco::eval::load_case(&moved.join("case")).unwrap();
+
+    // Replay supplies a new config; the original auth/environment is not bundled.
+    fixture.configure(&server);
+    let replay = fixture
+        .cli(vec![
+            "run".into(),
+            moved.join("case").to_string_lossy().into_owned(),
+            "--config".into(),
+            fixture.path("config.toml"),
+            "--model".into(),
+            "test".into(),
+            "--output".into(),
+            fixture.path("replayed"),
+            "--timeout-secs".into(),
+            "5".into(),
+        ])
+        .await;
+    assert_eq!(report(&replay)["groups"][0]["success_rate"], 1.0);
+    assert_eq!(server.connections(), 4);
 }
 
 #[tokio::test]
@@ -192,6 +353,176 @@ async fn model_aliases_get_distinct_runs_and_effort_changes_do_not_reuse_scores(
     assert_eq!(changed["groups"].as_array().unwrap().len(), 4);
     assert_eq!(fixture.results().len(), 4);
     assert_eq!(server.connections(), 4);
+}
+
+#[tokio::test]
+async fn runtime_policy_changes_invalidate_cached_results_and_record_effective_settings() {
+    let fixture = Fixture::new();
+    fixture.create().await;
+    let server = StubHttpServer::sequence(vec![answer(10, 1); 3]).await;
+    fixture.configure(&server);
+    let path = fixture.root.join("config.toml");
+    let original = std::fs::read_to_string(&path).unwrap().replace(
+        "auth = { source = \"none\" }",
+        "auth = \"fixture-auth-secret\"",
+    );
+    for settings in [
+        "",
+        "compaction_max_requests = 2\n",
+        "compaction_max_requests = 2\nmax_prelude_bytes = 10000\n",
+    ] {
+        std::fs::write(&path, format!("{settings}{original}")).unwrap();
+        report(&fixture.run(&[]).await);
+    }
+    assert_eq!(fixture.results().len(), 3);
+    assert_eq!(server.connections(), 3);
+    report(&fixture.run(&[]).await);
+    assert_eq!(server.connections(), 3);
+    let provenance = std::fs::read_to_string(fixture.run_path().join("provenance.json")).unwrap();
+    assert!(!provenance.contains("fixture-auth-secret"));
+    let provenance: Value = serde_json::from_str(&provenance).unwrap();
+    assert_eq!(provenance["version"], 1);
+    assert_eq!(provenance["configuration"]["backend"]["effort"], "high");
+    assert_eq!(
+        provenance["configuration"]["model"]["context_window_tokens"],
+        100000
+    );
+    assert!(provenance["configuration"]["runtime"]["compaction_max_requests"].is_u64());
+    assert!(
+        provenance["configuration"]["system_prompt"]
+            .as_str()
+            .unwrap()
+            .contains("current task workspace")
+    );
+    assert!(
+        provenance["configuration"]["tools"]
+            .as_array()
+            .unwrap()
+            .len()
+            > 1
+    );
+    assert_eq!(provenance["artifacts"]["trace"], "events.jsonl");
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(provenance["created_at"].as_str().unwrap()).is_ok()
+    );
+}
+
+#[tokio::test]
+async fn transient_and_broken_stream_recovery_retains_attempts_without_replaying_tools() {
+    let fixture = Fixture::new();
+    fixture.create().await;
+    let partial = json!({"type":"response.output_text.delta", "output_index":0, "content_index":0, "delta":"Abandoned draft"});
+    let body = format!("data: {partial}\n\n");
+    let broken = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len() + 100).into_bytes();
+    let server = StubHttpServer::sequence(vec![
+        tool(
+            "printf done > result.txt; printf once >> effects.txt",
+            100,
+            5,
+        ),
+        StubHttpServer::status_response(503, r#"{"error":{"message":"fixture outage"}}"#),
+        broken,
+        answer(70, 7),
+    ])
+    .await;
+    fixture.configure(&server);
+    let config = fixture.root.join("config.toml");
+    std::fs::write(
+        &config,
+        std::fs::read_to_string(&config).unwrap().replace(
+            "max_attempts = 1",
+            "max_attempts = 3\ninitial_backoff_ms = 1",
+        ),
+    )
+    .unwrap();
+    let result = report(&fixture.run(&[]).await);
+    assert_eq!(
+        result["groups"][0]["success_rate"],
+        1.0,
+        "{:?}",
+        fixture.results()
+    );
+    assert_eq!(result["groups"][0]["requests"], 4);
+    assert_eq!(result["groups"][0]["requests_without_usage"], 2);
+    assert_eq!(server.connections(), 4);
+    assert_eq!(
+        std::fs::read_to_string(fixture.run_path().join("workspace/effects.txt")).unwrap(),
+        "once"
+    );
+    assert_eq!(fixture.results()[0]["agent"]["answer"], "Done.");
+    let events = fixture.events();
+    for (index, event) in events.iter().enumerate() {
+        assert_eq!(event["version"], 1);
+        assert_eq!(event["sequence"], index + 1);
+        assert!(chrono::DateTime::parse_from_rfc3339(event["timestamp"].as_str().unwrap()).is_ok());
+    }
+    assert!(
+        events
+            .windows(2)
+            .all(|pair| pair[0]["elapsed_ms"].as_u64() <= pair[1]["elapsed_ms"].as_u64())
+    );
+    let requests: Vec<_> = events
+        .iter()
+        .filter(|event| event["event"] == "request_finished")
+        .collect();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|event| event["outcome"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["finished", "failed", "failed", "finished"]
+    );
+    for (index, event) in requests.iter().enumerate() {
+        assert_eq!(event["request_id"], index + 1);
+    }
+    let started = events
+        .iter()
+        .find(|event| event["event"] == "tool_started")
+        .unwrap();
+    let finished = events
+        .iter()
+        .find(|event| event["event"] == "tool_finished")
+        .unwrap();
+    assert_eq!(started["call_id"], finished["call_id"]);
+    assert!(started["call_id"].is_string());
+    let failures: Vec<_> = events
+        .iter()
+        .filter(|event| event["event"] == "generation_failed")
+        .collect();
+    assert_eq!(failures.len(), 2);
+    assert!(failures.iter().all(|event| event["retry_in_ms"].is_u64()));
+}
+
+#[tokio::test]
+async fn deadline_cancels_retry_backoff_without_starting_another_request() {
+    let fixture = Fixture::new();
+    fixture.create().await;
+    let server = StubHttpServer::sequence(vec![
+        StubHttpServer::status_response(503, r#"{"error":{"message":"fixture outage"}}"#),
+        answer(70, 7),
+    ])
+    .await;
+    fixture.configure(&server);
+    let config = fixture.root.join("config.toml");
+    std::fs::write(
+        &config,
+        std::fs::read_to_string(&config).unwrap().replace(
+            "max_attempts = 1",
+            "max_attempts = 3\ninitial_backoff_ms = 30000",
+        ),
+    )
+    .unwrap();
+    report(&fixture.run(&["--timeout-secs", "1"]).await);
+    assert_eq!(fixture.results()[0]["status"], "timeout");
+    assert_eq!(server.connections(), 1);
+    let events = fixture.events();
+    let failure = events
+        .iter()
+        .find(|event| event["event"] == "generation_failed")
+        .unwrap();
+    assert_eq!(failure["retry_in_ms"], 30000);
+    assert_eq!(events.last().unwrap()["event"], "run_finished");
+    assert_eq!(events.last().unwrap()["status"], "timeout");
 }
 
 #[tokio::test]
@@ -348,5 +679,58 @@ async fn session_export_ends_at_the_selected_task_and_copies_images_without_muta
             .root
             .join("source-home/profiles/default/images")
             .exists()
+    );
+}
+
+#[tokio::test]
+async fn candidate_image_cap_above_default_reaches_eval_tools_and_provider_input() {
+    let fixture = Fixture::new();
+    let image_path = fixture.root.join("fixture/large.png");
+    let mut bytes = vec![0; 4 * 1024 * 1024]; // 5.3MiB base64: above the default, below this model's cap.
+    bytes[..4].copy_from_slice(b"\x89PNG");
+    std::fs::write(image_path, bytes).unwrap();
+    fixture.create().await;
+    let view = StubHttpServer::sse_response(vec![
+        json!({"type":"response.output_item.added", "output_index":0, "item":{"type":"function_call", "name":"view_image", "call_id":"image", "arguments":""}}),
+        json!({"type":"response.function_call_arguments.done", "output_index":0, "arguments":json!({"path":"large.png"}).to_string()}),
+        json!({"type":"response.completed", "response":{"status":"completed", "usage":{"input_tokens":100,"output_tokens":1}}}),
+    ]);
+    let server = StubHttpServer::sequence(vec![view, answer(200, 2)]).await;
+    fixture.configure(&server);
+    let config = fixture.root.join("config.toml");
+    let text = std::fs::read_to_string(&config).unwrap().replace(
+        "context_window = 100000",
+        "context_window = 100000\nmax_image_base64_bytes = 12582912",
+    );
+    std::fs::write(config, text).unwrap();
+    let output = fixture.run(&["--timeout-secs", "15"]).await;
+    report(&output);
+    assert_eq!(server.connections(), 2);
+    let request = server.captured().await;
+    let view = request.body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "view_image")
+        .unwrap();
+    assert!(
+        view["description"]
+            .as_str()
+            .unwrap()
+            .contains("12582912 bytes")
+    );
+    let agent: Value =
+        serde_json::from_slice(&std::fs::read(fixture.run_path().join("agent.json")).unwrap())
+            .unwrap();
+    let id = agent["session_id"].as_str().unwrap();
+    let path = fixture
+        .run_path()
+        .join("home/profiles/eval/session")
+        .join(&id[..2])
+        .join(format!("{id}.json"));
+    let saved = std::fs::read_to_string(path).unwrap();
+    assert!(
+        saved.contains("myco-image:sha256:"),
+        "view_image did not produce a saved image"
     );
 }

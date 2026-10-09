@@ -42,6 +42,14 @@ works on one thread at a time, and session turns and compaction share a writer g
 the summary, followed by bounded recent context. The predecessor retains its original
 messages and tool output. Title, links, and scratchpad remain attached to the same session.
 
+The recent tail retains up to two complete human turns, at most 64 messages and
+64 KiB of serialized context. Image sidecars count at their resolved base64 size
+without loading their bytes; unavailable or unknown-size images omit that turn.
+A turn that exceeds either bound is represented by the summary, with its original
+history still available through `session_history`. The summary and latest runtime
+inventory are separate from this tail budget. These bounds limit retained history;
+the selected model's context and request-size limits still apply.
+
 Live bash shells and editor read stamps belong to the **session runtime**, shared across
 threads and any replacement agent using that runtime. Compaction does not reset them.
 A recorded tool result remains an observation from its original thread: a shell or file
@@ -55,6 +63,12 @@ fingerprints. Local state is observed directly; connected remote hosts are queri
 a bounded wait. Inventory never connects a lazy remote. Failed queries retain explicitly
 last-known data rather than claiming the host is empty. This is an inventory of tool
 handles, not every OS process or file created by a command.
+
+The model-facing description is limited to 16 KiB across current and prior-runtime
+inventories, with 512-byte quoted previews for commands and errors. Included host,
+tool, handle, and process-instance identifiers remain complete. Omission counts make
+larger inventories explicit; use `bash` with `action="list"` on the configured host
+to inspect its handles. Saved runtime metadata retains the full observations.
 
 A new runtime records which previously observed handles are unavailable here. External
 side effects may survive: inspect them before retrying work, and re-read files before
@@ -119,7 +133,7 @@ The manual is regenerated on startup. The paths below show the default profile.
 | Path | Role |
 |------|------|
 | `~/.ssh/config` | Remote hosts: every concrete `Host` alias (no `*`/`?`/`!` patterns; `Include`s followed) is a remote host of the same name. Local is always on. |
-| `~/.myco/profiles/default/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`attach_timeout_secs`, `max_prelude_bytes`). Override: `$MYCO_CONFIG` or `myco --config`. |
+| `~/.myco/profiles/default/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`attach_timeout_secs`, `host_idle_timeout_secs`, `max_prelude_bytes`). Override: `$MYCO_CONFIG` or `myco --config`. |
 | `~/.myco/profiles/default/session/{shard}/{id}.json` | Ordered threads + shared metadata (title, links, scratchpad), as **minified single-line JSON** — read it via the `session_history` tool or `jq`, not raw `cat`/`grep`. Not shell/file state. Worker runs (e.g. compact) use the same store with a non-user `kind` (hidden in default listings). |
 | `~/.myco/profiles/default/images/{shard}/{sha256}` | Immutable raw image sidecars, shared by all threads and sessions in this profile. Back up this directory together with `session/`. |
 | `~/.myco/profiles/default/session/{shard}/{id}.history` | Legacy readline history, preserved when present. |
@@ -134,6 +148,7 @@ top-level keys must come before the tables, per TOML):
 model = "grok-4.5-build"      # default model key (--model overrides)
 # Per-remote connect timeout in seconds on first tool use (0 disables).
 attach_timeout_secs = 10
+host_idle_timeout_secs = 1800 # 0 disables; retained tools keep workers alive
 # Hard cap on the rendered prelude in every agent system prompt (default 262144):
 # oversized edits are refused, and startup exits against a prelude over it.
 max_prelude_bytes = 262_144
@@ -249,9 +264,19 @@ Per-model fields: `api_id` (wire id, defaults to the key), required
 the name says measured on the uploaded base64 payload — 4/3 of the file on
 disk; default 5 MiB, matching Anthropic's per-image cap). The image cap is enforced locally by
 `view_image` and by browser `@path` attachments, so an oversized image fails with a
-clear message naming both sizes instead of a provider 400. Remote hosts are
-spawned with the selected model's value (`myco --mode host --max-image-base64-bytes`),
-which keeps every host in a session on the same limit.
+clear message naming both sizes instead of a provider 400. Worker startup uses the
+largest cap in the configured model catalog (`myco --mode host --max-image-base64-bytes`).
+Every tool call carries its session's selected model cap; workers enforce the smaller
+of that cap and their startup ceiling. Sessions with different models can share a
+worker, and switching models preserves live shells and editor read stamps. Tool
+descriptions quote the active limit in exact bytes.
+
+Provider input is checked again against the selected model, including older inline
+images and saved image sidecars. Sidecars are checked before reading and read under
+a byte bound. An image retained from a larger model may require compaction, resizing,
+or selecting that model again. Remote image URLs have no locally known payload size;
+the provider validates their content. The whole serialized request remains subject
+to `max_request_bytes`.
 
 `max_request_bytes` on `[gateways.NAME]` caps the **entire serialized JSON
 request body**, including the system prompt, tool schemas, conversation history,
@@ -281,18 +306,26 @@ much it writes would otherwise resume all night; any turn that ends for another
 reason clears the count. Per model because the right ceiling depends on that
 model's `max_output_tokens` versus how much it tends to write.
 **Auto-compaction** is enabled for every configured model through the session runner.
-`auto_compact_at` defaults to `1.0`, the full context window; `0.8` triggers when reported prompt size reaches 80% of
-`context_window`, at a settled boundary between tool rounds or after a normal answer.
-The system prompt tells the agent this
-threshold. The fraction must be greater than 0 and at most 1.
+`auto_compact_at` defaults to `0.8`. The effective threshold is the smaller of
+`floor(context_window * auto_compact_at)` and `context_window - max_output_tokens`.
+The output reservation applies only when the output cap is smaller than the window;
+larger caps retain compatibility with existing small-window configurations. An explicit
+fraction of `1.0` still reserves usable output capacity. Fractions must be greater than
+0 and at most 1. The default 20% headroom allows growth but cannot guarantee that a
+future tool result or response will fit. The system prompt reports the resolved threshold.
 
-The runner also checks saved context before sending a new submission. After a
-model change, it compares the last known prompt size with the selected model's
-threshold. This estimate survives restarts but is kept separate from the new
-model's usage report. Selecting a model or opening a session alone does not
-compact or generate. The newly accepted message is included in any compaction.
-Counts are estimates for a different tokenizer and exclude input added since the
-last report; a fraction below `1.0` leaves more room for growth.
+Before each model request, the runner counts newly accepted input, dynamic prelude
+notices, assistant tool arguments, and completed tool results. It adds estimated growth
+to the last measured input size, or estimates text from scratch when usage is absent.
+The heuristic uses three UTF-8 bytes per token plus message/tool framing; it excludes
+hidden metadata and thinking that providers do not receive. Images, tokenizer differences,
+and provider-owned instructions/schema remain outside this estimate and may require
+request-size recovery. Tracking updates incrementally without serializing the full history.
+
+After restart, saved usage lacks its exact measured prefix, so sizing conservatively
+includes the restored text as well and may compact early. Model changes preserve sizing
+hints separately from reported usage. Selecting a model or opening a session alone does
+not compact or generate. Compaction includes newly accepted input and settled tool results.
 
 It runs the same compaction as `/compact`, creating a successor thread in the
 same session with live tools intact. After success, a `# Resumption` message
@@ -304,16 +337,23 @@ user input and does not restore live tools from a previous process.
 
 Long tool loops can compact repeatedly when the context shrinks then grows again.
 A completed answer triggers at most one compact-and-continue cycle per submission.
-If the next usage report remains above the threshold, automatic compaction is
-disabled until manual compaction succeeds or another session is opened. With
-auto-continue off, a summarization failure also disables automatic compaction;
-other generation failures, cancellation, refusal, and an exhausted truncation
-cap do not start another generation. With auto-continue enabled, generation,
-persistence, and automatic summarization errors retry indefinitely with waits
-of 1–5 seconds. Retries retain live state and any successfully produced summary;
-failed saves are repaired before work advances. Cancellation or disabling
-auto-continue stops retries. Manual `/compact` retains bounded retries and waits
-for the next user input after success.
+An oversized successor estimate suspends automatic compaction until the next
+provider usage report calibrates that estimate.
+
+Compaction with auto-continue off retries transient or malformed model responses
+within the same worker and its shared `compaction_max_requests` budget. Retry waits
+are visible and cancellable; completed writes are not replayed. Exhausting recovery
+stops the run with the original context retained; a later submission or manual
+compaction can try again. Authentication, request-budget, and persistence errors
+stop immediately.
+
+With auto-continue enabled, generation, persistence, and automatic summarization
+errors retain the session's indefinite recovery policy, with waits of 1–5 seconds.
+Retries retain live state and any successfully produced summary; failed saves are
+repaired before work advances. Cancellation or disabling auto-continue stops retries.
+Manual `/compact` retains bounded retries and waits for the next user input after
+success. If the next usage report remains above the threshold, automatic compaction
+is disabled until manual compaction succeeds or another session is opened.
 Compaction workers do not run auto-compaction. Each committed successor retains the
 same live tool owner and the run's usage and truncation accounting.
 
@@ -328,7 +368,9 @@ falls back to removing the rejected submission from active context; the saved
 threads keep the input and completed observations. The session still accepts new
 input. Another size recovery is allowed after a successful model response.
 
-**Retry** is per gateway — what is being tuned is one endpoint's tolerance for
+**Bounded generation retry** applies when session auto-continue is off; explicit
+auto-continue uses the session recovery policy described in `cli`. The retry
+configuration is per gateway — what is being tuned is one endpoint's tolerance for
 blips and its rate-limit behaviour — in a `[gateways.NAME.retry]` table:
 `max_attempts` (default 3, counting the first; `1` disables), `initial_backoff_ms`
 (500), `max_backoff_ms` (30 000), `backoff_multiplier` (2.0). Each unset field
@@ -345,13 +387,54 @@ until it validates. Terminal chat keeps streamed drafts visible, separated by
 retry diagnostics.
 
 A 413 or recognized size rejection goes to the session's context recovery instead
-of retrying the unchanged request. Other 400 and 401 errors, malformed response
-data, and incomplete responses that end without a transport error surface
-immediately. A provider's `Retry-After` is honoured when it asks for longer than
-the computed backoff, still bounded by `max_backoff_ms`. The agent owns retries;
+of retrying the unchanged request. Other 400 and 401 errors surface immediately.
+Malformed response data, including truncated tool JSON and incomplete streams,
+use the same bounded retry budget; no calls from an invalid response execute.
+A provider's `Retry-After` is honoured when it asks for longer than
+the computed backoff. If that minimum exceeds `max_backoff_ms` or the remaining
+recovery budget, automatic retry stops with a limit diagnostic; it never sends
+early by shortening the provider's requested wait. The agent owns retries;
 provider drivers perform one attempt and report failures. The browser shows
 “Retrying” during backoff and a notice with the next attempt and delay. Cancel
 stops the request, including retry waits. Notices are not added to model history.
+
+For longer temporary outages, opt into an elapsed recovery budget in the same
+table and raise its attempt count:
+
+```toml
+[models.my-model.retry]
+max_attempts = 24
+initial_backoff_ms = 1000
+max_backoff_ms = 30000
+max_elapsed_ms = 300000
+```
+
+`max_elapsed_ms` accepts 1–300000 milliseconds (at most five minutes). It starts
+at the first retryable failure of one generation and includes all later waits
+and requests, including partial streams. It does not impose a deadline on the
+original request or the whole task. Exhaustion discards the unvalidated draft
+and stops at the committed conversation boundary. CLI and browser
+retry notices show the remaining budget. Cancel interrupts both waiting and
+streaming. A validated response resets the budget for the next generation;
+earlier completed tool effects are never restarted.
+Malformed drafts use the same finite attempt/time budget. Authentication and
+deterministic request errors still stop immediately.
+
+Errors reported inside an HTTP 200 stream use that same recovery policy. Myco
+retries Anthropic `overloaded_error`, `api_error`, `timeout_error`, and
+`rate_limit_error`, and OpenAI `server_error`, `rate_limit_exceeded`, `slow_down`,
+and `server_is_overloaded` codes. Unknown codes, authentication errors, and
+invalid requests stop immediately; error-message wording never selects retries.
+Anthropic's `rate_limit_error` can also represent a spend cap, so its finite
+recovery budget may expire until account access is restored. Failed draft text
+and tool calls do not enter committed history or execute, even if they arrived
+before the error. A `Retry-After` response header remains a minimum delay.
+
+Without `max_elapsed_ms`, existing attempt/backoff limits apply (three attempts
+by default). Model retry tables replace gateway retry tables, so a model override
+must repeat this field to retain the gateway's elapsed budget. Compaction's
+separate request cap and eval run budgets still apply. These are recovery limits,
+not a spending limit for an entire autonomous task.
 
 **Auth** is per gateway, overridable per model. The `auth` value is either
 the credential itself (`auth = "sk-…"`) or a source table:

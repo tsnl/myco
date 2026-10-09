@@ -150,7 +150,13 @@ fn main() {
     {
         eprintln!("warning: could not organize archived sessions: {error}");
     }
-    tokio::runtime::Builder::new_multi_thread()
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    // A worker multiplexes pipe I/O; allocating one thread per CPU exhausts
+    // shared remote process limits when many sessions touch the same host.
+    if args.mode == Mode::Host {
+        runtime.worker_threads(2);
+    }
+    runtime
         .enable_all()
         .build()
         .expect("create async runtime")
@@ -439,7 +445,7 @@ fn build_model(
     let (epilogue, prelude) = prompts::agent_prompt_epilogue();
     let model = generative_model::new(GenerativeModelConfig {
         model: catalog_model.spec.clone(),
-        tools: harness.tool_specs(),
+        tools: harness.tool_specs_with_image_limit(catalog_model.spec.max_image_base64_bytes),
         system_prompt: [
             SYSTEM_PROMPT_PROLOGUE.to_string(),
             epilogue,
@@ -456,6 +462,7 @@ fn build_model(
     let model = myco::core::image_store::with_images(
         model,
         myco::core::image_store::ImageStore::for_profile()?,
+        catalog_model.spec.max_image_base64_bytes,
     );
     Ok((model, prelude))
 }

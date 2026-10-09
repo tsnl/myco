@@ -33,16 +33,21 @@ and tool results. Live shells and editor read stamps continue through
 compaction, as do the title, links, and scratchpad.
 
 Automatic compaction is enabled for every model. The per-model `auto_compact_at`
-fraction defaults to `1.0`, the full context window; a lower fraction leaves
-more room for growth. The server checks the last known prompt size before a new
-submission, between tool rounds, or after an answer and asks the agent to continue
-after compaction. Switching models preserves a sizing estimate across restarts,
-so the next message can compact before a request to a smaller model. The new
-message is included in compaction; selecting a model alone does not start work.
+fraction defaults to `0.8`. Its resolved threshold also reserves the configured
+output cap when that cap is smaller than the context window. Before each model request,
+the server estimates new input, prelude changes, tool arguments, and settled tool results
+in addition to measured prompt usage. Missing usage falls back to a text estimate.
+Three UTF-8 bytes per token plus framing is a heuristic; images, static provider context,
+and tokenizer differences can still require request-size recovery. Restored usage is
+conservative because its exact input prefix is unavailable, so it may compact early.
+The agent continues after compaction. New input is included; selecting a model alone
+does not start work.
 Long tool loops can compact repeatedly as context grows. A completed answer can
 trigger at most one cycle per submission. Manual compaction and reopening a
-saved session wait for input. Failure or ineffective compaction disables automatic
-threshold compaction until a manual compaction succeeds or another session opens.
+saved session wait for input. An oversized successor estimate suspends automatic
+compaction until the next provider usage report calibrates it. A report still above
+the threshold, or a compaction failure, disables automatic compaction until manual
+compaction succeeds or another session opens.
 
 A request-size rejection (HTTP 413 or the configured request byte cap) also
 compacts and continues automatically, independently of the token threshold. This

@@ -32,6 +32,7 @@ use myco_model::{
 };
 use uuid::Uuid;
 
+mod context_size;
 mod generation;
 mod state;
 pub use state::{
@@ -123,6 +124,8 @@ pub enum AgentEvent {
         attempt: u32,
         max_attempts: u32,
         retry_in: Option<std::time::Duration>,
+        /// Remaining elapsed recovery budget, if configured and recovery started.
+        recovery_remaining: Option<std::time::Duration>,
         context: TraceContext,
     },
     /// Incremental assistant text (for streaming UX).
@@ -223,6 +226,8 @@ pub struct Agent {
     context_window_tokens: u64,
     checkpoint: Option<Checkpoint>,
     before_generation_notice: Option<BeforeGenerationNotice>,
+    prepared_generation: Option<OperationId>,
+    notice_pending_checkpoint: Option<OperationId>,
     checkpoint_failed: AtomicBool,
     /// A failed save must not discard the validated response's commit notification.
     pending_generation_commit: Mutex<Option<TraceContext>>,
@@ -253,6 +258,8 @@ impl Agent {
             context_window_tokens: 200_000,
             checkpoint: None,
             before_generation_notice: None,
+            prepared_generation: None,
+            notice_pending_checkpoint: None,
             checkpoint_failed: AtomicBool::new(false),
             pending_generation_commit: Mutex::new(None),
         }
@@ -374,6 +381,17 @@ impl Agent {
     /// Last observed prompt/context token usage (from the provider), if any.
     pub fn last_usage(&self) -> Option<TokenUsage> {
         self.state.last_usage()
+    }
+
+    /// Approximate current text/tool prompt size, including growth since the
+    /// last measured input. This is not provider-reported usage or a fit guarantee.
+    pub fn context_tokens_estimate(&self) -> u64 {
+        self.state.context_tokens_estimate()
+    }
+
+    /// Preserve an older model's sizing hint when its usage cannot be restored.
+    pub fn restore_context_size_hint(&mut self, tokens: Option<u64>) {
+        self.state.restore_context_size_hint(tokens);
     }
 
     pub fn context(&self) -> &TraceContext {
@@ -504,9 +522,9 @@ impl Agent {
             .ok_or(StateError::UnexpectedCompletion)?;
         let next = match effect {
             Effect::Generate { operation } => {
-                self.state.begin_effect(operation)?;
                 let output = match async {
-                    self.append_pending_notice(operation, &cancel).await?;
+                    self.prepare_generation(cancel.clone()).await?;
+                    self.state.begin_effect(operation)?;
                     generation::generate(self, cancel, policy).await
                 }
                 .await
@@ -547,6 +565,32 @@ impl Agent {
         }
     }
 
+    /// Append and checkpoint dynamic context before a caller sizes the next
+    /// request. Idempotent for this operation; context replacement invalidates it.
+    pub async fn prepare_generation(
+        &mut self,
+        cancel: CancelToken,
+    ) -> Result<(), AgentInteractionError> {
+        let Some(PendingOperation::Generation { operation }) = self.state.pending_operation()
+        else {
+            return Ok(());
+        };
+        if !self.state.can_replace_at_boundary() {
+            return Err(StateError::Busy.into());
+        }
+        if self.prepared_generation == Some(operation) {
+            return Ok(());
+        }
+        self.emit_checkpoint()?;
+        if self.notice_pending_checkpoint != Some(operation) {
+            self.append_pending_notice(operation, &cancel).await?;
+        }
+        self.emit_checkpoint()?;
+        self.notice_pending_checkpoint = None;
+        self.prepared_generation = Some(operation);
+        Ok(())
+    }
+
     async fn append_pending_notice(
         &mut self,
         operation: OperationId,
@@ -562,7 +606,7 @@ impl Agent {
         };
         if let Some(text) = note {
             self.state.append_generation_notice(operation, text)?;
-            self.emit_checkpoint()?;
+            self.notice_pending_checkpoint = Some(operation);
         }
         Ok(())
     }
@@ -683,6 +727,51 @@ mod tests {
 
     #[derive(Default)]
     struct EventLog(Mutex<Vec<AgentEvent>>);
+
+    #[tokio::test]
+    async fn preparing_a_generation_retries_its_notice_checkpoint_without_polling_twice() {
+        let model = ScriptedModel::new(vec![GenerateOutput {
+            content: vec![],
+            tool_uses: vec![],
+            usage: None,
+            turn_end_reason: TurnEndReason::EndTurn,
+        }]);
+        let mut agent = Agent::new(
+            model.clone(),
+            TestTools::new(vec![]),
+            Arc::new(NullEventSink),
+        );
+        agent.append_input(user("task")).unwrap();
+        agent.start_run().unwrap();
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = polls.clone();
+        agent.set_before_generation_notice(Some(Box::new(move |_, _| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Some("new prelude".repeat(1000)) })
+        })));
+        let broken = Arc::new(AtomicBool::new(true));
+        let disk = broken.clone();
+        agent.set_checkpoint(Some(Box::new(move |state| {
+            if disk.load(Ordering::SeqCst) && state.context_tokens_estimate() > 100 {
+                Err("disk full".into())
+            } else {
+                Ok(())
+            }
+        })));
+        assert!(matches!(
+            agent.prepare_generation(CancelToken::new()).await,
+            Err(AgentInteractionError::Checkpoint(_))
+        ));
+        let size = agent.context_tokens_estimate();
+        assert!(size > 3000);
+        assert_eq!(model.remaining(), 1);
+        broken.store(false, Ordering::SeqCst);
+        agent.prepare_generation(CancelToken::new()).await.unwrap();
+        agent.step(CancelToken::new()).await.unwrap();
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert_eq!(model.remaining(), 0);
+        assert_eq!(agent.history().iter().flat_map(Message::content).filter(|part| matches!(part, Content::System { kind, .. } if kind == "generation_notice")).count(), 1);
+    }
 
     #[tokio::test]
     async fn generation_commit_events_require_a_successful_history_checkpoint() {
@@ -1534,6 +1623,10 @@ mod tests {
             usage: None,
         }]);
         let mut agent = Agent::new(model, tools, Arc::new(NullEventSink));
+        agent.set_retry_policy(RetryPolicy {
+            max_attempts: 1,
+            ..Default::default()
+        });
         let err = interact(
             &mut agent,
             vec![Content::Text { text: "hi".into() }],

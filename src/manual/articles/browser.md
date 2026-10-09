@@ -466,9 +466,12 @@ the server uses its default and shows a notice.
 When the threshold is reached, the runner settles pending tools, saves a summary
 in a successor thread, and continues the task automatically. Queued follow-ups
 join that continued context. Manual **Compact** finishes after creating the
-thread and waits for your next message. Failed or ineffective automatic compaction
-shows a warning and disables further attempts until manual compaction or a session
-change; cancellation preserves the source thread.
+thread and waits for your next message. Transient compaction response failures retry
+within the worker's existing request budget, with visible, cancellable waits.
+The source thread and completed tool observations survive. Exhausted retries or
+terminal errors stop the run; a later message can try again.
+An ineffective summary disables further automatic compaction until manual
+compaction or a session change. Cancellation preserves the source thread.
 
 ## Running and resuming
 

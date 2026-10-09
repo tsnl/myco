@@ -924,9 +924,9 @@ context_window = 100000
         expect(page.locator('#input-tokens')).to_have_text('Input 0')
         expect(page.locator('#output-tokens')).to_have_text('Output 0')
 
-    def test_auto_compaction_defaults_to_the_full_context_window(self):
+    def test_auto_compaction_defaults_to_eighty_percent_of_the_context_window(self):
         self.compaction_release.clear()
-        self.usage = {'input_tokens': 100000, 'output_tokens': 20}
+        self.usage = {'input_tokens': 80000, 'output_tokens': 20}
         self.turns['Alpha images'] = 1
         page = self.session(self.page)
         self.submit(page, 'Alpha images')
@@ -985,7 +985,7 @@ context_window = 100000
                     self.process, _ = self.launch(port=urlsplit(self.origin).port)
                 self.compaction_release.clear()
                 self.continuation_release.clear()
-                self.usage = {'input_tokens': 80000, 'output_tokens': 20}
+                self.usage = {'input_tokens': 80000 if automatic else 60000, 'output_tokens': 20}
                 self.turns['Alpha images'] = 1
                 page = self.session(self.page)
                 self.submit(page, 'Alpha images')
@@ -1068,7 +1068,21 @@ context_window = 100000
         self.compaction_release.set()
         expect(page.locator('.assistant .body').last).to_have_text('Alpha finished.')
         expect(page.locator('#model')).to_be_enabled()
-        expect(page.locator('.user .body')).to_contain_text('Image omitted to reduce request size')
+        # The whole oversized turn is outside the bounded successor tail.
+        # Its original image and text remain in the predecessor audit history.
+        session_id = page.url.rsplit('/', 1)[1]
+        saved = self.home / f'profiles/default/session/{session_id[:2]}/{session_id}.json'
+        threads = json.loads(saved.read_text())['threads']
+        self.assertGreaterEqual(len(threads), 2)
+        self.assertIn('Alpha images', json.dumps(threads[0]['messages']))
+        self.assertIn('myco-image:sha256:', json.dumps(threads[0]['messages']))
+        self.assertEqual(threads[-1]['predecessor_id'], threads[-2]['id'])
+        self.assertIn('Continue the browser fixture task.', json.dumps(threads[-1]['messages']))
+        for refreshed in [False, True]:
+            if refreshed:
+                page.reload()
+            expect(page.locator('.user')).to_have_count(0)
+            expect(page.locator('.assistant .body').last).to_have_text('Alpha finished.')
         self.assertTrue(self.requests)
         self.assertTrue(all(not self.image_urls(request) for request in self.requests),
                         'The oversized image request must fail locally before upload')
@@ -3320,6 +3334,13 @@ context_window = 100000
         self.assertEqual(renders, [], 'Returning to the tab uses the rendered snapshot')
 
     def test_26_concurrent_sessions_do_not_replay_unobserved_histories(self):
+        # Keep large-history transport independent of automatic compaction.
+        self.stop(self.process)
+        config = self.home / 'config.toml'
+        config.write_text(config.read_text().replace('context_window = 100000',
+                                                    'context_window = 1000000'))
+        self.process, _ = self.launch(port=urlsplit(self.origin).port)
+        self.page.reload()
         home = self.page
         expect(home.locator('#connection')).to_have_text('Live')
         home.evaluate("""Object.defineProperty(document, 'hidden', {configurable: true, value: true});

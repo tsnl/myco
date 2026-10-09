@@ -23,8 +23,7 @@ extension can be wrong or missing. Anything else (including text files) belongs 
 
 /// Reads image files as [`Content::Image`]. Implements [`ToolService`] (host-placed).
 pub struct ViewImageService {
-    /// Largest image this host will return, from the driving model's
-    /// `max_image_base64_bytes` (see [`crate::host::HostWorker::standard`]).
+    /// Startup ceiling for this worker. Each call may lower it for its model.
     max_image_base64_bytes: u64,
 }
 
@@ -40,12 +39,19 @@ impl ViewImageService {
     pub fn specs(max_image_base64_bytes: u64) -> Vec<generative_model::ToolSpec> {
         vec![generative_model::ToolSpec {
             name: "view_image".to_string(),
-            description: TOOL_DESCRIPTION.replace("{limit}", &mib(max_image_base64_bytes)),
+            description: TOOL_DESCRIPTION.replace(
+                "{limit}",
+                &format!(
+                    "{} bytes ({})",
+                    max_image_base64_bytes,
+                    mib(max_image_base64_bytes)
+                ),
+            ),
             input_schema: super::tool_input_schema::<Input>(),
         }]
     }
 
-    fn execute(&self, input: Input) -> Result<Content, String> {
+    fn execute(&self, input: Input, limit: u64) -> Result<Content, String> {
         let path = input.path.trim();
         if path.is_empty() {
             return Err("view_image requires a non-empty path".to_string());
@@ -60,8 +66,7 @@ impl ViewImageService {
             return Err(format!("'{path}' is not a file"));
         }
 
-        let source =
-            read_image_data_url(&path_buf, &format!("'{path}'"), self.max_image_base64_bytes)?;
+        let source = read_image_data_url(&path_buf, &format!("'{path}'"), limit)?;
         Ok(Content::Image { source })
     }
 }
@@ -74,14 +79,18 @@ impl ToolService for ViewImageService {
     fn dispatch_tool_use(
         self: Arc<Self>,
         tool_use: generative_model::ToolUse,
-        _ctx: HostDispatchContext,
+        ctx: HostDispatchContext,
     ) -> Async<generative_model::ToolResult> {
         Box::pin(async move {
             let input: Input = match serde_json::from_value(tool_use.input) {
                 Ok(v) => v,
                 Err(e) => return ToolResult::err(format!("invalid view_image input: {e}")),
             };
-            match self.execute(input) {
+            let limit = ctx
+                .max_image_base64_bytes
+                .unwrap_or(self.max_image_base64_bytes)
+                .min(self.max_image_base64_bytes);
+            match self.execute(input, limit) {
                 Ok(image) => ToolResult::ok(vec![image]),
                 Err(e) => ToolResult::err(e),
             }
@@ -125,6 +134,7 @@ mod tests {
                     agent_id: uuid::Uuid::nil(),
                     cancel: CancelToken::new(),
                     background: CancelToken::new(),
+                    max_image_base64_bytes: None,
                 },
             ),
         )

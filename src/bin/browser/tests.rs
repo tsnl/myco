@@ -53,10 +53,12 @@ fn retry_discards_only_the_current_generation_and_preserves_output_and_live_tool
         attempt: 1,
         max_attempts: 3,
         retry_in: Some(Duration::from_millis(500)),
+        recovery_remaining: Some(Duration::from_secs(300)),
         context: context.clone(),
     });
     let snapshot = app.snapshot().change["snapshot"].clone();
     assert_eq!(snapshot["status"], "Retrying");
+    assert!(snapshot.to_string().contains("300.0s recovery budget left"));
     assert_eq!(snapshot["blocks"][0]["text"], "completed answer");
     assert_eq!(snapshot["blocks"][1]["text"], "completed continuation");
     assert_eq!(snapshot["blocks"][2]["resource"]["instance_id"], "retained");
@@ -103,6 +105,7 @@ fn automatic_failures_replace_one_diagnostic_without_growing_the_transcript() {
             attempt: 1,
             max_attempts: 1,
             retry_in: None,
+            recovery_remaining: None,
             context: context.clone(),
         });
         app.retrying(error, Duration::from_secs(5));

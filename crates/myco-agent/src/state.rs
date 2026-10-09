@@ -78,6 +78,7 @@ pub enum StateError {
 #[derive(Debug, Clone)]
 pub struct AgentState {
     history: Vec<Message>,
+    context_size: crate::context_size::ContextSize,
     last_usage: Option<TokenUsage>,
     phase: Phase,
     sequence: u64,
@@ -91,6 +92,7 @@ impl Default for AgentState {
     fn default() -> Self {
         Self {
             history: Vec::new(),
+            context_size: Default::default(),
             last_usage: None,
             phase: Phase::Ready,
             sequence: 0,
@@ -109,6 +111,31 @@ impl AgentState {
 
     pub fn last_usage(&self) -> Option<TokenUsage> {
         self.last_usage
+    }
+
+    pub(crate) fn context_tokens_estimate(&self) -> u64 {
+        self.context_size.tokens()
+    }
+
+    pub(crate) fn restore_context_size_hint(&mut self, tokens: Option<u64>) {
+        self.context_size.restore_hint(tokens);
+    }
+
+    fn push(&mut self, message: Message) {
+        self.context_size.append(&message);
+        self.history.push(message);
+    }
+
+    fn replace_history(&mut self, history: Vec<Message>, usage: Option<TokenUsage>) {
+        if (usage.is_none() || usage == self.last_usage) && history.starts_with(&self.history) {
+            for message in &history[self.history.len()..] {
+                self.context_size.append(message);
+            }
+        } else {
+            self.context_size = crate::context_size::ContextSize::restored(&history, usage);
+        }
+        self.history = history;
+        self.last_usage = usage;
     }
 
     pub fn run_usage(&self) -> Option<TokenUsage> {
@@ -209,8 +236,7 @@ impl AgentState {
             return Err(StateError::Busy);
         }
         validate_context(&history)?;
-        self.history = history;
-        self.last_usage = usage;
+        self.replace_history(history, usage);
         self.generate();
         Ok(())
     }
@@ -220,7 +246,8 @@ impl AgentState {
     /// Live intents that never began have known, unexecuted outcomes.
     pub fn recover_interrupted(&mut self) -> Result<(), StateError> {
         if self.executing {
-            self.history = recover_checkpoint(self.history.clone(), self.pending_operation())?;
+            let history = recover_checkpoint(self.history.clone(), self.pending_operation())?;
+            self.replace_history(history, self.last_usage);
         } else if let Phase::Tools {
             operation, count, ..
         } = self.phase
@@ -250,8 +277,7 @@ impl AgentState {
     ) -> Result<(), StateError> {
         self.require_ready()?;
         validate_context(&history)?;
-        self.history = history;
-        self.last_usage = usage;
+        self.replace_history(history, usage);
         self.phase = Phase::Ready;
         Ok(())
     }
@@ -264,7 +290,7 @@ impl AgentState {
             ));
         }
         self.phase = Phase::Ready;
-        self.history.push(message);
+        self.push(message);
         Ok(())
     }
 
@@ -283,7 +309,7 @@ impl AgentState {
                 "runtime observations must be system parts".into(),
             ));
         }
-        self.history.push(Message::UserMessage { content: parts });
+        self.push(Message::UserMessage { content: parts });
         if matches!(self.phase, Phase::Generating(_)) {
             self.generate();
         }
@@ -297,6 +323,7 @@ impl AgentState {
         })?;
         validate_context(prefix)?;
         let dropped = self.history.split_off(index);
+        self.context_size = crate::context_size::ContextSize::restored(&self.history, None);
         self.last_usage = None;
         self.phase = Phase::Ready;
         Ok(dropped)
@@ -364,11 +391,15 @@ impl AgentState {
         // Notices belong to the current input so user-turn indexes and tool
         // call/result pairing remain stable across rewind and compaction.
         match self.history.last_mut() {
-            Some(Message::UserMessage { content }) => content.push(notice),
+            Some(Message::UserMessage { content }) => {
+                self.context_size.append_part(&notice);
+                content.push(notice);
+            }
             Some(Message::ToolResults { tool_use_results }) if !tool_use_results.is_empty() => {
+                self.context_size.append_part(&notice);
                 tool_use_results.last_mut().unwrap().content.push(notice);
             }
-            _ => self.history.push(Message::UserMessage {
+            _ => self.push(Message::UserMessage {
                 content: vec![notice],
             }),
         }
@@ -401,6 +432,7 @@ impl AgentState {
         }
         self.executing = false;
         if let Some(usage) = output.usage {
+            self.context_size.observe_input(usage);
             self.run_usage = Some(TokenUsage {
                 output_tokens: self
                     .run_usage
@@ -413,7 +445,7 @@ impl AgentState {
         let answer = answer_content(&output.content);
         let reason = output.turn_end_reason;
         let calls = output.tool_uses;
-        self.history.push(Message::AssistantMessage {
+        self.push(Message::AssistantMessage {
             content: output.content,
             tool_uses: calls.clone(),
             turn_end_reason: Some(reason.clone()),
@@ -433,7 +465,7 @@ impl AgentState {
         };
         if calls.is_empty() {
             if resume {
-                self.history.push(Message::UserMessage {
+                self.push(Message::UserMessage {
                     content: vec![Content::System {
                         kind: "continuation".into(),
                         text: CONTINUE_PROMPT.into(),
@@ -480,7 +512,7 @@ impl AgentState {
         }
         let next = next.clone();
         self.executing = false;
-        self.history.push(Message::ToolResults {
+        self.push(Message::ToolResults {
             tool_use_results: results,
         });
         if cancelled {
@@ -667,6 +699,41 @@ mod tests {
             validate_context(machine.history()).unwrap();
         }
         assert_eq!(format!("{left:?}"), format!("{right:?}"));
+    }
+
+    #[test]
+    fn context_growth_survives_rebinding_missing_usage_and_model_changes() {
+        let mut machine = state();
+        let op = generation(machine.start().unwrap());
+        machine
+            .generated(op, response(TurnEndReason::EndTurn, 0))
+            .unwrap();
+        let measured = machine.context_tokens_estimate();
+        machine
+            .replace_context(machine.history().to_vec(), machine.last_usage())
+            .unwrap();
+        assert_eq!(machine.context_tokens_estimate(), measured);
+        machine
+            .append_input(Message::UserMessage {
+                content: vec![Content::Text {
+                    text: "x".repeat(3000),
+                }],
+            })
+            .unwrap();
+        let grown = machine.context_tokens_estimate();
+        assert!(grown >= measured + 1000);
+        let op = generation(machine.start().unwrap());
+        let mut unmeasured = response(TurnEndReason::EndTurn, 0);
+        unmeasured.usage = None;
+        machine.generated(op, unmeasured).unwrap();
+        assert!(machine.context_tokens_estimate() > grown);
+        let before_change = machine.context_tokens_estimate();
+        machine
+            .replace_context(machine.history().to_vec(), None)
+            .unwrap();
+        assert_eq!(machine.context_tokens_estimate(), before_change);
+        machine.truncate_history(1).unwrap();
+        assert!(machine.context_tokens_estimate() < measured);
     }
 
     #[test]

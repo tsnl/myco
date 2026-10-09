@@ -90,6 +90,7 @@ fn fast_retry(max_attempts: u32) -> RetryPolicy {
         initial_backoff: std::time::Duration::from_millis(1),
         max_backoff: std::time::Duration::from_millis(5),
         backoff_multiplier: 2.0,
+        max_elapsed: None,
     }
 }
 
@@ -312,7 +313,7 @@ async fn agent_retry_can_be_disabled() {
 }
 
 #[tokio::test]
-async fn agent_does_not_retry_malformed_responses_missing_a_stop_reason() {
+async fn agent_retries_malformed_responses_missing_a_stop_reason() {
     let partial = StubHttpServer::sse_response(vec![serde_json::json!({
         "choices": [{"index": 0, "delta": {"content": "partial"}}]
     })]);
@@ -320,9 +321,14 @@ async fn agent_does_not_retry_malformed_responses_missing_a_stop_reason() {
     let (mut agent, events) = retry_agent(&server.base_url(), fast_retry(3));
     myco::chat::interact(&mut agent, prompt(), myco::CancelToken::new())
         .await
-        .expect_err("missing stop reason");
-    assert_eq!(server.connections(), 1);
-    assert_eq!(agent.history().len(), 1);
+        .expect("retry replaces the response missing its stop reason");
+    assert_eq!(server.connections(), 2);
+    assert_eq!(agent.history().len(), 2);
+    assert!(
+        !serde_json::to_string(agent.history())
+            .unwrap()
+            .contains("partial")
+    );
     let events = events.0.lock().unwrap();
     assert_eq!(
         events
@@ -332,11 +338,13 @@ async fn agent_does_not_retry_malformed_responses_missing_a_stop_reason() {
             .count(),
         1
     );
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, myco::AgentEvent::Failure { retry_in: None, .. }))
-    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        myco::AgentEvent::Failure {
+            retry_in: Some(_),
+            ..
+        }
+    )));
 }
 
 #[tokio::test]

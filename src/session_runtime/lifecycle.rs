@@ -83,34 +83,7 @@ impl RuntimeRecord {
             resources,
             unavailable_after_restart,
         };
-        let mut text = format!(
-            "Runtime {} at {}. {}\nModel: {}.",
-            record.runtime_id,
-            record.observed_at.to_rfc3339(),
-            if record.resumed {
-                "Session resumed; use the current runtime observations below."
-            } else {
-                "Current runtime observations."
-            },
-            serde_json::to_string(&record.model).unwrap()
-        );
-        if let Some(previous) = &record.previous_model {
-            text.push_str(&format!(
-                "\nModel or effort changed from {}.",
-                serde_json::to_string(previous).unwrap()
-            ));
-        }
-        if !same_runtime && record.resumed {
-            text.push_str("\nThis is a new runtime. Saved conversation does not restore bash handles, captured output, or editor read fingerprints. Re-read files before editing. External side effects and background processes may still exist; verify before repeating work.");
-        }
-        describe_resources(&mut text, "Current tool resources", &record.resources);
-        if !record.unavailable_after_restart.is_empty() {
-            describe_resources(
-                &mut text,
-                "Handles from the previous runtime are unavailable here (last recorded inventory)",
-                &record.unavailable_after_restart,
-            );
-        }
+        let text = super::description::describe(&record, !same_runtime);
         Some(Content::System {
             kind: "runtime".into(),
             text,
@@ -119,44 +92,128 @@ impl RuntimeRecord {
     }
 }
 
-fn describe_resources(text: &mut String, label: &str, hosts: &[HostResources]) {
-    text.push_str(&format!("\n{label}:"));
-    for host in hosts {
-        text.push_str(&format!("\n- {}: ", host.host));
-        if let Some(error) = &host.error {
-            text.push_str(&format!(
-                "{error}; any listed resources are last known, not confirmed live. "
-            ));
-        }
-        let Some(resources) = &host.resources else {
-            continue;
-        };
-        if resources.is_empty() {
-            text.push_str("no retained resources");
-        }
-        let editors = resources
-            .iter()
-            .filter(|resource| resource.tool == "str_replace_based_edit_tool")
-            .count();
-        if editors > 0 {
-            text.push_str(&format!("{editors} editor read fingerprints; "));
-        }
-        for resource in resources
-            .iter()
-            .filter(|resource| resource.tool != "str_replace_based_edit_tool")
-        {
-            text.push_str(&format!(
-                "{} handle {:?} {}; ",
-                resource.tool, resource.id, resource.details
-            ));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::ToolResource;
+
+    #[tokio::test(start_paused = true)]
+    async fn an_aging_host_failure_does_not_add_repeated_runtime_records() {
+        let harness = crate::harness::Harness::attach(crate::harness::HarnessConfig {
+            remote_hosts: vec![crate::harness::HostConfig {
+                name: "offline".into(),
+                command: vec!["/missing/myco-host".into()],
+            }],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let owner = Uuid::new_v4();
+        let result = harness
+            .clone()
+            .dispatch_tool_use(
+                crate::generative_model::ToolUse {
+                    name: "bash".into(),
+                    input: serde_json::json!({"host":"offline", "command":"true"}),
+                },
+                owner,
+                crate::core::CancelToken::new(),
+            )
+            .await;
+        assert!(result.is_error);
+        let model = ModelInfo::named("test");
+        let first = RuntimeRecord::observe(
+            &[],
+            owner,
+            model.clone(),
+            harness.resources(owner).await,
+            false,
+        )
+        .unwrap();
+        let history = vec![Message::UserMessage {
+            content: vec![first],
+        }];
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        assert!(
+            RuntimeRecord::observe(
+                &history,
+                owner,
+                model,
+                harness.resources(owner).await,
+                false
+            )
+            .is_none()
+        );
+        assert!(
+            harness
+                .host_status()
+                .iter()
+                .find(|host| host.name == "offline")
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("10s ago")
+        );
+    }
+
+    #[test]
+    fn bounded_descriptions_preserve_complete_inventory_through_outage_and_restart() {
+        let owner = Uuid::new_v4();
+        let model = ModelInfo::named("model");
+        let resources = vec![HostResources {
+            host: "remote".into(),
+            resources: Some(vec![ToolResource {
+                tool: "bash".into(),
+                id: "shell".into(),
+                details: serde_json::json!({"command": "script".repeat(256 * 1024)}),
+            }]),
+            error: None,
+        }];
+        let first =
+            RuntimeRecord::observe(&[], owner, model.clone(), resources.clone(), false).unwrap();
+        let mut history = vec![Message::UserMessage {
+            content: vec![first],
+        }];
+        assert_eq!(
+            RuntimeRecord::latest(&history).unwrap().resources,
+            resources
+        );
+        let missing = vec![HostResources {
+            host: "remote".into(),
+            resources: None,
+            error: Some("offline".into()),
+        }];
+        let outage =
+            RuntimeRecord::observe(&history, owner, model.clone(), missing.clone(), false).unwrap();
+        history.push(Message::UserMessage {
+            content: vec![outage],
+        });
+        let mut last_known = resources;
+        last_known[0].error = Some("offline".into());
+        assert_eq!(
+            RuntimeRecord::latest(&history).unwrap().resources,
+            last_known
+        );
+        let resumed =
+            RuntimeRecord::observe(&history, Uuid::new_v4(), model, missing.clone(), false)
+                .unwrap();
+        history.push(Message::UserMessage {
+            content: vec![resumed],
+        });
+        let record = RuntimeRecord::latest(&history).unwrap();
+        assert_eq!(record.resources, missing);
+        assert_eq!(record.unavailable_after_restart, last_known);
+        for message in history {
+            let Message::UserMessage { content } = message else {
+                unreachable!()
+            };
+            let Content::System { text, .. } = &content[0] else {
+                unreachable!()
+            };
+            assert!(text.len() <= 16 * 1024);
+        }
+    }
 
     #[test]
     fn unavailable_inventory_preserves_last_known_handles_and_restart_never_claims_them() {
