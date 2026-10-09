@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -49,12 +49,12 @@ pub fn load_case(path: &Path) -> Result<Case, String> {
         return Err("case needs a name and grader command".into());
     }
     if let Workspace::Git { repo, revision } = &case.workspace
-        && (!repo.is_absolute()
+        && (!(repo.is_absolute() || safe_relative_path(repo))
             || revision.len() != 40
             || !revision.bytes().all(|c| c.is_ascii_hexdigit()))
     {
         return Err(
-            "git cases require an absolute local repository and a pinned 40-character commit"
+            "git cases require an absolute local repository or a path inside the case, and a pinned 40-character commit"
                 .into(),
         );
     }
@@ -64,6 +64,13 @@ pub fn load_case(path: &Path) -> Result<Case, String> {
         return Err("eval context must end at a real user task, before the answer".into());
     }
     Ok(case)
+}
+
+fn safe_relative_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && path
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
 }
 
 pub fn discover_cases(path: &Path) -> Result<Vec<PathBuf>, String> {
@@ -239,6 +246,7 @@ pub fn create_case(options: CreateOptions) -> Result<PathBuf, String> {
 pub(super) fn git(repo: &Path, arguments: &[&str]) -> Result<String, String> {
     let output = GIT
         .command()
+        .args(["-c", "init.templateDir="])
         .arg("-C")
         .arg(repo)
         .args(arguments)
@@ -281,4 +289,45 @@ pub(super) fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portable_git_recipes_cannot_escape_the_frozen_case() {
+        let temp = crate::test_support::temp_dir("portable-case-path");
+        write_json(
+            &temp.path().join("context.json"),
+            &vec![Message::UserMessage {
+                content: vec![Content::Text {
+                    text: "task".into(),
+                }],
+            }],
+        )
+        .unwrap();
+        for (repo, valid) in [
+            ("source.bundle", true),
+            ("sources/repo.bundle", true),
+            ("../source.bundle", false),
+            ("sources/../../repo", false),
+            (".", false),
+            ("", false),
+        ] {
+            let case = Case {
+                version: 1,
+                name: "portable".into(),
+                split: "test".into(),
+                workspace: Workspace::Git {
+                    repo: repo.into(),
+                    revision: "a".repeat(40),
+                },
+                grader: vec!["grader".into()],
+                source: None,
+            };
+            write_json(&temp.path().join("case.json"), &case).unwrap();
+            assert_eq!(load_case(temp.path()).is_ok(), valid, "{repo}");
+        }
+    }
 }

@@ -76,17 +76,68 @@ fn retry_discards_only_the_current_generation_and_preserves_output_and_live_tool
     );
 }
 
+#[test]
+fn automatic_failures_replace_one_diagnostic_without_growing_the_transcript() {
+    let (app, _) = app();
+    let context = myco::TraceContext::root();
+    app.emit(AgentEvent::TextDelta {
+        text: "committed answer".into(),
+        context: context.clone(),
+    });
+    app.notice("Keep this unrelated notice");
+    app.resources(vec![process_inventory("local", "retained")]);
+    for attempt in 0..300 {
+        app.emit(AgentEvent::GenerationStarted {
+            context: context.clone(),
+        });
+        app.emit(AgentEvent::TextDelta {
+            text: "abandoned draft".into(),
+            context: context.clone(),
+        });
+        let error = format!("failure {attempt}");
+        app.emit(AgentEvent::Failure {
+            failure: myco::generative_model::GenerationFailure::transient(
+                myco::generative_model::GenerateError::ExecutionError(error.clone()),
+                None,
+            ),
+            attempt: 1,
+            max_attempts: 1,
+            retry_in: None,
+            context: context.clone(),
+        });
+        app.retrying(error, Duration::from_secs(5));
+        if attempt == 0 {
+            app.notice("Keep a later unrelated notice too");
+        }
+    }
+    let snapshot = app.snapshot().change["snapshot"].clone();
+    let blocks = snapshot["blocks"].as_array().unwrap();
+    assert_eq!(blocks.len(), 5);
+    assert_eq!(blocks[0]["text"], "committed answer");
+    assert_eq!(blocks[1]["text"], "Keep this unrelated notice");
+    assert_eq!(blocks[2]["resource"]["instance_id"], "retained");
+    assert_eq!(
+        blocks[3]["text"],
+        "failure 299 — auto-continue retrying in 5.0s"
+    );
+    assert_eq!(blocks[4]["text"], "Keep a later unrelated notice too");
+    assert_eq!(snapshot["status"], "Retrying");
+    assert!(!snapshot.to_string().contains("abandoned"));
+}
+
 fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc::Receiver<Work>) {
     let (work, receiver) = mpsc::channel(1);
     let app = Arc::new(App {
         live: Mutex::new(Live {
             generation_start: None,
+            retry_notice: None,
             snapshot: Snapshot {
                 revision: 0,
                 session_id: id.into(),
                 thread_id: "thread".into(),
                 title: "Test".into(),
                 archived: false,
+                auto_continue: false,
                 model: "test".into(),
                 models: vec!["test".into(), "second".into()],
                 attachment_limits: attachments::Limits::new(
@@ -104,6 +155,7 @@ fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc:
             cancel: None,
             background: HashMap::new(),
             accepted: HashMap::new(),
+            service: service::Receipts::default(),
         }),
         events,
         work,
@@ -113,8 +165,8 @@ fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc:
     (app, receiver)
 }
 
-fn server(apps: &[Arc<App>]) -> Arc<Server> {
-    let config = Config::resolve_with(
+fn test_config() -> Config {
+    Config::resolve_with(
         myco::ConfigUserSettings {
             config_path: Some("/unused/config.toml".into()),
             ..Default::default()
@@ -135,10 +187,13 @@ fn server(apps: &[Arc<App>]) -> Arc<Server> {
         || Ok(vec![]),
         |_| unreachable!(),
     )
-    .unwrap();
+    .unwrap()
+}
+
+fn server(apps: &[Arc<App>]) -> Arc<Server> {
     let mut sessions = Sessions::new(
         <Args as clap::Parser>::parse_from(["myco", "--web"]),
-        config,
+        test_config(),
         StartupPreflight::default(),
         vec![],
     );
@@ -459,6 +514,26 @@ fn title_changes_reach_live_metadata_and_invalidate_session_listings() {
     assert_eq!(
         app.snapshot().change["snapshot"]["title"],
         "Renamed while running"
+    );
+}
+
+#[test]
+fn auto_continue_changes_reach_live_clients_while_the_run_is_busy() {
+    let (app, _) = app();
+    let active = ActiveSession::new(Session::new_with_id("test", "session"));
+    active.with_mut(|session| session.auto_continue = true);
+    app.live.lock().unwrap().snapshot.busy = true;
+    let mut updates = app.events.subscribe();
+    app.refresh_metadata(&active);
+    let update = updates.try_recv().unwrap();
+    assert_eq!(update.change["meta"]["auto_continue"], true);
+    assert_eq!(update.change["meta"]["busy"], true);
+    assert_eq!(app.snapshot().change["snapshot"]["auto_continue"], true);
+    active.with_mut(|session| session.auto_continue = false);
+    app.refresh_metadata(&active);
+    assert_eq!(
+        updates.try_recv().unwrap().change["meta"]["auto_continue"],
+        false
     );
 }
 
@@ -1344,4 +1419,103 @@ fn recorded_history_hides_runtime_context_and_preserves_outcomes_and_turn_times(
     assert_eq!(blocks[2]["running"], false);
     assert!(blocks[2].get("elapsed_ms").is_none());
     assert!(blocks[3]["time"].is_null());
+}
+
+struct UnusedModel;
+
+impl myco::generative_model::GenerativeModel for UnusedModel {
+    fn generate(
+        &self,
+        _: &[Message],
+    ) -> myco::generative_model::AsyncStream<myco::generative_model::GenerationEvent> {
+        panic!("settlement must not call a model")
+    }
+}
+
+async fn settlement_boot(app: &Arc<App>) -> Boot {
+    let config = test_config();
+    let mut saved = Session::new("test");
+    saved.id = app.snapshot().session_id;
+    let session = ActiveSession::new(saved);
+    let harness = myco::Harness::local_with_services(vec![]);
+    let runtime = myco::SessionRuntime::new(harness.clone(), session.clone());
+    let agent = myco::Agent::new(Arc::new(UnusedModel), runtime.clone(), app.clone());
+    Boot {
+        catalog_model: config.models.get("test").unwrap().clone(),
+        app_config: config,
+        preflight: StartupPreflight::default(),
+        session,
+        _session_lock: None,
+        harness,
+        runner: myco::chat::SessionRunner::new(agent, runtime)
+            .await
+            .unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn receipt_completion_and_next_admission_share_the_settlement_lock() {
+    for queued in [false, true] {
+        let (app, mut receiver) = app();
+        let boot = settlement_boot(&app).await;
+        let input = crate::service_protocol::Submit {
+            instance: Uuid::new_v4(),
+            request_id: Uuid::new_v4(),
+            text: "first".into(),
+            images: vec![],
+        };
+        app.accept_service(input.clone(), "session".into()).unwrap();
+        receiver.try_recv().unwrap();
+        let followup = action_request();
+        if queued {
+            app.accept(followup.clone()).unwrap();
+        }
+        assert_eq!(app.snapshot().change["snapshot"]["busy"], true);
+        assert_eq!(
+            app.service_output(input.instance, input.request_id, 0)
+                .unwrap()
+                .exit_code,
+            None
+        );
+
+        app.sync_with(&boot, "Ready", |receipts| {
+            receipts.finish(input.request_id, &Ok(()), false);
+            assert!(
+                matches!(
+                    app.live.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ),
+                "receipt completion must hold the same lock as snapshot settlement and admission"
+            );
+        });
+
+        assert_eq!(
+            app.service_output(input.instance, input.request_id, 0)
+                .unwrap()
+                .exit_code,
+            Some(0)
+        );
+        assert_eq!(app.snapshot().change["snapshot"]["busy"], queued);
+        let next = crate::service_protocol::Submit {
+            request_id: Uuid::new_v4(),
+            text: "next".into(),
+            ..input.clone()
+        };
+        if queued {
+            let work = receiver.try_recv().unwrap();
+            assert_eq!(work.request.request_id, followup.request_id);
+            assert!(matches!(
+                app.accept_service(next, "session".into()),
+                Err(Error::Conflict(_))
+            ));
+            app.cancel_service(input.request_id).unwrap();
+            assert!(!work.cancel.is_cancelled());
+        } else {
+            app.accept_service(next.clone(), "session".into()).unwrap();
+            let work = receiver.try_recv().unwrap();
+            assert_eq!(work.request.request_id, next.request_id);
+            app.cancel_service(input.request_id).unwrap();
+            assert!(!work.cancel.is_cancelled());
+        }
+    }
 }

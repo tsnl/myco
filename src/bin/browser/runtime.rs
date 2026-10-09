@@ -25,6 +25,9 @@ use super::view::{self, Block};
 mod queue;
 use queue::{MAX_QUEUED_MESSAGES, QueueUpdate, QueuedMessage};
 
+#[path = "service.rs"]
+mod service;
+
 #[path = "timers.rs"]
 mod timers;
 
@@ -40,6 +43,7 @@ mod timers_tests;
 pub(super) enum Error {
     Invalid(String),
     NotFound(String),
+    Gone(String),
     Conflict(String),
     Unavailable(String),
     Internal(String),
@@ -49,6 +53,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (Self::Invalid(message)
         | Self::NotFound(message)
+        | Self::Gone(message)
         | Self::Conflict(message)
         | Self::Unavailable(message)
         | Self::Internal(message)) = self;
@@ -66,6 +71,7 @@ struct Snapshot {
     thread_id: String,
     title: String,
     archived: bool,
+    auto_continue: bool,
     model: String,
     models: Vec<String>,
     attachment_limits: attachments::Limits,
@@ -84,6 +90,7 @@ impl Snapshot {
         json!({
             "session_id": self.session_id, "thread_id": self.thread_id,
             "title": self.title, "archived": self.archived, "model": self.model,
+            "auto_continue": self.auto_continue,
             "busy": self.busy, "status": self.status, "queued": self.queued, "timers": self.timers,
             "attachment_limits": self.attachment_limits,
             "usage": self.usage, "context_window_tokens": self.context_window_tokens,
@@ -94,10 +101,12 @@ impl Snapshot {
 struct Live {
     // Only message blocks from the current, unvalidated generation are replaceable.
     generation_start: Option<usize>,
+    retry_notice: Option<usize>,
     background: HashMap<Uuid, CancelToken>,
     snapshot: Snapshot,
     cancel: Option<CancelToken>,
     accepted: HashMap<Uuid, ActionRequest>,
+    service: service::Receipts,
 }
 
 #[derive(Clone, Serialize)]
@@ -201,6 +210,15 @@ impl App {
         self.notice(text);
     }
 
+    fn retrying(&self, error: String, delay: Duration) {
+        self.discard_generation();
+        self.status("Retrying");
+        self.retry_notice(format!(
+            "{error} — auto-continue retrying in {:.1}s",
+            delay.as_secs_f64()
+        ));
+    }
+
     fn status(&self, status: &str) {
         let mut live = self.live.lock().unwrap();
         if live.snapshot.status != "Cancelling" && live.snapshot.status != status {
@@ -220,20 +238,47 @@ impl App {
         );
     }
 
+    fn retry_notice(&self, text: String) {
+        let mut live = self.live.lock().unwrap();
+        let block = Block::Notice { text };
+        let index = if let Some(index) = live.retry_notice {
+            live.snapshot.blocks[index] = block.clone();
+            index
+        } else {
+            let index = live.snapshot.blocks.len();
+            live.snapshot.blocks.push(block.clone());
+            live.retry_notice = Some(index);
+            index
+        };
+        self.publish(
+            &mut live.snapshot,
+            json!({"kind":"block", "index":index, "block":block}),
+        );
+    }
+
     fn discard_generation(&self) {
         let mut live = self.live.lock().unwrap();
         let Some(start) = live.generation_start.take() else {
             return;
         };
+        // A finished generation may still need its checkpoint repaired. Its
+        // validated service output must survive until GenerationCommitted.
+        live.service.reset_draft();
         let previous_len = live.snapshot.blocks.len();
         let mut index = 0;
+        let retry_notice = live.retry_notice;
+        let mut removed_before_notice = 0;
         // Resource refreshes may append live tool cards while a draft is streaming.
         live.snapshot.blocks.retain(|block| {
             let keep = index < start
                 || !matches!(block, Block::Message { role, .. } if role == "assistant" || role == "thinking");
+            if !keep && retry_notice.is_some_and(|notice| index < notice) {
+                removed_before_notice += 1;
+            }
             index += 1;
             keep
         });
+        live.retry_notice = retry_notice.map(|index| index - removed_before_notice);
         if live.snapshot.blocks.len() == previous_len {
             return;
         }
@@ -242,10 +287,18 @@ impl App {
     }
 
     fn sync(&self, boot: &Boot, status: &str) {
+        self.sync_with(boot, status, |_| {});
+    }
+
+    fn sync_with(&self, boot: &Boot, status: &str, finish: impl FnOnce(&mut service::Receipts)) {
         let session = boot.session.snapshot();
         let tasks = boot.runner.runtime().running_tool_summaries();
         let mut live = self.live.lock().unwrap();
+        // The receipt and snapshot settle under one lock. A completed native
+        // command cannot expose stale settings or cancel a subsequent turn.
+        finish(&mut live.service);
         live.generation_start = None;
+        live.retry_notice = None;
         let snapshot = &mut live.snapshot;
         let mut blocks = view::history(session.active_thread());
         if snapshot.thread_id == session.active_thread().id {
@@ -259,6 +312,7 @@ impl App {
             .clone()
             .unwrap_or_else(|| "New session".into());
         snapshot.archived = session.archived;
+        snapshot.auto_continue = session.auto_continue;
         snapshot.model = boot.catalog_model.spec.key.clone();
         snapshot.attachment_limits =
             attachments::Limits::new(boot.catalog_model.spec.max_image_base64_bytes);
@@ -283,21 +337,26 @@ impl App {
     }
 
     fn refresh_metadata(&self, session: &ActiveSession) {
-        let (title, archived, usage) = session.with(|session| {
+        let (title, archived, auto_continue, usage) = session.with(|session| {
             (
                 session
                     .title
                     .clone()
                     .unwrap_or_else(|| "New session".into()),
                 session.archived,
+                session.auto_continue,
                 session.active_thread().last_usage,
             )
         });
         let mut live = self.live.lock().unwrap();
         let listing_changed = live.snapshot.title != title || live.snapshot.archived != archived;
-        if listing_changed || live.snapshot.usage != usage {
+        if listing_changed
+            || live.snapshot.usage != usage
+            || live.snapshot.auto_continue != auto_continue
+        {
             live.snapshot.title = title;
             live.snapshot.archived = archived;
+            live.snapshot.auto_continue = auto_continue;
             live.snapshot.usage = usage;
             let change = json!({"kind":"meta", "meta":live.snapshot.metadata()});
             self.publish(&mut live.snapshot, change);
@@ -381,13 +440,21 @@ impl EventSink for App {
             AgentEvent::GenerationStarted { context } if context.depth == 0 => {
                 let mut live = self.live.lock().unwrap();
                 live.generation_start = Some(live.snapshot.blocks.len());
+                live.service.reset_draft();
                 drop(live);
                 self.status("Running");
             }
             AgentEvent::GenerationFinished { context } if context.depth == 0 => {
                 self.live.lock().unwrap().generation_start = None;
             }
+            AgentEvent::GenerationCommitted { context } if context.depth == 0 => {
+                let mut live = self.live.lock().unwrap();
+                if live.service.commit() {
+                    self.cancel_live(&mut live);
+                }
+            }
             AgentEvent::TextDelta { text, context } if context.depth == 0 => {
+                self.live.lock().unwrap().service.text(&text);
                 self.delta("assistant", text)
             }
             AgentEvent::ThinkingDelta { text, context } if context.depth == 0 => {
@@ -456,6 +523,7 @@ impl EventSink for App {
                 max_attempts,
                 context,
             } if context.depth == 0 => {
+                self.live.lock().unwrap().service.reset_draft();
                 let retry = if let Some(delay) = retry_in {
                     self.discard_generation();
                     self.status("Retrying");
@@ -468,7 +536,7 @@ impl EventSink for App {
                 } else {
                     String::new()
                 };
-                self.notice(format!("{}{retry}", failure.cause));
+                self.retry_notice(format!("{}{retry}", failure.cause));
             }
             _ => {}
         }
@@ -495,6 +563,11 @@ enum Action {
     #[serde(skip)]
     Timer {
         message: QueuedMessage,
+    },
+    #[serde(skip)]
+    ServiceSubmit {
+        text: String,
+        images: Vec<String>,
     },
     Compact,
     SelectModel {
@@ -682,6 +755,7 @@ impl Sessions {
                 Arc::new(App {
                     live: Mutex::new(Live {
                         generation_start: None,
+                        retry_notice: None,
                         snapshot: Snapshot {
                             revision: 0,
                             session_id: session.id.clone(),
@@ -691,6 +765,7 @@ impl Sessions {
                                 .clone()
                                 .unwrap_or_else(|| "New session".into()),
                             archived: session.archived,
+                            auto_continue: session.auto_continue,
                             model: config.model.clone(),
                             models: config
                                 .models
@@ -711,6 +786,7 @@ impl Sessions {
                         cancel: None,
                         background: HashMap::new(),
                         accepted: HashMap::new(),
+                        service: service::Receipts::default(),
                     }),
                     events: self.events.clone(),
                     work,
@@ -745,6 +821,7 @@ impl Sessions {
                 observer.finish_compaction();
             }
             WorkflowEvent::Warning(text) => observer.warning(text),
+            WorkflowEvent::Retrying { error, delay } => observer.retrying(error, delay),
             WorkflowEvent::CompactionProgress { .. } => {}
         }));
         let id = boot.session.id();
@@ -785,6 +862,24 @@ impl Sessions {
                 .await
                 .map_err(|e| Error::Internal(format!("browser worker: {e}")))?;
         }
+        Ok(())
+    }
+
+    pub(super) async fn set_auto_continue(&self, id: String, enabled: bool) -> Result<()> {
+        let app = self.open(&id).await?;
+        let id = app.live.lock().unwrap().snapshot.session_id.clone();
+        let running = self.running.lock().await;
+        let session = running
+            .get(&id)
+            .ok_or_else(|| Error::NotFound("Session closed".into()))?
+            .session
+            .clone();
+        let saved = session.clone();
+        tokio::task::spawn_blocking(move || saved.set_auto_continue(enabled))
+            .await
+            .map_err(|error| Error::Internal(error.to_string()))?
+            .map_err(Error::Internal)?;
+        app.refresh_metadata(&session);
         Ok(())
     }
 
@@ -913,6 +1008,8 @@ async fn worker(
             _ = &mut observations => unreachable!("resource observation loop ended"),
             work = receiver.recv() => match work { Some(work) => work, None => break },
         };
+        let request_id = work.request.request_id;
+        let cancel = work.cancel.clone();
         let result = {
             let operation = execute(&mut boot, &app, work, &args);
             tokio::pin!(operation);
@@ -921,7 +1018,11 @@ async fn worker(
                 _ = &mut observations => unreachable!("resource observation loop ended"),
             }
         };
-        app.sync(&boot, if result.is_ok() { "Ready" } else { "Stopped" });
+        app.sync_with(
+            &boot,
+            if result.is_ok() { "Ready" } else { "Stopped" },
+            |receipts| receipts.finish(request_id, &result, cancel.is_cancelled()),
+        );
         if let Err(error) = result {
             app.notice(error);
         }
@@ -953,6 +1054,14 @@ async fn execute(
             Err(error) => Err(error),
             Ok(content) => submit(boot, app, content, work.accepted_at, work.cancel).await,
         },
+        Action::ServiceSubmit { text, images } => {
+            let content = attachments::literal_content(
+                &text,
+                &images,
+                boot.catalog_model.spec.max_image_base64_bytes,
+            )?;
+            submit(boot, app, content, work.accepted_at, work.cancel).await
+        }
         Action::Compact => boot
             .runner
             .compact(work.cancel)
@@ -1040,6 +1149,11 @@ impl App {
         let mut live = self.live.lock().unwrap();
         if self.shutdown.is_cancelled() {
             return Err(Error::Unavailable("The server is stopping.".into()));
+        }
+        if live.service.contains(&request.request_id) {
+            return Err(Error::Conflict(
+                "Request id already used for a native service turn.".into(),
+            ));
         }
         if let Some(accepted) = live.accepted.get(&request.request_id) {
             return if accepted == &request {
@@ -1132,12 +1246,16 @@ impl App {
                 "The request belongs to a different session.".into(),
             ));
         }
+        self.cancel_live(&mut live);
+        Ok(())
+    }
+
+    fn cancel_live(&self, live: &mut Live) {
         if let Some(cancel) = &live.cancel {
             cancel.cancel();
             live.snapshot.status = "Cancelling".into();
         }
         let change = json!({"kind":"meta", "meta":live.snapshot.metadata()});
         self.publish(&mut live.snapshot, change);
-        Ok(())
     }
 }

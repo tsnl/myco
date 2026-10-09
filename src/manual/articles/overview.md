@@ -42,6 +42,14 @@ works on one thread at a time, and session turns and compaction share a writer g
 the summary, followed by bounded recent context. The predecessor retains its original
 messages and tool output. Title, links, and scratchpad remain attached to the same session.
 
+The recent tail retains up to two complete human turns, at most 64 messages and
+64 KiB of serialized context. Image sidecars count at their resolved base64 size
+without loading their bytes; unavailable or unknown-size images omit that turn.
+A turn that exceeds either bound is represented by the summary, with its original
+history still available through `session_history`. The summary and latest runtime
+inventory are separate from this tail budget. These bounds limit retained history;
+the selected model's context and request-size limits still apply.
+
 Live bash shells and editor read stamps belong to the **session runtime**, shared across
 threads and any replacement agent using that runtime. Compaction does not reset them.
 A recorded tool result remains an observation from its original thread: a shell or file
@@ -56,6 +64,12 @@ a bounded wait. Inventory never connects a lazy remote. Failed queries retain ex
 last-known data rather than claiming the host is empty. This is an inventory of tool
 handles, not every OS process or file created by a command.
 
+The model-facing description is limited to 16 KiB across current and prior-runtime
+inventories, with 512-byte quoted previews for commands and errors. Included host,
+tool, handle, and process-instance identifiers remain complete. Omission counts make
+larger inventories explicit; use `bash` with `action="list"` on the configured host
+to inspect its handles. Saved runtime metadata retains the full observations.
+
 A new runtime records which previously observed handles are unavailable here. External
 side effects may survive: inspect them before retrying work, and re-read files before
 editing. Model and effort changes produce a new notice. Compaction and rejected-input
@@ -64,11 +78,16 @@ observations. The session's top-level `model` is its initial catalog key; runtim
 identify the model used afterward. These parts reach the model but are omitted from
 transcript replay, titles, and human acceptance timestamps.
 
-State checkpoints fail closed: a save error stops further model/tool work. An interrupted
-tool batch is recovered with explicit unknown outcomes and a hidden runtime notice, since
-the calls may have taken effect before their results were saved. Inspect external state
-before retrying those actions. Stored histories remain readable for inspection, but
-malformed call/result pairs cannot be used as executable context.
+State checkpoints fail closed: a save error stops further model/tool work. After restoring
+writable storage, submit another message, compact, or select a model to recover the live
+session. Completed tool observations are saved before new work; a tool batch that never
+started is recorded as not executed. Tools are not automatically replayed.
+
+After a restart or an abandoned running tool future, a pending batch has unknown outcomes:
+the calls may have taken effect before their results were saved. A hidden runtime notice
+records the interruption. Inspect external state before retrying those actions. Stored
+histories remain readable for inspection, but malformed call/result pairs cannot be used
+as executable context.
 
 Use `session_history` to read saved threads without loading all of them into context:
 
@@ -77,11 +96,13 @@ Use `session_history` to read saved threads without loading all of them into con
 - `{"session_id":"…","thread_id":"…","action":"expand","index":12}` reads an original message.
 
 Omitting `thread_id` selects the active thread. Older threads are read-only.
-Session files use schema version 5, including archive status, per-user-turn acceptance
+Session files use schema version 6, including archive status, per-user-turn acceptance
 times, and structured system content. System parts carry model-visible runtime context
-without appearing in transcript replay. Formats 2 through 4 are accepted and upgraded
+without appearing in transcript replay. Formats 2 through 5 are accepted and upgraded
 on read; loading alone does not rewrite their files. Older turns keep unknown timestamps.
-Older binaries reject version 5. Existing predecessor/successor session links
+The optional `auto_continue` metadata field defaults to false in older files;
+it survives thread compaction but does not start work when a session loads.
+Binaries that predate schema 6 reject these files. Existing predecessor/successor session links
 remain metadata; separate saved sessions are not automatically combined.
 
 The browser’s Archive and Restore controls change a session's browsing visibility while retaining
@@ -112,7 +133,7 @@ The manual is regenerated on startup. The paths below show the default profile.
 | Path | Role |
 |------|------|
 | `~/.ssh/config` | Remote hosts: every concrete `Host` alias (no `*`/`?`/`!` patterns; `Include`s followed) is a remote host of the same name. Local is always on. |
-| `~/.myco/profiles/default/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`attach_timeout_secs`, `max_prelude_bytes`). Override: `$MYCO_CONFIG` or `myco --config`. |
+| `~/.myco/profiles/default/config.toml` | Model catalog (`[gateways]` / `[models]`, default `model`) + knobs (`attach_timeout_secs`, `host_idle_timeout_secs`, `max_prelude_bytes`). Override: `$MYCO_CONFIG` or `myco --config`. |
 | `~/.myco/profiles/default/session/{shard}/{id}.json` | Ordered threads + shared metadata (title, links, scratchpad), as **minified single-line JSON** — read it via the `session_history` tool or `jq`, not raw `cat`/`grep`. Not shell/file state. Worker runs (e.g. compact) use the same store with a non-user `kind` (hidden in default listings). |
 | `~/.myco/profiles/default/images/{shard}/{sha256}` | Immutable raw image sidecars, shared by all threads and sessions in this profile. Back up this directory together with `session/`. |
 | `~/.myco/profiles/default/session/{shard}/{id}.history` | Legacy readline history, preserved when present. |
@@ -127,6 +148,7 @@ top-level keys must come before the tables, per TOML):
 model = "grok-4.5-build"      # default model key (--model overrides)
 # Per-remote connect timeout in seconds on first tool use (0 disables).
 attach_timeout_secs = 10
+host_idle_timeout_secs = 1800 # 0 disables; retained tools keep workers alive
 # Hard cap on the rendered prelude in every agent system prompt (default 262144):
 # oversized edits are refused, and startup exits against a prelude over it.
 max_prelude_bytes = 262_144
@@ -307,10 +329,16 @@ user input and does not restore live tools from a previous process.
 
 Long tool loops can compact repeatedly when the context shrinks then grows again.
 A completed answer triggers at most one compact-and-continue cycle per submission.
-If the next usage report remains above the threshold, or summarization fails,
-automatic compaction is disabled until manual compaction succeeds or another session
-is opened. Other generation failures, cancellation, refusal, and an exhausted truncation cap
-do not start automatic continuation. Manual `/compact` waits for the next user input.
+If the next usage report remains above the threshold, automatic compaction is
+disabled until manual compaction succeeds or another session is opened. With
+auto-continue off, a summarization failure also disables automatic compaction;
+other generation failures, cancellation, refusal, and an exhausted truncation
+cap do not start another generation. With auto-continue enabled, generation,
+persistence, and automatic summarization errors retry indefinitely with waits
+of 1–5 seconds. Retries retain live state and any successfully produced summary;
+failed saves are repaired before work advances. Cancellation or disabling
+auto-continue stops retries. Manual `/compact` retains bounded retries and waits
+for the next user input after success.
 Compaction workers do not run auto-compaction. Each committed successor retains the
 same live tool owner and the run's usage and truncation accounting.
 

@@ -53,6 +53,9 @@ pub const DEFAULT_MAX_OUTPUT_TOKENS: usize = 8192;
 /// Default per-remote connect timeout (seconds) when the config file sets none.
 pub const DEFAULT_ATTACH_TIMEOUT_SECS: u64 = 10;
 
+/// Idle remotes without retained resources are released after 30 minutes.
+pub const DEFAULT_HOST_IDLE_TIMEOUT_SECS: u64 = 1800;
+
 /// Default model request budget for one compaction, including retries.
 pub const DEFAULT_COMPACTION_MAX_REQUESTS: usize = 64;
 
@@ -214,6 +217,8 @@ impl Config {
             ssh_aliases()?,
             file.attach_timeout_secs
                 .unwrap_or(DEFAULT_ATTACH_TIMEOUT_SECS),
+            file.host_idle_timeout_secs
+                .unwrap_or(DEFAULT_HOST_IDLE_TIMEOUT_SECS),
             models
                 .keys()
                 .into_iter()
@@ -1240,6 +1245,7 @@ context_window = 200_000
                 assert_eq!(p, Path::new("/tmp/h.toml"));
                 let mut file = parse_file_config_str(&model_toml("m", &[]))?;
                 file.attach_timeout_secs = Some(42);
+                file.host_idle_timeout_secs = Some(0);
                 Ok(file)
             },
             || Ok(vec!["devbox".into()]),
@@ -1247,6 +1253,7 @@ context_window = 200_000
         )
         .unwrap();
         assert_eq!(cfg.harness.attach_timeout_secs, 42);
+        assert_eq!(cfg.harness.host_idle_timeout_secs, 0);
         assert_eq!(cfg.harness.remote_hosts.len(), 1);
         assert_eq!(cfg.harness.remote_hosts[0].name, "devbox");
     }
@@ -1298,6 +1305,10 @@ context_window = 200_000
         // not at parse.
         let cfg = resolve_catalog_cfg(&[]);
         assert_eq!(cfg.harness.attach_timeout_secs, DEFAULT_ATTACH_TIMEOUT_SECS);
+        assert_eq!(
+            cfg.harness.host_idle_timeout_secs,
+            DEFAULT_HOST_IDLE_TIMEOUT_SECS
+        );
     }
 
     #[test]

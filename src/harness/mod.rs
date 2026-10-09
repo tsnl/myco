@@ -13,6 +13,7 @@ use crate::core::{Async, CancelToken};
 use crate::generative_model;
 use crate::tool_services::ToolService;
 
+mod command_nudge;
 mod config;
 pub use config::{
     default_ssh_config_path, load_ssh_host_aliases, ssh_config_host_aliases, ssh_spawn_command,
@@ -72,6 +73,8 @@ pub struct HarnessConfig {
     pub remote_hosts: Vec<HostConfig>,
     /// Per-remote connect timeout in seconds on first tool use (`0` disables it).
     pub attach_timeout_secs: u64,
+    /// Reap unused remote connections after this many seconds; 0 disables reaping.
+    pub host_idle_timeout_secs: u64,
     /// Worker ceiling: the largest image cap in the configured model catalog.
     /// Remotes carry it in their spawn argv; local enforces it in-process.
     /// Each session call can lower this ceiling for its active model.
@@ -89,6 +92,7 @@ impl Default for HarnessConfig {
         Self {
             remote_hosts: Vec::new(),
             attach_timeout_secs: 10,
+            host_idle_timeout_secs: 1800,
             max_image_base64_bytes: 5 * 1024 * 1024,
         }
     }
@@ -175,9 +179,10 @@ impl Harness {
             let name = host_cfg.name.clone();
             harness.hosts.insert(
                 name,
-                HostController::with_timeout(
+                HostController::with_timeouts(
                     host_cfg,
                     connect_timeout,
+                    config.host_idle_timeout_secs,
                     config.max_image_base64_bytes,
                 ),
             );
@@ -365,7 +370,22 @@ impl Harness {
                 ));
             };
 
-            client.call_controlled(tool_use, context).await
+            let nudge = (name == "bash")
+                .then(|| {
+                    tool_use
+                        .input
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .flatten()
+                .and_then(|command| command_nudge::command_nudge(command, &self.hosts));
+            let mut result = client.call_controlled(tool_use, context).await;
+            if let Some(text) = nudge {
+                result.content.push(generative_model::Content::Text {
+                    text: format!("\nNudge: {text}\n"),
+                });
+            }
+            result
         })
     }
 
@@ -741,6 +761,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bash_routing_advice_uses_configured_hosts_without_connecting_them() {
+        let harness = Harness::attach(HarnessConfig {
+            remote_hosts: vec![HostConfig {
+                name: "R".into(),
+                command: vec!["/never/spawn".into()],
+            }],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let result = call(
+            &harness,
+            "bash",
+            json!({"command":"false && timeout 120 ssh R pwd"}),
+        )
+        .await;
+        assert!(result_text(&result).contains("host=\"R\""), "{result:?}");
+        assert!(
+            !harness
+                .host_status()
+                .iter()
+                .find(|host| host.name == "R")
+                .unwrap()
+                .connected
+        );
+        let result = call(
+            &harness,
+            "bash",
+            json!({"command":"false && ssh unknown pwd"}),
+        )
+        .await;
+        assert!(!result_text(&result).contains("Nudge:"), "{result:?}");
+    }
+
+    #[tokio::test]
     async fn lazy_connect_failure_on_first_use() {
         let cfg = HarnessConfig {
             attach_timeout_secs: 10,
@@ -757,6 +812,17 @@ mod tests {
         let ghost = status.iter().find(|s| s.name == "ghost").unwrap();
         assert!(!ghost.connected, "{ghost:?}");
         assert!(ghost.error.is_none(), "no error until first use: {ghost:?}");
+        let inventory = harness.resources(uuid::Uuid::nil()).await;
+        assert!(
+            inventory
+                .iter()
+                .find(|host| host.host == "ghost")
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("connects on first tool use")
+        );
 
         let r = call(
             &harness,
@@ -769,6 +835,19 @@ mod tests {
         assert!(
             text.contains("ghost") || text.contains("spawn") || text.contains("No such"),
             "{text}"
+        );
+        assert!(text.contains("retry once"), "{text}");
+        let inventory = harness.resources(uuid::Uuid::nil()).await;
+        let error = inventory
+            .iter()
+            .find(|host| host.host == "ghost")
+            .unwrap()
+            .error
+            .as_ref()
+            .unwrap();
+        assert!(
+            error.contains("last host failure at") && error.contains("retry once"),
+            "{error}"
         );
         let status = harness.host_status();
         let ghost = status.iter().find(|s| s.name == "ghost").unwrap();

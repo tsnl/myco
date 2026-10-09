@@ -35,7 +35,7 @@ pub enum Request {
     /// returning a handle in the original ToolResult. Never cancels the call.
     Background { id: String },
     /// Reap agent-owned host state (bash sessions, …). Fire-and-forget: the
-    /// worker does not reply (host process exit is the hard guarantee).
+    /// worker does not reply. Graceful worker shutdown also releases its handles.
     AgentFinished { agent_id: uuid::Uuid },
 }
 

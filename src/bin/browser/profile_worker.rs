@@ -30,6 +30,7 @@ use super::super::Args;
 #[derive(Deserialize, Serialize)]
 pub(super) struct Ready {
     pub launch_path: String,
+    pub identity: crate::service_protocol::Identity,
 }
 
 struct SocketDirectory(PathBuf);
@@ -96,6 +97,15 @@ impl Worker {
             .map_err(|_| format!("profile {profile} took too long to start"))?
             .map_err(|e| format!("profile {profile} startup: {e}"))?;
         let ready: Ready = serde_json::from_str(&line).map_err(|_| format!("Profile {profile} could not start. Check its config and the server's diagnostic output."))?;
+        ready.identity.validate()?;
+        if ready.identity.profile != profile
+            || Path::new(&ready.identity.workspace)
+                != workspace.canonicalize().map_err(|e| e.to_string())?
+        {
+            return Err(format!(
+                "Profile {profile} reported an unexpected profile or workspace."
+            ));
+        }
         let client = reqwest::Client::builder()
             .unix_socket(socket)
             .no_proxy()

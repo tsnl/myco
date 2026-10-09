@@ -9,9 +9,12 @@ use super::{Args, Boot, boot_session, prepare_boot};
 mod interactive;
 mod output;
 mod print;
+mod service;
+mod service_client;
 
 pub(super) use interactive::run_interactive;
 pub(super) use print::run_print;
+pub(super) use service::run_service;
 
 //
 // Shared session lifecycle
@@ -45,10 +48,17 @@ async fn boot<S: EventSink + 'static>(args: &Args, sink: Arc<S>) -> Result<Boot,
         |_, _, _| sink,
     )
     .await?;
+    if let Some(enabled) = args.auto_continue {
+        boot.session.set_auto_continue(enabled)?;
+    }
     boot.runner.set_observer(Arc::new(|event| match event {
         myco::chat::WorkflowEvent::Compacting { .. } => eprintln!("myco: compacting…"),
         myco::chat::WorkflowEvent::Compacted(_) => eprintln!("myco: compaction complete"),
         myco::chat::WorkflowEvent::Warning(message) => eprintln!("myco: {message}"),
+        myco::chat::WorkflowEvent::Retrying { error, delay } => eprintln!(
+            "myco: auto-continue retrying in {:.1}s: {error}",
+            delay.as_secs_f64()
+        ),
         myco::chat::WorkflowEvent::CompactionProgress { .. } => {}
     }));
     Ok(boot)
