@@ -84,6 +84,14 @@ input. `recover_checkpoint` records unknown outcomes for those calls;
 that need to compact or schedule work at settled boundaries. Myco's
 `SessionRunner` supplies the application persistence and recovery workflow.
 
+After a failed checkpoint, `continue_run` retries the preserved operation without
+repeating completed effects. A new submission, manual compaction, or model change
+instead settles the stopped run before proceeding. `recover_interrupted` knows
+whether a live tool batch began: undispatched calls receive not-executed results;
+dropped in-flight calls receive unknown outcomes. On cold resume, saved intent
+alone cannot establish whether dispatch began, so `recover_checkpoint` remains
+conservative. Every recovery must be saved before further model or tool work.
+
 ## Cancellation and observation
 
 Cancel a clone of `CancelToken` and **await the run future** so cleanup can

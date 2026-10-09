@@ -22,6 +22,7 @@ use crate::session::{ActiveSession, CompactOutcome, Session, Thread};
 use crate::{Config, ConfigUserSettings, Harness, SessionRuntime};
 
 use super::case::copy_tree;
+use super::interventions::{Annotations, ResultIdentity};
 use super::metrics::{Metrics, Recorder};
 use super::{discover_cases, load_case, read_json, write_json};
 
@@ -800,12 +801,22 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
 }
 
 pub fn report(output: &Path, prices: Option<&Path>) -> Result<serde_json::Value, String> {
+    report_with_interventions(output, prices, None)
+}
+
+/// Join explicit observer attestations without modifying run artifacts or machine metrics.
+pub fn report_with_interventions(
+    output: &Path,
+    prices: Option<&Path>,
+    interventions: Option<&Path>,
+) -> Result<serde_json::Value, String> {
+    let interventions = Annotations::load(interventions)?;
+    let mut identities = Vec::new();
     let prices: BTreeMap<String, Prices> = prices.map(read_json).transpose()?.unwrap_or_default();
     for price in prices.values() {
         price.validate()?;
     }
-    let mut groups: BTreeMap<(String, String, String, String, String), Vec<ResultRecord>> =
-        BTreeMap::new();
+    let mut groups: BTreeMap<_, Vec<(ResultRecord, ResultIdentity)>> = BTreeMap::new();
     for entry in std::fs::read_dir(output).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         if entry
@@ -819,7 +830,23 @@ pub fn report(output: &Path, prices: Option<&Path>) -> Result<serde_json::Value,
         if !path.exists() {
             continue;
         }
-        let result: ResultRecord = read_json(&path)?;
+        // Parse and hash the same snapshot, even if another process replaces the file.
+        let bytes =
+            std::fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
+        let result: ResultRecord = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("parse {}: {error}", path.display()))?;
+        let identity = ResultIdentity {
+            fingerprint: result.fingerprint.clone(),
+            result_sha256: sha256(&bytes),
+            result_path: entry
+                .path()
+                .strip_prefix(output)
+                .unwrap()
+                .join("result.json")
+                .to_string_lossy()
+                .into_owned(),
+        };
+        identities.push(identity.clone());
         groups
             .entry((
                 result.cohort_hash.clone(),
@@ -829,20 +856,31 @@ pub fn report(output: &Path, prices: Option<&Path>) -> Result<serde_json::Value,
                 result.split.clone(),
             ))
             .or_default()
-            .push(result);
+            .push((result, identity));
     }
-    let groups: Vec<_> = groups.into_iter().map(|((cohort, model_hash, model, prelude, split), results)| {
+    identities.sort_by(|left, right| {
+        left.fingerprint
+            .cmp(&right.fingerprint)
+            .then(left.result_path.cmp(&right.result_path))
+    });
+    interventions.bind(&identities)?;
+    let groups: Vec<_> = groups.into_iter().map(|((cohort, model_hash, model, prelude, split), loaded)| {
+        let coverage = interventions.coverage(loaded.iter().map(|(_, identity)| identity))?;
+        let results: Vec<_> = loaded.iter().map(|(result, _)| result).collect();
         let count = results.len();
         let successes = results.iter().filter(|result| result.status == "completed" && result.score == Some(1.0)).count();
         let infra = results.iter().filter(|result| ["setup_error", "worker_error", "grader_error", "case_modified"].contains(&result.status.as_str())).count();
         let metrics: Vec<_> = results.iter().filter_map(|result| result.agent.as_ref()).collect();
-        serde_json::json!({
+        Ok::<_, String>(serde_json::json!({
             "cohort_hash": cohort,
             "model_hash": model_hash,
             "model": model,
             "prelude_hash": prelude,
             "split": split,
             "runs": count,
+            "observer_reported_human_interventions": coverage.total,
+            "intervention_annotated_runs": coverage.annotated,
+            "intervention_unannotated_runs": coverage.missing,
             "successes": successes,
             "success_rate": successes as f64 / count as f64,
             "mean_score": results.iter().map(|result| result.score.unwrap_or(0.0)).sum::<f64>() / count as f64,
@@ -858,7 +896,9 @@ pub fn report(output: &Path, prices: Option<&Path>) -> Result<serde_json::Value,
             "requests_without_usage": metrics.iter().map(|result| result.metrics.requests - result.metrics.requests_with_usage).sum::<u64>(),
             "elapsed_ms": metrics.iter().map(|result| result.elapsed_ms).sum::<u128>(),
             "estimated_cost_usd": results.iter().map(|result| cost(result, prices.get(&model))).collect::<Option<Vec<_>>>().map(|costs| costs.iter().sum::<f64>())
-        })
-    }).collect();
-    Ok(serde_json::json!({"version":1, "groups":groups}))
+        }))
+    }).collect::<Result<_, _>>()?;
+    Ok(
+        serde_json::json!({"version":1, "groups":groups, "results":identities, "intervention_annotations":interventions.provenance()}),
+    )
 }

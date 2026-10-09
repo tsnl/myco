@@ -160,6 +160,82 @@ are unknown unless `report --prices prices.json` supplies USD per million tokens
 The estimate separates cached input from total input. Missing request usage
 makes the estimate unknown. Provider billing, cache writes, and non-model
 services can differ; preserve the original token counts alongside estimates.
+The headless runner does not infer human interventions, or whether one was
+needed, from an error, deadline, or cancellation. Reports can separately join
+explicit observer annotations as described below.
+
+## Observer-reported interventions
+
+An experiment observer can supply counts after a run without editing its result,
+trace, session, or machine metrics:
+
+```bash
+myco-eval report /private/results > /private/result-identities.json
+myco-eval report /private/results --interventions /private/interventions.json
+```
+
+The first report's `results` array lists each relative `result_path`, its run
+`fingerprint`, and the SHA-256 of the exact `result.json` bytes. Copy both identity
+fields into a version 1 annotation document. The values below are placeholders:
+
+```json
+{
+  "version": 1,
+  "annotations": [
+    {
+      "fingerprint": "FINGERPRINT_FROM_REPORT",
+      "result_sha256": "RESULT_SHA256_FROM_REPORT",
+      "human_interventions": 0,
+      "observer": "experiment operator",
+      "annotated_at": "2026-10-06T12:00:00Z",
+      "note": "Observed the entire run; no human steering occurred.",
+      "evidence": ["experiment-notes.md#run-1"]
+    }
+  ]
+}
+```
+
+Count deliberate human actions that steer an ongoing evaluated run, such as
+supplying guidance, changing its workspace, or manually cancelling it. Exclude
+initial task setup, passive observation, and subsequent grading. Describe the
+observed actions and any counting assumptions in `note`. An explicit zero asserts
+that the observer knows no such action occurred during the entire run. Omit an
+entry when the count is unknown; never manufacture zero from an absence of
+signals, errors, or intervention records.
+
+Counts must be unsigned integers. Observer and note are required nonempty strings;
+`annotated_at` is the annotation time in RFC 3339 format. Optional `evidence`
+strings name the observer's references and must be nonempty. Myco does not fetch
+or verify those references, authenticate the observer, or establish the truth of
+the assertions. The hash binds an annotation to result bytes; it does not make
+the observer's account a machine measurement. Annotation files must be regular
+files of at most 4 MiB.
+
+Each group's `observer_reported_human_interventions` is the checked sum only when
+**every included result** has an annotation, including failed or cancelled runs.
+Otherwise it is null. `intervention_annotated_runs` and
+`intervention_unannotated_runs` expose coverage independently of the total. Without
+an annotation file, all intervention totals remain unknown. Existing success,
+cost, token, and tool metrics are unaffected; annotations do
+not change grading or optimizer selection.
+
+The report's `intervention_annotations` records the source file's SHA-256 and
+the supplied observer metadata. Report version 1 gains these additive fields;
+saved run formats are unchanged. Keep the report and annotation file with the
+experiment evidence. Reports include supplied notes and references, so review
+them before sharing.
+
+Both fingerprint and result hash must match. Different fresh attempts can share
+a fingerprint; different result hashes identify their separate annotations.
+Duplicate exact identity pairs in results or annotations are rejected, as are
+unknown results, stale or mismatched hashes, unsupported annotation versions,
+unknown fields, and overflowing totals. Even reformatting `result.json` changes
+its hash. Moving a bundle without changing its bytes preserves the binding.
+Annotations for excluded interrupted directories or another report's results
+are unknown entries and must be removed from the supplied annotation document.
+
+## Comparing runs
+
 Use repeated cases, held-out tasks, and your own success floor before selecting
 models for long-running work. The included examples verify the infrastructure;
 they are not a model leaderboard or evidence about long-task reliability.
@@ -194,6 +270,9 @@ optimization score is task quality; costs are measured, not hidden in that score
 
 GEPA checkpoints live in the output directory. Reusing it resumes optimization
 when inputs match; changed tasks/configuration, seed prelude, or binary require a fresh output
-directory. The adapter caps reflection calls separately. Budget exhaustion or
-infrastructure errors stop with diagnostic artifacts; they do not count as an
-improved candidate. See the upstream [adapter interface](https://gepa-ai.github.io/gepa/guides/adapters/).
+directory. The adapter caps reflection calls separately and reserves each attempt
+on disk before launching it. Failed attempts and interruptions consume that allowance,
+even when resuming an older optimizer checkpoint. Existing proposal directories count
+conservatively toward the allowance; keep them and `reflection-budget` when resuming.
+Budget exhaustion or infrastructure errors stop with diagnostic artifacts; they do
+not count as an improved candidate. See the upstream [adapter interface](https://gepa-ai.github.io/gepa/guides/adapters/).

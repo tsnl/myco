@@ -2,6 +2,7 @@
 //! Case inputs and graders are frozen separately from each fresh run workspace.
 
 mod case;
+mod interventions;
 mod metrics;
 mod provenance;
 mod run;
@@ -10,7 +11,7 @@ mod workspace;
 pub use case::{
     Case, CaseSource, CreateOptions, Workspace, create_case, discover_cases, load_case,
 };
-pub use run::{RunOptions, execute_job, report, run};
+pub use run::{RunOptions, execute_job, report, report_with_interventions, run};
 
 use serde::{Serialize, de::DeserializeOwned};
 use std::path::Path;

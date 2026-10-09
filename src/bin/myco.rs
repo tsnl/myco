@@ -16,6 +16,7 @@ use myco::{
 mod browser;
 #[path = "cli/mod.rs"]
 mod cli;
+mod service_protocol;
 
 const SYSTEM_PROMPT_PROLOGUE: &str = r#"
 You are a helpful assistant running in an agentic harness with unfettered computer access.
@@ -32,6 +33,20 @@ struct Args {
     /// with a prompt, piped stdin is prepended as context.
     #[arg(short = 'p', long = "print", value_name = "PROMPT", num_args = 0..=1, conflicts_with_all = ["mode", "port", "bind"])]
     print: Option<Option<String>>,
+    /// Attach one-shot output to an existing service at http://localhost:PORT/profiles/NAME.
+    #[arg(long, value_name = "URL", requires = "resume", conflicts_with_all = ["mode", "port", "bind", "profile", "profile_worker", "model", "config", "effort", "auto_continue", "debug_dump_api_requests"])]
+    server: Option<String>,
+    /// Return after the service accepts the prompt; print a reconnect token to stderr.
+    #[arg(long, requires_all = ["server", "print"], conflicts_with = "observe")]
+    detach: bool,
+    /// Reconnect to a service turn and print its committed output from the beginning.
+    #[arg(
+        long,
+        value_name = "INSTANCE:REQUEST",
+        requires = "server",
+        conflicts_with = "print"
+    )]
+    observe: Option<String>,
     /// Server port (0 chooses a free port).
     #[arg(long, alias = "web", default_value = "8765", num_args = 0..=1, default_missing_value = "8765")]
     port: u16,
@@ -65,6 +80,9 @@ struct Args {
     /// Resume a saved session (id or unique prefix).
     #[arg(long, value_name = "SESSION_ID")]
     resume: Option<String>,
+    /// CLI: keep continuing until the agent disables the mode. Persisted per session.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    auto_continue: Option<bool>,
     /// Reasoning effort (low|medium|high|max).
     #[arg(long, value_parser = parse_effort_arg, default_value = "high")]
     effort: Effort,
@@ -102,12 +120,26 @@ enum Mode {
 
 fn main() {
     let args = Args::parse();
+    if args.auto_continue.is_some() && args.mode != Mode::Cli && args.print.is_none() {
+        eprintln!(
+            "myco: --auto-continue requires --mode cli or -p; use the browser's session control in server mode"
+        );
+        std::process::exit(2);
+    }
     if args.profile_worker.is_none() {
         let _ = dotenvy::dotenv();
     }
     if let Some(topic) = args.help_topic.as_deref() {
         print_launcher_help(topic);
         return;
+    }
+    if args.server.is_some() {
+        let code = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create service client runtime")
+            .block_on(cli::run_service(args));
+        std::process::exit(code.into());
     }
     if let Err(error) = configure_profile(args.profile.as_deref()) {
         eprintln!("myco: {error}");
@@ -352,10 +384,13 @@ async fn boot_session<S: EventSink + 'static>(
         }),
         catalog_model.spec.auto_compact_at_tokens,
     );
-    runner.set_observer(Arc::new(|event| {
-        if let WorkflowEvent::Warning(message) = event {
-            session_warning(&message);
-        }
+    runner.set_observer(Arc::new(|event| match event {
+        WorkflowEvent::Warning(message) => session_warning(&message),
+        WorkflowEvent::Retrying { error, delay } => session_warning(&format!(
+            "auto-continue retrying in {:.1}s: {error}",
+            delay.as_secs_f64()
+        )),
+        _ => {}
     }));
 
     Ok((
@@ -564,5 +599,40 @@ mod tests {
         ] {
             assert!(Args::try_parse_from(std::iter::once("myco").chain(flags)).is_err());
         }
+    }
+    #[test]
+    fn explicit_service_attachment_rejects_local_runtime_overrides() {
+        let base = [
+            "myco",
+            "--server",
+            "http://localhost:8765/profiles/default",
+            "--resume",
+            "id",
+            "-p",
+            "task",
+        ];
+        assert!(Args::try_parse_from(base).is_ok());
+        for flags in [
+            vec!["--profile", "other"],
+            vec!["--model", "other"],
+            vec!["--effort", "low"],
+            vec!["--auto-continue"],
+            vec!["--config", "other.toml"],
+            vec!["--mode", "cli"],
+            vec!["--observe", "token"],
+        ] {
+            assert!(Args::try_parse_from(base.into_iter().chain(flags)).is_err());
+        }
+        assert!(Args::try_parse_from(["myco", "--detach", "-p", "task"]).is_err());
+        assert!(
+            Args::try_parse_from([
+                "myco",
+                "--server",
+                "http://localhost:8765/profiles/default",
+                "-p",
+                "task"
+            ])
+            .is_err()
+        );
     }
 }
