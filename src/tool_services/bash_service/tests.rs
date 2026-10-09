@@ -22,6 +22,319 @@ fn dispatch_ctx(agent_id: uuid::Uuid) -> HostDispatchContext {
 }
 
 #[tokio::test]
+async fn replacing_a_session_during_a_pending_write_preserves_the_new_stdin_and_owner() {
+    let service = Arc::new(BashService::new());
+    let original_owner = Uuid::new_v4();
+    let replacement_owner = Uuid::new_v4();
+    let original = dispatch_json_as(
+        &service,
+        original_owner,
+        json!({
+            "action":"start", "session_id":"reused", "command":"sleep 30",
+            "timeout_ms":100, "idle_ms":10,
+        }),
+    )
+    .await;
+    assert!(!original.is_error, "{original:?}");
+    let original_instance = service.sessions()["reused"].shared.instance_id.clone();
+    let mut pending = service.clone().dispatch_tool_use(
+        tool_use_json(json!({
+            "action":"write", "session_id":"reused", "stdin":"x".repeat(2 * 1024 * 1024),
+            "timeout_ms":100, "idle_ms":10,
+        })),
+        dispatch_ctx(original_owner),
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut pending)
+            .await
+            .is_err()
+    );
+    assert!(lock_unpoisoned(&service.sessions()["reused"].stdin).is_none());
+
+    let closed = dispatch_json_as(
+        &service,
+        original_owner,
+        json!({
+            "action":"close", "session_id":"reused",
+        }),
+    )
+    .await;
+    assert!(!closed.is_error, "{closed:?}");
+    let replacement = dispatch_json_as(
+        &service,
+        replacement_owner,
+        json!({
+            "action":"start", "session_id":"reused", "command":"cat",
+            "timeout_ms":100, "idle_ms":10,
+        }),
+    )
+    .await;
+    assert!(!replacement.is_error, "{replacement:?}");
+    assert_ne!(
+        service.sessions()["reused"].shared.instance_id,
+        original_instance
+    );
+
+    // Complete the old write only after the same name belongs to another process.
+    let finished = tokio::time::timeout(Duration::from_secs(1), pending)
+        .await
+        .unwrap();
+    assert!(
+        finished.is_error,
+        "the closed pipe should fail: {finished:?}"
+    );
+    let written = dispatch_json_as(
+        &service,
+        replacement_owner,
+        json!({
+            "action":"write", "session_id":"reused", "stdin":"replacement still writable\n",
+            "timeout_ms":1000, "idle_ms":10,
+        }),
+    )
+    .await;
+    assert!(
+        !written.is_error,
+        "old write replaced the new stdin: {written:?}"
+    );
+    assert!(result_text(&written).contains("replacement still writable"));
+    let denied = dispatch_json_as(
+        &service,
+        original_owner,
+        json!({
+            "action":"read", "session_id":"reused", "timeout_ms":100, "idle_ms":10,
+        }),
+    )
+    .await;
+    assert!(denied.is_error);
+    assert!(result_text(&denied).contains("owned by another"));
+}
+
+#[tokio::test]
+async fn authorized_operations_do_not_retarget_reused_names_or_delay_owner_cleanup() {
+    let service = Arc::new(BashService::new());
+    let directory = temp_dir("replacement-output");
+    let release = directory.path().join("release");
+    let original_owner = Uuid::new_v4();
+    let replacement_owner = Uuid::new_v4();
+    let started = dispatch_json_as(
+        &service,
+        original_owner,
+        json!({
+            "action":"start", "session_id":"reused", "command":"sleep 30",
+            "timeout_ms":100, "idle_ms":10,
+        }),
+    )
+    .await;
+    assert!(!started.is_error, "{started:?}");
+    // Deschedule the caller immediately after its atomic authorization lookup.
+    let operation = service.operation("reused", original_owner).unwrap();
+    let original_pid = service.sessions()["reused"].process.pid().unwrap();
+    let original_instance = service.sessions()["reused"].shared.instance_id.clone();
+    service.reap_owner(original_owner);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while process_is_running(original_pid) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retained operation postponed process cleanup");
+    let replacement = dispatch_json_as(
+        &service,
+        replacement_owner,
+        json!({
+            "action":"start", "session_id":"reused",
+            "command":format!("while [ ! -f '{}' ]; do sleep 0.01; done; printf 'replacement private output'; cat", release.display()),
+            "timeout_ms":100, "idle_ms":10,
+        }),
+    )
+    .await;
+    assert!(!replacement.is_error, "{replacement:?}");
+    assert!(
+        operation
+            .signal(SignalKind::Term)
+            .unwrap_err()
+            .contains("closed")
+    );
+    let replacement_shared = service.sessions()["reused"].shared.clone();
+    std::fs::write(release, "").unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while lock_unpoisoned(&replacement_shared.buffer)
+            .stdout
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let old = operation
+        .collect(1000, 10, 4096, false, dispatch_ctx(original_owner))
+        .await
+        .unwrap();
+    assert_eq!(old.owner, original_owner);
+    assert_eq!(old.instance_id, original_instance);
+    assert!(!old.format().contains("replacement private output"));
+    let new = dispatch_json_as(
+        &service,
+        replacement_owner,
+        json!({
+            "action":"read", "session_id":"reused", "timeout_ms":100, "idle_ms":10,
+        }),
+    )
+    .await;
+    assert!(result_text(&new).contains("replacement private output"));
+    let writable = dispatch_json_as(
+        &service,
+        replacement_owner,
+        json!({
+            "action":"write", "session_id":"reused", "stdin":"alive after stale signal\n",
+            "timeout_ms":1000, "idle_ms":10,
+        }),
+    )
+    .await;
+    assert!(!writable.is_error, "{writable:?}");
+    assert!(result_text(&writable).contains("alive after stale signal"));
+}
+
+#[tokio::test]
+async fn teardown_stops_descendants_after_the_leader_exits_and_both_pipes_close() {
+    for teardown in ["close", "owner", "service"] {
+        let service = Arc::new(BashService::new());
+        let dir = temp_dir("closed-pipe-descendant");
+        let owner = Uuid::new_v4();
+        let pid_path = dir.path().join("pid");
+        let result = dispatch_json_as(
+            &service,
+            owner,
+            json!({
+                "action":"start", "session_id":"job", "timeout_ms":1000, "idle_ms":10,
+                "command":format!("sleep 30 >/dev/null 2>&1 & echo $! > '{}'", pid_path.display()),
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "{result:?}");
+        let shared = service.sessions()["job"].shared.clone();
+        let leader = service.sessions()["job"].process.pid().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !lock_unpoisoned(&shared.buffer).is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            exited_child_is_waitable(leader),
+            "released the group identity before close"
+        );
+        let pid: u32 = std::fs::read_to_string(pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(process_is_running(pid));
+        match teardown {
+            "close" => {
+                let result = dispatch_json_as(
+                    &service,
+                    owner,
+                    json!({"action":"close", "session_id":"job"}),
+                )
+                .await;
+                assert!(!result.is_error, "{result:?}");
+            }
+            "owner" => service.reap_owner(owner),
+            "service" => drop(service),
+            _ => unreachable!(),
+        }
+        let stopped = tokio::time::timeout(Duration::from_secs(1), async {
+            while process_is_running(pid) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        if !stopped {
+            // This fixture is still sleeping; clean it up before reporting failure.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+        assert!(stopped, "{teardown} left the redirected descendant running");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while exited_child_is_waitable(leader) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("closed handle retained its exited leader");
+    }
+}
+
+fn exited_child_is_waitable(pid: u32) -> bool {
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    // SAFETY: a writable, initialized siginfo_t; observe without reaping.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    result == 0 && unsafe { info.assume_init().si_pid() } == pid as libc::pid_t
+}
+
+fn process_is_running(pid: u32) -> bool {
+    let output = crate::external_command::PS
+        .command()
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .output()
+        .unwrap();
+    let state = String::from_utf8_lossy(&output.stdout);
+    !state.trim().is_empty() && !state.trim().starts_with('Z')
+}
+
+#[tokio::test]
+async fn promoted_exec_cleans_up_redirected_descendants_after_leader_exit() {
+    let service = Arc::new(BashService::new());
+    let dir = temp_dir("promoted-closed-pipe-descendant");
+    let ctx = dispatch_ctx(Uuid::new_v4());
+    ctx.background.cancel();
+    let result = service.clone().dispatch_tool_use(tool_use_json(json!({
+        "command":format!("while [ ! -f '{0}/release' ]; do sleep 0.01; done; sleep 30 >/dev/null 2>&1 & echo $! > '{0}/pid'", dir.path().display()),
+    })), ctx).await;
+    assert_eq!(result.status.as_deref(), Some("backgrounded"));
+    let shared = service.sessions().values().next().unwrap().shared.clone();
+    std::fs::write(dir.path().join("release"), "").unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !lock_unpoisoned(&shared.buffer).is_finished() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pid: u32 = std::fs::read_to_string(dir.path().join("pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(process_is_running(pid));
+    drop(service);
+    let stopped = tokio::time::timeout(Duration::from_secs(1), async {
+        while process_is_running(pid) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    if !stopped {
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    }
+    assert!(
+        stopped,
+        "promoted exec left its redirected descendant running"
+    );
+}
+
+#[tokio::test]
 async fn background_exec_retains_output_owner_and_process_after_turn_cancellation() {
     let service = Arc::new(BashService::new());
     let dir = temp_dir("background-exec");
@@ -839,7 +1152,10 @@ async fn background_output_keeps_a_session_visible_after_its_shell_exits() {
             .await
             .unwrap()
     };
-    kill_session_process(service.sessions().get(&id).unwrap());
+    service.sessions()[&id]
+        .process
+        .signal(libc::SIGKILL)
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while lock_unpoisoned(&shared.buffer).eof_streams < 2 {
             tokio::task::yield_now().await;
