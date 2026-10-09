@@ -97,6 +97,9 @@ its glass background continues below the viewport during native scroll bounce.
 The top bar stays fixed, with its glass extending above the viewport to keep
 both scroll limits covered. Native conversation scrolling and bounce remain
 enabled.
+The input bar aligns with tool cards. Colored state borders stay solid and two
+pixels wide; matching shadows lift those panels from the glass. Activity
+animations add light without dimming the base border.
 Floating controls use background blur. The conversation well is the lightest
 surface; the input bar and top banner share darker translucent glass, with
 dialogs darkest in front. Translucent clouds drift slowly in three

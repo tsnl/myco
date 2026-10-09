@@ -7,6 +7,7 @@
   --dim: #cfcfcf; --cyan: #8bd5dc; --green: #a6da95; --amber: #e5c890; --red: #ed8796;
   --line: #e5e5e526; --composer-height: 180px; --toolbar-height: 65px;
   --composer-bottom: max(16px, env(safe-area-inset-bottom));
+  --content-gutter: 32px;
   --glass-tint: 12 20 35;
   --glass-control: rgb(var(--glass-tint) / .36);
   --glass-well: rgb(var(--glass-tint) / .58);
@@ -56,8 +57,8 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .toolbar button { min-height: 36px; padding: 5px 9px; font-size: 13px; white-space: nowrap; }
 .toolbar-tools button { border-color: var(--glass-border); background: var(--glass-control); color: var(--dim); }
 .toolbar-tools button:hover:not(:disabled), .toolbar-tools button[aria-expanded="true"] { color: #e6e6e6; border-color: var(--dim); background: rgb(var(--glass-tint) / .6); }
-.toolbar #new-session { color: var(--green); border-color: #a6da9538; background: #a6da950b; }
-.toolbar #new-session:hover { border-color: #a6da9570; background: #a6da9517; }
+.toolbar #new-session { --rim-color: var(--green); color: var(--green); border: 2px solid var(--rim-color); background: #a6da950b; }
+.toolbar #new-session:hover { background: #a6da9517; }
 #session-browser { max-width: 980px; margin: 0 auto; padding: 40px 32px; }
 #session-browser label { display: block; font-weight: 700; color: var(--cyan); margin-bottom: 8px; }
 #search { width: 100%; border: 1px solid var(--line); border-radius: 0; background: var(--glass-control); padding: 10px 12px; }
@@ -87,12 +88,12 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 @keyframes activity-pulse { 50% { opacity: .35; } }
 @media (prefers-reduced-motion: reduce) { .activity-indicator[data-active="true"]::before { animation: none; } }
 #connection { flex: none; font-size: 12px; }
-#transcript { max-width: 980px; margin: 0 auto; padding: 40px 32px calc(var(--composer-height) + 65px); overflow-wrap: anywhere; }
+#transcript { max-width: 980px; margin: 0 auto; padding: 40px var(--content-gutter) calc(var(--composer-height) + 65px); overflow-wrap: anywhere; }
 .welcome { color: var(--dim); padding: 25px 0; }
 .welcome h1 { color: var(--green); font: inherit; font-weight: 700; }
 .message { margin: 0 0 30px; }
 .message.user { scroll-margin-top: calc(var(--toolbar-height) + 16px); }
-.message.user[aria-current="true"] { outline: 1px solid var(--cyan); outline-offset: 8px; background: rgb(var(--sky-light, 139 213 220) / .08); box-shadow: 0 0 0 8px rgb(var(--sky-light, 139 213 220) / .08); }
+.message.user[aria-current="true"] { outline: 2px solid var(--cyan); outline-offset: 8px; background: rgb(var(--sky-light, 139 213 220) / .08); box-shadow: 0 0 0 8px rgb(var(--sky-light, 139 213 220) / .08), 0 0 16px color-mix(in srgb, var(--cyan) 35%, transparent); }
 .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
 .message-header { padding-top: 16px; margin-bottom: 14px; border-top: 1px solid var(--line); }
 .role { display: block; color: var(--green); font-weight: 700; }
@@ -137,13 +138,17 @@ html.viewing-image { overflow: hidden; }
 #image-viewer .image-viewer-image { flex: none; width: auto; height: auto; max-width: 100%; max-height: 100%; margin: 0; object-position: center; }
 .image-viewer-close { position: absolute; top: max(12px, env(safe-area-inset-top)); right: max(12px, env(safe-area-inset-right)); min-width: 40px; min-height: 40px; padding: 0; font-size: 24px; background: var(--glass-raised); }
 #image-viewer [role="status"] { color: var(--dim); }
-.tool { position: relative; --tool-color: var(--dim); border: 1px solid var(--tool-color); border-radius: 0; background: rgb(var(--glass-tint) / .28); margin: 15px 0 22px; }
-.tool.running { --tool-color: rgb(var(--sky-light, 139 213 220)); border-color: rgb(var(--sky-light, 139 213 220) / .3); }
-/* Animate only the decorative rim, keeping output and glass steady. */
+.tool { position: relative; --tool-color: var(--dim); --rim-color: var(--tool-color); border: 2px solid var(--tool-color); border-radius: 0; background: rgb(var(--glass-tint) / .28); margin: 15px 0 22px; }
+.tool.running { --tool-color: var(--cyan); }
+:is(.tool, .active-call, .active-timer, .toolbar #new-session, .attachment.invalid, #jump) {
+  --rim-shadow: 0 0 3px color-mix(in srgb, var(--rim-color) 45%, transparent),
+    0 0 15px color-mix(in srgb, var(--rim-color) 20%, transparent), 0 8px 24px #00000040;
+  box-shadow: var(--rim-shadow);
+}
+/* Only the extra light pulses; the solid state border stays visible. */
 .tool.running::after, .active-call::after, .active-timer::after {
-  content: ''; position: absolute; inset: -1px; pointer-events: none;
-  border: 1px solid rgb(var(--sky-light, 139 213 220));
-  box-shadow: 0 0 3px rgb(var(--sky-light, 139 213 220) / .3), 0 0 15px rgb(var(--sky-light, 139 213 220) / .13);
+  content: ''; position: absolute; inset: -2px; pointer-events: none;
+  box-shadow: var(--rim-shadow);
   animation: running-border 2.4s ease-in-out infinite;
 }
 @keyframes running-border { 50% { opacity: .2; } }
@@ -174,8 +179,8 @@ html.viewing-image { overflow: hidden; }
 .thinking :is(a, code, blockquote) { color: inherit; }
 .thinking .body { margin-top: 10px; }
 .notice { color: var(--red); padding: 10px 0; white-space: pre-wrap; }
-.composer-frame { position: fixed; z-index: 3; bottom: var(--composer-bottom); left: 50%; transform: translateX(-50%); width: min(932px, calc(100% - 32px)); --composer-emission: rgb(var(--sky-light, 139 213 220)); }
-.composer { position: relative; max-height: calc(100dvh - var(--toolbar-height) - 24px); overflow-y: auto; padding: 16px 20px 14px; border: 1px solid var(--glass-border); border-radius: 0; background: var(--glass-composer); box-shadow: var(--glass-shadow), inset 0 1px #ffffff08; backdrop-filter: var(--glass-filter); }
+.composer-frame { position: fixed; z-index: 3; bottom: var(--composer-bottom); left: 50%; transform: translateX(-50%); width: calc(min(980px, 100%) - 2 * var(--content-gutter) - 2px); --composer-color: var(--cyan); --composer-emission: rgb(var(--sky-light, 139 213 220)); }
+.composer { position: relative; max-height: calc(100dvh - var(--toolbar-height) - 24px); overflow-y: auto; padding: 16px 20px 14px; border: 2px solid var(--glass-border); border-radius: 0; background: var(--glass-composer); box-shadow: var(--glass-shadow), inset 0 1px #ffffff08; backdrop-filter: var(--glass-filter); }
 .composer:focus-within { border-color: #8a8a8a; }
 /* Keep emitted light outside the scrolling glass. Filtering the glass itself
    would isolate its backdrop and flatten its translucency. */
@@ -187,15 +192,15 @@ html.viewing-image { overflow: hidden; }
     drop-shadow(0 10px 28px color-mix(in srgb, var(--composer-emission) 35%, transparent));
 }
 .composer-light-ring {
-  position: absolute; inset: 0; padding: 1px; overflow: hidden;
+  position: absolute; inset: 0; padding: 2px; overflow: hidden;
   mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
   mask-composite: exclude;
 }
 .composer-light-ring::before { content: ''; position: absolute; inset: 0; background: var(--composer-emission); }
-.composer-frame:not([data-state="ready"]) .composer { border-color: color-mix(in srgb, var(--composer-emission) 45%, transparent); }
+.composer-frame:not([data-state="ready"]) .composer { border-color: var(--composer-color); box-shadow: 0 0 3px color-mix(in srgb, var(--composer-color) 45%, transparent), 0 0 15px color-mix(in srgb, var(--composer-color) 20%, transparent), var(--glass-shadow); }
 .composer-frame:not([data-state="ready"]) .composer-light { opacity: 1; }
-.composer-frame[data-state="stopped"] { --composer-emission: var(--red); }
-.composer-frame:is([data-state="reconnecting"], [data-state="cancelling"]) { --composer-emission: var(--amber); }
+.composer-frame[data-state="stopped"] { --composer-color: var(--red); --composer-emission: var(--red); }
+.composer-frame:is([data-state="reconnecting"], [data-state="cancelling"]) { --composer-color: var(--amber); --composer-emission: var(--amber); }
 .composer-frame[data-state="running"] .composer-light-ring::before {
   /* Rotate a fixed texture behind the border mask. Repainting a gradient angle
      would also rerasterize the glow on every frame. The square covers the
@@ -232,8 +237,8 @@ html.viewing-image { overflow: hidden; }
 #activity-empty { color: var(--dim); }
 .activity-section ul { margin: 12px 0 0; padding-left: 1.5em; color: var(--cyan); }
 .activity-section li { overflow-wrap: anywhere; margin-bottom: 10px; }
-.active-call { position: relative; display: block; width: 100%; text-align: left; border: 1px solid var(--line); background: var(--glass-control); color: inherit; padding: 10px 12px; white-space: normal; overflow-wrap: anywhere; }
-.active-call:hover { text-decoration: underline; }
+.active-call { position: relative; --rim-color: var(--cyan); display: block; width: 100%; text-align: left; border: 2px solid var(--rim-color); background: var(--glass-control); color: inherit; padding: 10px 12px; white-space: normal; overflow-wrap: anywhere; }
+.active-call:hover { border-color: var(--rim-color); text-decoration: underline; }
 /* Settings modal */
 .toolbar #settings-toggle { display: inline-flex; align-items: center; justify-content: center; width: 36px; padding: 8px; }
 #settings-toggle svg { display: block; width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.5; }
@@ -261,7 +266,7 @@ html.viewing-image { overflow: hidden; }
 .attachment { position: relative; flex: 0 0 112px; min-width: 0; border: 1px solid var(--line); background: var(--glass-control); }
 .attachment img, .attachment-placeholder { display: block; width: 110px; height: 72px; margin: 0; object-fit: contain; object-position: center; }
 .attachment-placeholder { padding: 24px 8px; color: var(--dim); font-size: 12px; }
-.attachment.invalid { border-color: var(--red); }
+.attachment.invalid { --rim-color: var(--red); border-color: var(--rim-color); }
 .attachment-name { display: block; padding: 5px 7px; font-size: 11px; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
 .remove-attachment { position: absolute; top: 3px; right: 3px; width: 24px; height: 24px; padding: 0; background: var(--glass-raised); }
 #queued-list img { display: inline-block; width: 64px; height: 48px; margin: 6px 8px 0 0; vertical-align: middle; object-fit: contain; border: 1px solid var(--line); }
@@ -284,7 +289,7 @@ html.viewing-image { overflow: hidden; }
 #queue-edit { justify-content: space-between; margin-bottom: 12px; color: var(--cyan); font-size: 12px; }
 #cancel { color: var(--red); margin-left: auto; }
 #error { color: var(--red); padding-top: 8px; white-space: pre-wrap; }
-#jump { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(var(--composer-height) + var(--composer-bottom) + 12px); z-index: 3; min-width: 180px; min-height: 48px; padding: 11px 20px; border-color: var(--cyan); font-weight: 700; color: var(--cyan); background: var(--glass-raised); backdrop-filter: var(--glass-filter); box-shadow: 0 8px 32px #00000066; }
+#jump { position: fixed; --rim-color: var(--cyan); left: 50%; transform: translateX(-50%); bottom: calc(var(--composer-height) + var(--composer-bottom) + 12px); z-index: 3; min-width: 180px; min-height: 48px; padding: 11px 20px; border: 2px solid var(--rim-color); font-weight: 700; color: var(--cyan); background: var(--glass-raised); backdrop-filter: var(--glass-filter); }
 @media (max-width: 760px) {
   :root { --toolbar-height: 89px; }
   .toolbar-inner { flex-wrap: wrap; gap: 8px 12px; min-height: 88px; padding: 10px 16px; }
@@ -295,7 +300,7 @@ html.viewing-image { overflow: hidden; }
   .toolbar button { font-size: 12px; padding-inline: 6px; }
 }
 @media (max-width: 650px) {
-  #transcript { padding-left: 16px; padding-right: 16px; }
+  :root { --content-gutter: 16px; }
   #input-hint { display: none; }
   .composer-footer { justify-content: flex-end; }
   #model { overflow: hidden; white-space: nowrap; }
@@ -303,7 +308,7 @@ html.viewing-image { overflow: hidden; }
 
 .activity-section:not([hidden]) ~ .activity-section:not([hidden]) { margin-top: 22px; padding-top: 20px; border-top: 1px solid var(--line); }
 #timer-list { list-style: none; padding-left: 0; }
-.active-timer { position: relative; padding: 12px; border: 1px solid var(--glass-border); background: var(--glass-raised); }
+.active-timer { position: relative; --rim-color: var(--cyan); padding: 12px; border: 2px solid var(--rim-color); background: var(--glass-raised); }
 .timer-message { margin: 0 0 10px; white-space: pre-wrap; color: #e6e6e6; }
 .timer-countdown, .timer-due { display: block; margin-bottom: 8px; font-variant-numeric: tabular-nums; }
 .timer-due, .timer-note { color: var(--dim); font-size: 12px; }
