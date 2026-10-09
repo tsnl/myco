@@ -72,7 +72,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
             if not isinstance(content, str):
                 content = " ".join(part.get("text", "") for part in content)
             resuming |= '# Resumption\n\n' in content
-            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links|profile|getlink|view image|timer)\b", content)
+            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links|profile|getlink|view image|timer|autonomy)\b", content)
             if match:
                 prompts.append(match.group(0))
         prompt = prompts[-1] if prompts else 'Alpha images'
@@ -89,6 +89,11 @@ class Provider(http.server.BaseHTTPRequestHandler):
         elif "fail" in prompt:
             self.send_error(400, "Fixture model failure")
             return
+        elif "autonomy" in prompt:
+            if count == 1:
+                events = tool({'action': 'disable_auto_continue'}, 'session_meta')
+            else:
+                events = reply('More work remains.' if not count else 'Task complete.')
         elif "timer" in prompt:
             if not count:
                 events = tool(getattr(fixture, 'timer_input', {
@@ -741,6 +746,39 @@ context_window = 100000
                     page.click('#jump')
                 expect(selected).to_have_count(0)
                 expect(page.locator('#jump')).to_be_hidden()
+
+    def test_explicit_latest_jump_survives_a_queued_history_scroll(self):
+        page = self.session(self.page)
+        for index in range(3):
+            self.submit(page, f'Message {index}\n' + 'A line of context.\n' * 12)
+            expect(page.locator('#model')).to_be_enabled()
+        for _ in range(3):
+            page.locator('#prompt').press('ArrowUp')
+        expect(page.locator('.user[aria-current="true"] .body')).to_contain_text('Message 0')
+        page.evaluate('''() => new Promise(resolve => {
+            requestAnimationFrame(() => requestAnimationFrame(resolve));
+        })''')
+        result = page.evaluate('''() => {
+            const original = window.requestAnimationFrame;
+            const pending = [];
+            window.requestAnimationFrame = callback => { pending.push(callback); return 0; };
+            try {
+                document.querySelector('#jump').click();
+                // Deliver the previous history scroll before the next animation frame.
+                window.dispatchEvent(new Event('scroll'));
+                for (const callback of pending) callback(performance.now());
+                return {
+                    remaining: document.documentElement.scrollHeight - scrollY - innerHeight,
+                    hidden: document.querySelector('#jump').hidden,
+                };
+            } finally {
+                window.requestAnimationFrame = original;
+            }
+        }''')
+        self.assertLessEqual(result['remaining'], 1)
+        self.assertTrue(result['hidden'])
+        expect(page.locator('.user[aria-current="true"]')).to_have_count(0)
+        expect(page.locator('#prompt')).to_be_focused()
 
     def test_message_navigation_preserves_text_editing_modifiers_and_composition(self):
         self.turns['Alpha images'] = 1
@@ -2698,6 +2736,39 @@ context_window = 100000
         (self.home / "Alpha-rename-release").touch()
         expect(page.locator("#model")).to_be_enabled()
 
+    def test_auto_continue_finishes_only_after_the_agent_disables_it(self):
+        page = self.session(self.page)
+        expect(page.locator('#auto-continue')).to_have_text('Auto-continue: off')
+        page.click('#auto-continue')
+        expect(page.locator('#auto-continue')).to_have_attribute('aria-pressed', 'true')
+        self.assertEqual(len(self.requests), 0, 'Enabling does not start a task')
+        self.submit(page, 'Alpha autonomy')
+        expect(page.locator('.assistant .body').last).to_have_text('Task complete.')
+        expect(page.locator('#connection')).to_have_text('Ready')
+        expect(page.locator('#auto-continue')).to_have_text('Auto-continue: off')
+        self.assertEqual(len(self.requests), 3)
+        expect(page.locator('.user')).to_have_count(1)
+        page.reload()
+        expect(page.locator('#auto-continue')).to_have_attribute('aria-pressed', 'false')
+
+    def test_auto_continue_persists_and_can_be_disabled_during_live_work(self):
+        page = self.session(self.page)
+        page.click('#auto-continue')
+        expect(page.locator('#auto-continue')).to_have_text('Auto-continue: on')
+        self.stop(self.process)
+        self.process, _ = self.launch(urlsplit(self.origin).port)
+        page.reload()
+        expect(page.locator('#auto-continue')).to_have_text('Auto-continue: on')
+        self.assertEqual(len(self.requests), 0, 'Restart must not start the saved mode')
+        self.submit(page, 'Alpha wait')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        page.click('#auto-continue')
+        expect(page.locator('#auto-continue')).to_have_text('Auto-continue: off')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        (self.home / 'Alpha-release').touch()
+        expect(page.locator('#connection')).to_have_text('Ready')
+        self.assertEqual(len(self.requests), 2)
+
     def test_rename_session_updates_tabs_and_listing_without_interrupting_work(self):
         page = self.session(self.page)
         self.submit(page, 'Alpha wait')
@@ -3323,9 +3394,13 @@ context_window = 100000
 
         page.click("#jump")
         expect(page.locator("#jump")).to_be_hidden()
-        page.set_viewport_size({"width": 390, "height": 844})
-        self.assertTrue(page.evaluate("document.documentElement.scrollWidth <= innerWidth"))
-        expect(page.locator("#composer")).to_be_in_viewport()
+        for width in [320, 390, 760, 768, 1200]:
+            page.set_viewport_size({"width": width, "height": 844})
+            self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"), width)
+            expect(page.locator("#composer")).to_be_in_viewport()
+            for control in page.locator('.toolbar-actions button, #new-session').all():
+                expect(control).to_be_in_viewport(ratio=1)
+
     def test_session_archive_redirects_and_undo_survives_reload_within_its_profile(self):
         self.add_profile()
         default = self.session(self.page)

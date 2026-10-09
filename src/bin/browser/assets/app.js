@@ -18,6 +18,7 @@ let follow = true;
 let scrollPending = false;
 let selectingModel = false;
 let archiving = false;
+let updatingAutoContinue = false;
 let eventPort = null;
 const sessionId = decodeURIComponent(location.pathname.slice(profilePath('/sessions/').length));
 const nodes = [];
@@ -77,7 +78,9 @@ window.addEventListener('scroll', () => {
   $('jump').hidden = follow;
 }, { passive: true });
 function jumpToLatest() {
-  navigation.clear(); follow = true; scrollLatest();
+  navigation.clear(); follow = true;
+  // A queued history scroll must not cancel this explicit jump.
+  window.scrollTo({ top: document.documentElement.scrollHeight });
   $('jump').hidden = true;
   $('prompt').focus({ preventScroll: true });
 }
@@ -335,6 +338,9 @@ function metadata() {
   for (const button of document.querySelectorAll('.background-tool')) button.disabled = !connected || state.status === 'Cancelling' || button.dataset.pending === 'true';
   composer.update(state, connected, selectingModel);
   $('compact').disabled = disabled || !state.blocks.length;
+  $('auto-continue').disabled = !connected || !state.session_id || updatingAutoContinue;
+  $('auto-continue').textContent = `Auto-continue: ${state.auto_continue ? 'on' : 'off'}`;
+  $('auto-continue').setAttribute('aria-pressed', String(!!state.auto_continue));
   $('archive').disabled = !connected || !state.session_id || archiving;
   $('archive').textContent = state.archived ? 'Restore' : 'Archive';
   $('archived-status').hidden = !state.archived;
@@ -433,6 +439,14 @@ async function sendAction(action, id = requestId()) {
   await api(`/api/sessions/${encodeURIComponent(state.session_id)}/action`, { request_id: id, session_id: state.session_id, action });
 }
 $('compact').onclick = () => sendAction({ kind: 'compact' }).catch((e) => error(e.message));
+$('auto-continue').onclick = async () => {
+  if (updatingAutoContinue || !state.session_id) return;
+  updatingAutoContinue = true; metadata(); error();
+  try {
+    await api(`/api/sessions/${encodeURIComponent(state.session_id)}/auto-continue`, { session_id: state.session_id, enabled: !state.auto_continue });
+  } catch (e) { error(e.message); }
+  finally { updatingAutoContinue = false; metadata(); }
+};
 $('rename').onclick = () => renameSession({ id: state.session_id, title: state.title }, $('rename'));
 $('archive').onclick = async () => {
   if (archiving || !state.session_id) return;

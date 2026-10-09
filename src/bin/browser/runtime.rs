@@ -66,6 +66,7 @@ struct Snapshot {
     thread_id: String,
     title: String,
     archived: bool,
+    auto_continue: bool,
     model: String,
     models: Vec<String>,
     attachment_limits: attachments::Limits,
@@ -84,6 +85,7 @@ impl Snapshot {
         json!({
             "session_id": self.session_id, "thread_id": self.thread_id,
             "title": self.title, "archived": self.archived, "model": self.model,
+            "auto_continue": self.auto_continue,
             "busy": self.busy, "status": self.status, "queued": self.queued, "timers": self.timers,
             "attachment_limits": self.attachment_limits,
             "usage": self.usage, "context_window_tokens": self.context_window_tokens,
@@ -259,6 +261,7 @@ impl App {
             .clone()
             .unwrap_or_else(|| "New session".into());
         snapshot.archived = session.archived;
+        snapshot.auto_continue = session.auto_continue;
         snapshot.model = boot.catalog_model.spec.key.clone();
         snapshot.attachment_limits =
             attachments::Limits::new(boot.catalog_model.spec.max_image_base64_bytes);
@@ -283,21 +286,26 @@ impl App {
     }
 
     fn refresh_metadata(&self, session: &ActiveSession) {
-        let (title, archived, usage) = session.with(|session| {
+        let (title, archived, auto_continue, usage) = session.with(|session| {
             (
                 session
                     .title
                     .clone()
                     .unwrap_or_else(|| "New session".into()),
                 session.archived,
+                session.auto_continue,
                 session.active_thread().last_usage,
             )
         });
         let mut live = self.live.lock().unwrap();
         let listing_changed = live.snapshot.title != title || live.snapshot.archived != archived;
-        if listing_changed || live.snapshot.usage != usage {
+        if listing_changed
+            || live.snapshot.usage != usage
+            || live.snapshot.auto_continue != auto_continue
+        {
             live.snapshot.title = title;
             live.snapshot.archived = archived;
+            live.snapshot.auto_continue = auto_continue;
             live.snapshot.usage = usage;
             let change = json!({"kind":"meta", "meta":live.snapshot.metadata()});
             self.publish(&mut live.snapshot, change);
@@ -691,6 +699,7 @@ impl Sessions {
                                 .clone()
                                 .unwrap_or_else(|| "New session".into()),
                             archived: session.archived,
+                            auto_continue: session.auto_continue,
                             model: config.model.clone(),
                             models: config
                                 .models
@@ -785,6 +794,24 @@ impl Sessions {
                 .await
                 .map_err(|e| Error::Internal(format!("browser worker: {e}")))?;
         }
+        Ok(())
+    }
+
+    pub(super) async fn set_auto_continue(&self, id: String, enabled: bool) -> Result<()> {
+        let app = self.open(&id).await?;
+        let id = app.live.lock().unwrap().snapshot.session_id.clone();
+        let running = self.running.lock().await;
+        let session = running
+            .get(&id)
+            .ok_or_else(|| Error::NotFound("Session closed".into()))?
+            .session
+            .clone();
+        let saved = session.clone();
+        tokio::task::spawn_blocking(move || saved.set_auto_continue(enabled))
+            .await
+            .map_err(|error| Error::Internal(error.to_string()))?
+            .map_err(Error::Internal)?;
+        app.refresh_metadata(&session);
         Ok(())
     }
 

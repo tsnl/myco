@@ -45,6 +45,9 @@ async fn boot<S: EventSink + 'static>(args: &Args, sink: Arc<S>) -> Result<Boot,
         |_, _, _| sink,
     )
     .await?;
+    if let Some(enabled) = args.auto_continue {
+        boot.session.set_auto_continue(enabled)?;
+    }
     boot.runner.set_observer(Arc::new(|event| match event {
         myco::chat::WorkflowEvent::Compacting { .. } => eprintln!("myco: compacting…"),
         myco::chat::WorkflowEvent::Compacted(_) => eprintln!("myco: compaction complete"),
