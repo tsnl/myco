@@ -150,7 +150,8 @@ pub struct ModelEntry {
     #[serde(default)]
     pub max_truncated_resumes: Option<u32>,
     /// Compact automatically once the prompt reaches this fraction of
-    /// `context_window` (e.g. `0.8`). Defaults to `1.0`, the full window.
+    /// `context_window` (default `0.8`). The effective threshold also reserves
+    /// `max_output_tokens` when that cap is smaller than the context window.
     ///
     /// Per model because the trigger is a share of *this* model's context
     /// window. Resolution turns it into a concrete token count

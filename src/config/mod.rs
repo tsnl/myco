@@ -360,12 +360,18 @@ fn resolve_catalog(
         // A fraction of *this* model's window, turned into a token count once
         // here so the runner compares plain numbers and a bad value is caught at
         // startup rather than hours into an unattended run.
-        let auto_compact_at_tokens = match entry.auto_compact_at {
-            None | Some(1.0) => Some(entry.context_window),
-            Some(fraction) if fraction > 0.0 && fraction < 1.0 => {
-                Some((entry.context_window as f64 * fraction) as u64)
-            }
-            Some(fraction) => {
+        let max_output = entry.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+        let output_reserve = u64::try_from(max_output)
+            .ok()
+            .filter(|&tokens| tokens < entry.context_window)
+            .unwrap_or(0);
+        let auto_compact_at_tokens = match entry.auto_compact_at.unwrap_or(0.8) {
+            fraction if fraction > 0.0 && fraction <= 1.0 => Some(
+                ((entry.context_window as f64 * fraction) as u64)
+                    .min(entry.context_window - output_reserve)
+                    .max(1),
+            ),
+            fraction => {
                 return Err(format!(
                     "model `{key}`: auto_compact_at must be greater than 0 and at most 1 \
                      (got {fraction})"
@@ -387,7 +393,6 @@ fn resolve_catalog(
                 .unwrap_or(DEFAULT_MAX_TRUNCATED_RESUMES),
             auto_compact_at_tokens,
         };
-        let max_output = entry.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
         let max_request_bytes = entry
             .max_request_bytes
             .or_else(|| gateway.and_then(|g| g.max_request_bytes))
@@ -1210,16 +1215,16 @@ context_window = 200_000
             cfg.models.spec("capped").unwrap().auto_compact_at_tokens,
             Some(160_000)
         );
-        // Unset defaults to the full context window.
+        // Unset leaves twenty percent headroom.
         assert_eq!(
             cfg.models.spec("stock").unwrap().auto_compact_at_tokens,
-            Some(200_000)
+            Some(160_000)
         );
         let explicit = toml_text.replace("auto_compact_at = 0.8", "auto_compact_at = 1.0");
         let cfg = resolve_toml(&explicit, ConfigUserSettings::default(), env_of(&[])).unwrap();
         assert_eq!(
             cfg.models.spec("capped").unwrap().auto_compact_at_tokens,
-            Some(200_000)
+            Some(200_000 - DEFAULT_MAX_OUTPUT_TOKENS as u64)
         );
     }
 
@@ -1235,6 +1240,26 @@ context_window = 200_000
                 resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).unwrap_err();
             assert!(err.contains("auto_compact_at"), "{bad}: {err}");
             assert!(err.contains("model `x`"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn compaction_reserves_usable_output_capacity_and_keeps_tiny_windows_compatible() {
+        for (window, output, fraction, expected) in [
+            (100_000, 30_000, "", 70_000),
+            (100_000, 30_000, "auto_compact_at = 1.0", 70_000),
+            (100_000, 30_000, "auto_compact_at = 0.5", 50_000),
+            (1000, 8192, "", 800),
+            (1000, 1000, "auto_compact_at = 1.0", 1000),
+        ] {
+            let source = format!(
+                "model = 'test'\n[models.test]\nprotocol = 'openai-responses'\nbase_url = 'https://h'\ncontext_window = {window}\nmax_output_tokens = {output}\n{fraction}\n"
+            );
+            let config = resolve_toml(&source, ConfigUserSettings::default(), env_of(&[])).unwrap();
+            assert_eq!(
+                config.models.spec("test").unwrap().auto_compact_at_tokens,
+                Some(expected)
+            );
         }
     }
 

@@ -23,16 +23,18 @@ pub fn auto_compact_notice(threshold: Option<u64>, context_window: u64) -> Strin
     let percent = threshold as f64 * 100.0 / context_window as f64;
     format!(
         "# Automatic compaction\n\n\
-         Between completed tool rounds or after a normal answer, a reported prompt size of {threshold} tokens \
+         Before model requests at settled tool boundaries, or after a normal answer, an estimated prompt size of {threshold} tokens \
          ({percent}% of the {context_window}-token context window) triggers the same \
          compaction as `/compact`. It creates a new thread within this session and keeps \
          live tools running. A `# Resumption` message then asks you to continue. \
          Long tool loops can compact repeatedly as context grows. An answer triggers at most \
-         one compact-and-continue cycle per submission. With auto-continue off, transient compaction response failures \
-         retry within the worker's request budget; other failures stop the run with its original \
-         history retained, and later submissions can try again. If the next reported prompt \
-         remains above the threshold, automatic compaction is disabled until manual compaction \
-         succeeds or another session is opened. Cancellation stops continuation."
+         one compact-and-continue cycle per submission. Estimates include new input and tool results \
+         but are not exact tokenizer counts. An oversized successor estimate suspends automatic \
+         compaction pending its next provider usage report. With auto-continue off, transient \
+         compaction response failures retry within the worker's request budget; other failures \
+         stop the run with its original history retained, and later submissions can try again. \
+         If the next reported prompt remains above the threshold, automatic compaction is disabled \
+         until manual compaction succeeds or another session is opened. Cancellation stops continuation."
     )
 }
 

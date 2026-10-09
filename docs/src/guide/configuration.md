@@ -78,7 +78,7 @@ are never silently resized or removed to fit a request.
 | --- | --- |
 | `max_output_tokens` | Output budget per model request; default 8192 |
 | `max_truncated_resumes` | Consecutive continuations after output truncation; default 3, `0` disables |
-| `auto_compact_at` | Automatic compaction fraction in `(0, 1]`; default `1.0` (full context window) |
+| `auto_compact_at` | Automatic compaction fraction in `(0, 1]`; default `0.8`. Threshold also reserves `max_output_tokens` when that cap is smaller than the context window. |
 | `max_image_base64_bytes` | Per-image uploaded base64 limit; default 5 MiB |
 | `attach_timeout_secs` | Remote connection timeout; default 10, `0` disables |
 

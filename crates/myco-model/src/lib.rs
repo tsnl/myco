@@ -243,7 +243,7 @@ pub struct ModelSpec {
     /// Myco's config defaults to the full context window. Library callers can
     /// use `None` when they own compaction policy themselves.
     ///
-    /// Resolved from the model's `auto_compact_at` *fraction* against
+    /// Resolved from the model's `auto_compact_at` *fraction* and output reserve against
     /// `context_window_tokens` so the comparison downstream is a plain token
     /// count, and the fraction is validated once, at startup.
     pub auto_compact_at_tokens: Option<u64>,

@@ -345,6 +345,7 @@ pub(super) struct Workflow {
     auto_ineffective: bool,
     compacted_after_completion: bool,
     awaiting_compacted_usage: bool,
+    skip_preflight: bool,
     recovering_size_error: bool,
     observer: Arc<dyn Fn(WorkflowEvent) + Send + Sync>,
     followups: Option<super::FollowupHandler>,
@@ -360,6 +361,7 @@ impl Default for Workflow {
             auto_ineffective: false,
             compacted_after_completion: false,
             awaiting_compacted_usage: false,
+            skip_preflight: false,
             recovering_size_error: false,
             observer: Arc::new(|_| {}),
             followups: None,
@@ -448,6 +450,7 @@ impl Workflow {
     ) -> Result<RunOutcome, AgentInteractionError> {
         if start {
             self.recovering_size_error = false;
+            self.skip_preflight = false;
             self.compacted_after_completion = false;
             self.awaiting_compacted_usage = false;
             self.checkpointed_update(agent, runtime, &cancel, |agent| {
@@ -487,21 +490,32 @@ impl Workflow {
         self.record_runtime(agent, runtime).await?;
         if start {
             agent.start_run()?;
-            let used = agent
-                .last_usage()
-                .map(|usage| usage.context_tokens())
-                .or_else(|| {
-                    runtime
-                        .session()
-                        .with(|session| session.active_thread().context_tokens_estimate)
-                });
-            if self.threshold_reached(used) && !cancel.is_cancelled() {
-                self.auto_compact(agent, runtime, writer, cancel.clone())
-                    .await?;
-            }
         }
         loop {
             self.deliver_followups(agent, runtime, &cancel)?;
+            if matches!(
+                agent.state().pending_operation(),
+                Some(crate::agent::PendingOperation::Generation { .. })
+            ) && !cancel.is_cancelled()
+            {
+                if let Err(error) = agent.prepare_generation(cancel.clone()).await {
+                    if matches!(error, AgentInteractionError::Cancelled) {
+                        agent.cancel_at_boundary()?;
+                    }
+                    return Err(error);
+                }
+                let reached = self.threshold_reached(Some(agent.context_tokens_estimate()));
+                if std::mem::take(&mut self.skip_preflight) {
+                    if reached {
+                        self.auto_ineffective = true;
+                        (self.observer)(WorkflowEvent::Warning("compaction did not reduce the estimated text prompt below its threshold; automatic compaction is suspended pending the next provider usage report. Manual compaction or a session change also resets it. Token estimates are approximate; request-size recovery remains available.".into()));
+                    }
+                } else if reached {
+                    self.auto_compact(agent, runtime, writer, cancel.clone())
+                        .await?;
+                    continue;
+                }
+            }
             let result = if runtime.session().with(|session| session.auto_continue) {
                 agent.step_once(cancel.clone()).await
             } else {
@@ -557,12 +571,13 @@ impl Workflow {
             let used = agent.last_usage().map(|usage| usage.context_tokens());
             if self.awaiting_compacted_usage && used.is_some() {
                 self.awaiting_compacted_usage = false;
-                if self
+                // A conservative successor estimate can suspend preflight
+                // until this measurement establishes the actual input size.
+                self.auto_ineffective = self
                     .threshold
                     .zip(used)
-                    .is_some_and(|(threshold, used)| used >= threshold)
-                {
-                    self.auto_ineffective = true;
+                    .is_some_and(|(threshold, used)| used >= threshold);
+                if self.auto_ineffective {
                     (self.observer)(WorkflowEvent::Warning("compaction did not reduce the prompt below its threshold; automatic compaction disabled until manual compaction or a session change".into()));
                 }
             }
@@ -701,6 +716,7 @@ impl Workflow {
         })
         .await?;
         self.awaiting_compacted_usage = automatic;
+        self.skip_preflight = automatic;
         wire_checkpoint(agent, runtime.session());
         self.compact_retry(mode, runtime, &cancel, || {
             persist_session(agent, runtime.session(), true)
@@ -865,7 +881,9 @@ mod tests {
                 if self.cancel.swap(false, Ordering::SeqCst) {
                     cancel.cancel();
                 }
-                if let Some(home) = &self.break_store {
+                if let Some(home) = &self.break_store
+                    && self.calls.load(Ordering::SeqCst) == 1
+                {
                     std::fs::rename(home.join("session"), home.join("saved-store")).unwrap();
                     std::fs::write(home.join("session"), "disk unavailable").unwrap();
                 }
@@ -892,7 +910,8 @@ mod tests {
                 .collect(),
             turn_end_reason: reason,
             usage: Some(TokenUsage {
-                input_tokens: used,
+                // Keep synthetic measurements above normal runtime framing.
+                input_tokens: used * 1000,
                 output_tokens: 7,
                 cached_input_tokens: 0,
             }),
@@ -915,7 +934,7 @@ mod tests {
         let model = ScriptedModel::from_results(scripts);
         let agent = Agent::new(model.clone(), runtime.clone(), Arc::new(NullEventSink));
         let mut runner = SessionRunner::new(agent, runtime).await.unwrap();
-        runner.set_compactor(compactor, Some(80));
+        runner.set_compactor(compactor, Some(80_000));
         (runner, model)
     }
 
@@ -1310,7 +1329,7 @@ mod tests {
                         compactor.clone(),
                     )
                     .await;
-                    runner.set_compactor(compactor.clone(), Some(200));
+                    runner.set_compactor(compactor.clone(), Some(200_000));
                     submit(&mut runner, CancelToken::new())
                         .await
                         .result
@@ -1343,7 +1362,7 @@ mod tests {
                         );
                         runner = SessionRunner::new(agent, runtime).await.unwrap();
                     }
-                    runner.set_compactor(compactor.clone(), Some(threshold));
+                    runner.set_compactor(compactor.clone(), Some(threshold * 1000));
                     submit(&mut runner, CancelToken::new())
                         .await
                         .result
@@ -1390,6 +1409,192 @@ mod tests {
     }
 
     #[test]
+    fn preflight_counts_new_input_without_usage_and_growth_after_a_measurement() {
+        let _home = temp_home("preflight-new-input");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for prior_usage in [false, true] {
+                let compactor = Arc::new(Summarizer::default());
+                let mut final_output = output(2, None, TurnEndReason::EndTurn);
+                final_output.usage = None;
+                let scripts = if prior_usage {
+                    vec![output(2, None, TurnEndReason::EndTurn), final_output]
+                } else {
+                    vec![final_output]
+                };
+                let (mut runner, model) = setup(scripts, compactor.clone()).await;
+                runner.set_compactor(compactor.clone(), Some(5_000));
+                if prior_usage {
+                    submit(&mut runner, CancelToken::new())
+                        .await
+                        .result
+                        .unwrap();
+                }
+                runner
+                    .submit(
+                        vec![Content::Text {
+                            text: "new input".repeat(2500),
+                        }],
+                        Utc::now(),
+                        CancelToken::new(),
+                    )
+                    .await
+                    .result
+                    .unwrap();
+                assert_eq!(model.remaining(), 0);
+                assert_eq!(compactor.calls.load(Ordering::SeqCst), 1);
+                let sources = compactor.sources.lock().unwrap();
+                let source = &sources[0].active_thread().messages;
+                assert_eq!(
+                    source
+                        .iter()
+                        .filter(|message| matches!(message, Message::AssistantMessage { .. }))
+                        .count(),
+                    usize::from(prior_usage)
+                );
+                assert!(
+                    source
+                        .iter()
+                        .flat_map(Message::content)
+                        .any(|part| matches!(part, Content::Text { text } if text.len() > 20_000))
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn preflight_waits_for_tool_results_then_counts_large_arguments_and_output() {
+        let _home = temp_home("preflight-tools");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for command in [
+                format!("true #{}", "x".repeat(18_000)),
+                "printf '%18000s' x".into(),
+            ] {
+                let compactor = Arc::new(Summarizer::default());
+                let mut first = output(
+                    2,
+                    Some(json!({"command":command, "max_bytes":20_000})),
+                    TurnEndReason::ToolUse,
+                );
+                first.usage = None;
+                let (mut runner, model) = setup(
+                    vec![first, output(2, None, TurnEndReason::EndTurn)],
+                    compactor.clone(),
+                )
+                .await;
+                runner.set_compactor(compactor.clone(), Some(5_000));
+                submit(&mut runner, CancelToken::new())
+                    .await
+                    .result
+                    .unwrap();
+                assert_eq!(model.remaining(), 0);
+                assert_eq!(compactor.calls.load(Ordering::SeqCst), 1);
+                let sources = compactor.sources.lock().unwrap();
+                let source = &sources[0].active_thread().messages;
+                assert_eq!(
+                    source
+                        .iter()
+                        .filter(|message| matches!(message, Message::AssistantMessage { .. }))
+                        .count(),
+                    1
+                );
+                assert!(
+                    source
+                        .iter()
+                        .any(|message| matches!(message, Message::ToolResults { .. }))
+                );
+                crate::agent::validate_context(source).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn changed_prelude_is_prepared_before_sizing_without_recompacting_the_same_successor() {
+        let _home = temp_home("preflight-prelude");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let compactor = Arc::new(Summarizer::default());
+            let (mut runner, model) = setup(vec![output(2, None, TurnEndReason::EndTurn)], compactor.clone()).await;
+            runner.set_compactor(compactor.clone(), Some(5_000));
+            let sent = Arc::new(AtomicBool::new(false));
+            runner.agent_mut().set_before_generation_notice(Some(Box::new(move |_, _| {
+                let first = !sent.swap(true, Ordering::SeqCst);
+                Box::pin(async move { first.then(|| "prelude".repeat(3000)) })
+            })));
+            submit(&mut runner, CancelToken::new()).await.result.unwrap();
+            assert_eq!(model.remaining(), 0);
+            assert_eq!(compactor.calls.load(Ordering::SeqCst), 1);
+            let sources = compactor.sources.lock().unwrap();
+            assert!(sources[0].active_thread().messages.iter().flat_map(Message::content).any(|part| matches!(part, Content::System { kind, text, .. } if kind == "generation_notice" && text.len() > 20_000)));
+        });
+    }
+
+    #[test]
+    fn cancelling_preflight_notice_settles_the_saved_intent_without_model_work() {
+        let _home = temp_home("preflight-cancel-notice");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let compactor = Arc::new(Summarizer::default());
+            let (mut runner, model) = setup(
+                vec![output(2, None, TurnEndReason::EndTurn)],
+                compactor.clone(),
+            )
+            .await;
+            let polling = CancelToken::new();
+            let started = polling.clone();
+            runner
+                .agent_mut()
+                .set_before_generation_notice(Some(Box::new(move |_, _| {
+                    started.cancel();
+                    Box::pin(std::future::pending())
+                })));
+            let cancel = CancelToken::new();
+            let abort = cancel.clone();
+            tokio::spawn(async move {
+                polling.cancelled().await;
+                abort.cancel();
+            });
+            assert!(matches!(
+                submit(&mut runner, cancel).await.result,
+                Err(AgentInteractionError::Cancelled)
+            ));
+            assert!(runner.agent().state().is_idle());
+            assert_eq!(model.remaining(), 1);
+            assert_eq!(compactor.calls.load(Ordering::SeqCst), 0);
+            let saved = Session::load(&runner.runtime().session().snapshot().json_path()).unwrap();
+            assert!(saved.active_thread().pending_operation.is_none());
+        });
+    }
+
+    #[test]
+    fn measured_successor_usage_reenables_preflight_after_a_conservative_estimate() {
+        let _home = temp_home("preflight-measured-successor");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let compactor = Arc::new(Summarizer::default());
+            let (mut runner, model) = setup(
+                vec![output(2, None, TurnEndReason::EndTurn); 2],
+                compactor.clone(),
+            )
+            .await;
+            runner.set_compactor(compactor.clone(), Some(5_000));
+            for (size, expected_compactions) in [(24_000, 1), (12_000, 2)] {
+                runner
+                    .submit(
+                        vec![Content::Text {
+                            text: "x".repeat(size),
+                        }],
+                        Utc::now(),
+                        CancelToken::new(),
+                    )
+                    .await
+                    .result
+                    .unwrap();
+                assert_eq!(compactor.calls.load(Ordering::SeqCst), expected_compactions);
+                assert!(!runner.workflow.auto_ineffective);
+                assert!(runner.agent().context_tokens_estimate() < 5_000);
+            }
+            assert_eq!(model.remaining(), 0);
+        });
+    }
+
+    #[test]
     fn manual_compaction_clears_the_estimate_left_by_a_model_change() {
         let _home = temp_home("runner-estimate-reset");
         tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -1399,7 +1604,7 @@ mod tests {
                 compactor.clone(),
             )
             .await;
-            runner.set_compactor(compactor.clone(), Some(200));
+            runner.set_compactor(compactor.clone(), Some(200_000));
             submit(&mut runner, CancelToken::new())
                 .await
                 .result
@@ -1418,9 +1623,9 @@ mod tests {
                     .snapshot()
                     .active_thread()
                     .context_tokens_estimate,
-                Some(90)
+                Some(90_000)
             );
-            runner.set_compactor(compactor.clone(), Some(80));
+            runner.set_compactor(compactor.clone(), Some(80_000));
             runner.compact(CancelToken::new()).await.unwrap();
             assert!(
                 runner
@@ -1869,7 +2074,7 @@ mod tests {
             assert_eq!(outcome.usage.unwrap().output_tokens, 14);
             assert_eq!(std::fs::read_to_string(effect).unwrap(), "x");
             let saved = Session::load(&runner.runtime().session().snapshot().json_path()).unwrap();
-            assert_eq!(saved.threads().len(), 1);
+            assert_eq!(saved.threads().len(), 2);
             assert!(saved.active_thread().pending_operation.is_none());
         });
     }

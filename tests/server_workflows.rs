@@ -289,6 +289,9 @@ fn configure_compact(env: &ServerEnv, server: &test_utils::StubHttpServer, enabl
         .replace("http://127.0.0.1:1/v1", &server.base_url());
     if enabled {
         config.push_str("auto_compact_at = 0.8\n");
+    } else {
+        // These scenarios keep 80k measured prompts below the test threshold.
+        config.push_str("auto_compact_at = 1.0\n");
     }
     std::fs::write(&env.config, config).unwrap();
 }

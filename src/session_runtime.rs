@@ -154,6 +154,7 @@ impl SessionRuntime {
                 .map_err(crate::agent::AgentInteractionError::Checkpoint)?;
         }
         agent.replace_context(history, thread.last_usage)?;
+        agent.restore_context_size_hint(thread.context_tokens_estimate);
         let mut context = agent.context().clone();
         context.session_id = Some(session.id.clone());
         context.thread_id = Some(thread.id.clone());

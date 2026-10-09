@@ -924,9 +924,9 @@ context_window = 100000
         expect(page.locator('#input-tokens')).to_have_text('Input 0')
         expect(page.locator('#output-tokens')).to_have_text('Output 0')
 
-    def test_auto_compaction_defaults_to_the_full_context_window(self):
+    def test_auto_compaction_defaults_to_eighty_percent_of_the_context_window(self):
         self.compaction_release.clear()
-        self.usage = {'input_tokens': 100000, 'output_tokens': 20}
+        self.usage = {'input_tokens': 80000, 'output_tokens': 20}
         self.turns['Alpha images'] = 1
         page = self.session(self.page)
         self.submit(page, 'Alpha images')
@@ -985,7 +985,7 @@ context_window = 100000
                     self.process, _ = self.launch(port=urlsplit(self.origin).port)
                 self.compaction_release.clear()
                 self.continuation_release.clear()
-                self.usage = {'input_tokens': 80000, 'output_tokens': 20}
+                self.usage = {'input_tokens': 80000 if automatic else 60000, 'output_tokens': 20}
                 self.turns['Alpha images'] = 1
                 page = self.session(self.page)
                 self.submit(page, 'Alpha images')
@@ -3303,6 +3303,13 @@ context_window = 100000
         self.assertEqual(renders, [], 'Returning to the tab uses the rendered snapshot')
 
     def test_26_concurrent_sessions_do_not_replay_unobserved_histories(self):
+        # Keep large-history transport independent of automatic compaction.
+        self.stop(self.process)
+        config = self.home / 'config.toml'
+        config.write_text(config.read_text().replace('context_window = 100000',
+                                                    'context_window = 1000000'))
+        self.process, _ = self.launch(port=urlsplit(self.origin).port)
+        self.page.reload()
         home = self.page
         expect(home.locator('#connection')).to_have_text('Live')
         home.evaluate("""Object.defineProperty(document, 'hidden', {configurable: true, value: true});
