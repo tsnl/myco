@@ -598,6 +598,103 @@ async fn print_auto_compacts_and_continues_without_printing_the_compactors_answe
     assert_eq!(env.saved(&session.id).threads().len(), 2);
 }
 
+#[tokio::test]
+async fn compaction_rewrites_identical_summary_and_retries_without_repeating_the_write() {
+    let provider = StubHttpServer::sequence(vec![]).await;
+    let env = CliEnv::new(&provider, true);
+    let session = env.seed();
+    // A failed prior attempt may have left the same summary on disk.
+    let summary_path = env
+        .session_path(&session.id)
+        .with_extension(format!("{}.summary.md", session.active_thread().id));
+    std::fs::write(
+        summary_path,
+        "# Goal / active task\nFinish the pending task.",
+    )
+    .unwrap();
+    let provider = StubHttpServer::sequence(vec![
+        answer("Working.\n", 80_000),
+        summary(&session),
+        StubHttpServer::status_response(
+            503,
+            r#"{"error":{"message":"temporary outage after summary write"}}"#,
+        ),
+        answer("private compactor answer", 100),
+        answer("Finished.", 100),
+    ])
+    .await;
+    env.use_provider(&provider);
+    let config = std::fs::read_to_string(&env.config).unwrap();
+    std::fs::write(
+        &env.config,
+        format!("{config}\n[models.pipetest.retry]\nmax_attempts = 2\ninitial_backoff_ms = 1\n"),
+    )
+    .unwrap();
+    let output = env.run(&["-p", "task", "--resume", &session.id], b"").await;
+    assert_eq!(success(&output), "Working.\nFinished.\n");
+    assert_eq!(provider.connections(), 5);
+    let saved = env.saved(&session.id);
+    assert_eq!(saved.threads().len(), 2);
+    assert_eq!(saved.threads()[0].id, session.active_thread().id);
+    assert!(
+        serde_json::to_string(&saved.threads()[0])
+            .unwrap()
+            .contains("Working.")
+    );
+    for thread in saved.threads() {
+        myco::agent::validate_context(&thread.messages).unwrap();
+        assert!(thread.pending_operation.is_none());
+    }
+}
+
+#[tokio::test]
+async fn compact_worker_authentication_errors_and_request_limits_stop_without_more_requests() {
+    for limited in [false, true] {
+        let provider = StubHttpServer::sequence(vec![]).await;
+        let env = CliEnv::new(&provider, false);
+        let session = env.seed();
+        let provider = StubHttpServer::sequence(vec![
+            answer("Initial answer.", 100),
+            summary(&session),
+            StubHttpServer::status_response(
+                if limited { 503 } else { 401 },
+                r#"{"error":{"message":"scripted rejection"}}"#,
+            ),
+            answer("This request must not happen.", 100),
+        ])
+        .await;
+        env.use_provider(&provider);
+        let original = std::fs::read_to_string(&env.config).unwrap();
+        let limit = if limited {
+            "compaction_max_requests = 2\n"
+        } else {
+            ""
+        };
+        std::fs::write(&env.config, format!("{limit}{original}\n[models.pipetest.retry]\nmax_attempts = 3\ninitial_backoff_ms = 1\n")).unwrap();
+        let output = env
+            .run(
+                &["--mode", "cli", "--resume", &session.id],
+                b"task\n/compact\n/quit\n",
+            )
+            .await;
+        assert_eq!(success(&output), "Initial answer.\n");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(if limited {
+                "2-request limit"
+            } else {
+                "scripted rejection"
+            }),
+            "{stderr}"
+        );
+        assert_eq!(provider.connections(), 3);
+        let saved = env.saved(&session.id);
+        assert_eq!(saved.threads().len(), 1);
+        assert!(saved.active_thread().pending_operation.is_none());
+        myco::agent::validate_context(&saved.active_thread().messages).unwrap();
+    }
+}
+
 async fn wait_for_file(path: &Path) {
     tokio::time::timeout(Duration::from_secs(10), async {
         while !path.exists() {

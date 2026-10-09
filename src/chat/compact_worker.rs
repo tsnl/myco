@@ -13,7 +13,9 @@ use crate::generative_model::{
 use crate::session::{ActiveSession, CompactOutcome, Session, SessionKind, Thread, compact_thread};
 use crate::tool_services::{HostDispatchContext, SessionHistoryTool, ToolService};
 
-use crate::agent::{Agent, AgentInteractionError, NullEventSink, ToolExecutor, TraceContext};
+use crate::agent::{
+    Agent, AgentInteractionError, EventSink, NullEventSink, ToolExecutor, TraceContext,
+};
 
 const MAX_SUMMARY_CHARS: usize = 8_000;
 
@@ -140,8 +142,8 @@ async fn run_worker(
     }
 }
 
-/// A successful write in this attempt proves freshness even when a retry writes
-/// identical text. Existing bytes alone cannot prove the worker wrote a summary.
+/// A retry can legitimately write identical text. A successful write during this
+/// attempt proves freshness; the bytes alone cannot distinguish it from stale output.
 fn read_fresh_summary(path: &Path, written: bool) -> Result<String, String> {
     if !written {
         return Err(format!(
@@ -184,9 +186,13 @@ pub async fn run_compact_worker(
     max_requests: usize,
     cancel: CancelToken,
 ) -> Result<(Thread, CompactOutcome), CompactWorkerError> {
-    run_compact_worker_with_model(predecessor, catalog_model, max_requests, cancel, |model| {
-        model
-    })
+    run_compact_worker_with_sink(
+        predecessor,
+        catalog_model,
+        max_requests,
+        cancel,
+        Arc::new(NullEventSink),
+    )
     .await
 }
 
@@ -197,6 +203,44 @@ pub async fn run_compact_worker_with_model(
     max_requests: usize,
     cancel: CancelToken,
     wrap_model: impl FnOnce(Arc<dyn GenerativeModel>) -> Arc<dyn GenerativeModel>,
+) -> Result<(Thread, CompactOutcome), CompactWorkerError> {
+    run_compact_worker_instrumented(
+        predecessor,
+        catalog_model,
+        max_requests,
+        cancel,
+        wrap_model,
+        Arc::new(NullEventSink),
+    )
+    .await
+}
+
+/// Forward worker retry observations without changing its history or request budget.
+pub(crate) async fn run_compact_worker_with_sink(
+    predecessor: &Session,
+    catalog_model: &CatalogModel,
+    max_requests: usize,
+    cancel: CancelToken,
+    sink: Arc<dyn EventSink>,
+) -> Result<(Thread, CompactOutcome), CompactWorkerError> {
+    run_compact_worker_instrumented(
+        predecessor,
+        catalog_model,
+        max_requests,
+        cancel,
+        |model| model,
+        sink,
+    )
+    .await
+}
+
+async fn run_compact_worker_instrumented(
+    predecessor: &Session,
+    catalog_model: &CatalogModel,
+    max_requests: usize,
+    cancel: CancelToken,
+    wrap_model: impl FnOnce(Arc<dyn GenerativeModel>) -> Arc<dyn GenerativeModel>,
+    sink: Arc<dyn EventSink>,
 ) -> Result<(Thread, CompactOutcome), CompactWorkerError> {
     let auto_continue = predecessor.auto_continue;
     let worker_id = uuid::Uuid::new_v4();
@@ -232,7 +276,6 @@ pub async fn run_compact_worker_with_model(
         }
     };
 
-    let sink = Arc::new(NullEventSink);
     let session = ActiveSession::new(worker_session.clone());
     let mut worker = Agent::with_context(
         Arc::new(CompactModel {
@@ -559,6 +602,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_checkpoint_failure_stops_before_generating_or_writing_a_summary() {
+        let inner = ScriptedModel::new(vec![]);
+        let mut worker = Agent::new(
+            inner,
+            CompactTools::new(&Session::new("test")),
+            Arc::new(NullEventSink),
+        );
+        worker.set_checkpoint(Some(Box::new(|_| Err("storage unavailable".into()))));
+        let result = run_worker(&mut worker, "summarize".into(), CancelToken::new()).await;
+        assert!(
+            matches!(result, Err(CompactWorkerError::Failed(text)) if text.contains("storage unavailable"))
+        );
+        assert!(worker.checkpoint_failed());
+        assert!(worker.state().pending_operation().is_none());
+    }
+
+    #[tokio::test]
     async fn retries_count_towards_the_same_request_budget() {
         struct Retry;
         impl GenerativeModel for Retry {
@@ -663,6 +723,8 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), previous);
 
+        // A successful rewrite can be byte-identical after a failed attempt.
+        assert_eq!(read_fresh_summary(&path, true).unwrap(), previous);
         std::fs::write(&path, "# Fresh summary\n").unwrap();
         assert_eq!(
             read_fresh_summary(&path, true).unwrap(),
@@ -683,7 +745,6 @@ mod tests {
         let err = read_fresh_summary(&path, true).expect_err("empty must fail");
         assert!(err.contains("summary file is empty"), "{err}");
 
-        // A first successful summary write is accepted once its contents are valid.
         std::fs::write(&path, "# First\n").unwrap();
         assert_eq!(read_fresh_summary(&path, true).unwrap(), "# First\n");
     }

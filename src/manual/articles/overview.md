@@ -329,16 +329,20 @@ user input and does not restore live tools from a previous process.
 
 Long tool loops can compact repeatedly when the context shrinks then grows again.
 A completed answer triggers at most one compact-and-continue cycle per submission.
-If the next usage report remains above the threshold, automatic compaction is
-disabled until manual compaction succeeds or another session is opened. With
-auto-continue off, a summarization failure also disables automatic compaction;
-other generation failures, cancellation, refusal, and an exhausted truncation
-cap do not start another generation. With auto-continue enabled, generation,
-persistence, and automatic summarization errors retry indefinitely with waits
-of 1–5 seconds. Retries retain live state and any successfully produced summary;
-failed saves are repaired before work advances. Cancellation or disabling
-auto-continue stops retries. Manual `/compact` retains bounded retries and waits
-for the next user input after success.
+Compaction with auto-continue off retries transient or malformed model responses
+within the same worker and its shared `compaction_max_requests` budget. Retry waits
+are visible and cancellable; completed writes are not replayed. Exhausting recovery
+stops the run with the original context retained; a later submission or manual
+compaction can try again. Authentication, request-budget, and persistence errors
+stop immediately.
+
+With auto-continue enabled, generation, persistence, and automatic summarization
+errors retain the session's indefinite recovery policy, with waits of 1–5 seconds.
+Retries retain live state and any successfully produced summary; failed saves are
+repaired before work advances. Cancellation or disabling auto-continue stops retries.
+Manual `/compact` retains bounded retries and waits for the next user input after
+success. If the next usage report remains above the threshold, automatic compaction
+is disabled until manual compaction succeeds or another session is opened.
 Compaction workers do not run auto-compaction. Each committed successor retains the
 same live tool owner and the run's usage and truncation accounting.
 

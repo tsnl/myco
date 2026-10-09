@@ -143,7 +143,7 @@ fn automatic_compaction_retries_keep_the_same_task_and_cap_each_wait_at_five_sec
                 1
             );
             assert!(runner.agent.state().pending_operation().is_some());
-            assert!(!runner.workflow.auto_failed);
+            assert!(!runner.workflow.auto_ineffective);
         }
     });
 }
