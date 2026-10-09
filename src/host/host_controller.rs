@@ -807,16 +807,40 @@ impl HostController {
     }
 }
 
-/// Bound a remote wait from the tool's requested timeout. Bash validates the
-/// value independently; clamping here keeps malformed input from disabling
-/// the transport watchdog before the worker can reject it.
+/// Wait until exec should finish or yield, plus transport grace. Background
+/// waiting does not impose a kill deadline; the host validates both parameters.
+/// Invalid values cannot make the transport wait indefinitely.
 fn response_timeout(tool_use: &ToolUse) -> Duration {
-    let tool_ms = tool_use
+    let timeout = tool_use
         .input
         .get("timeout_ms")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(DEFAULT_RESPONSE_TIMEOUT_MS)
-        .min(MAX_RESPONSE_TIMEOUT_MS);
+        .and_then(serde_json::Value::as_u64);
+    let background = (tool_use.name == "bash"
+        && tool_use
+            .input
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|action| action == "exec")
+        && tool_use
+            .input
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .is_some())
+    .then(|| {
+        tool_use
+            .input
+            .get("background_after")
+            .and_then(serde_json::Value::as_u64)
+    })
+    .flatten()
+    .filter(|millis| (1..=MAX_RESPONSE_TIMEOUT_MS).contains(millis));
+    let tool_ms = match (timeout, background) {
+        (Some(timeout), Some(background)) => timeout.min(background),
+        (Some(timeout), None) => timeout,
+        (None, Some(background)) => background,
+        (None, None) => DEFAULT_RESPONSE_TIMEOUT_MS,
+    }
+    .min(MAX_RESPONSE_TIMEOUT_MS);
     Duration::from_millis(tool_ms.saturating_add(RESPONSE_GRACE_MS.max(tool_ms / 10)))
 }
 
@@ -1051,6 +1075,51 @@ async fn run_reader(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn response_watchdog_accounts_for_timed_exec_backgrounding() {
+        for (input, expected_ms) in [
+            (
+                serde_json::json!({"command":"sleep 100", "background_after":90000}),
+                99000,
+            ),
+            (
+                serde_json::json!({"command":"sleep 100", "background_after":90000, "timeout_ms":1000}),
+                6000,
+            ),
+            (
+                serde_json::json!({"action":"exec", "command":"sleep 100", "background_after":1000, "timeout_ms":90000}),
+                6000,
+            ),
+            (serde_json::json!({"command":"sleep 100"}), 66000),
+            (
+                serde_json::json!({"command":"sleep 100", "background_after":0}),
+                66000,
+            ),
+            (
+                serde_json::json!({"command":"sleep 100", "background_after":1800001}),
+                66000,
+            ),
+            (
+                serde_json::json!({"command":"sleep 100", "background_after":"later"}),
+                66000,
+            ),
+            (
+                serde_json::json!({"action":"read", "session_id":"x", "background_after":90000}),
+                66000,
+            ),
+        ] {
+            let tool = ToolUse {
+                name: "bash".into(),
+                input,
+            };
+            assert_eq!(
+                response_timeout(&tool),
+                Duration::from_millis(expected_ms),
+                "{tool:?}"
+            );
+        }
+    }
+
     use super::*;
 
     /// Hosts under test serve the standard catalog at the resolved default;
