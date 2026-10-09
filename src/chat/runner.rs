@@ -12,7 +12,7 @@ use crate::generative_model::{CatalogModel, Content, GenerateError, GenerativeMo
 use crate::prompts;
 use crate::session::{CompactOutcome, Session, SessionWriter, Thread};
 
-use super::session_turn::{Submission, finish_turn, run_turn};
+use super::session_turn::{Submission, finish_turn, run_turn, settle_stopped_run};
 use super::{
     CompactWorkerError, SessionTurnOutcome, persist_session, run_compact_worker, wire_checkpoint,
 };
@@ -117,14 +117,9 @@ impl SessionRunner {
         model: Arc<dyn GenerativeModel>,
         info: ModelInfo,
     ) -> Result<(), AgentInteractionError> {
-        if !self.agent.state().is_idle() {
-            return Err(StateError::Busy.into());
-        }
         let session = self.runtime.session().clone();
         let _writer = session.writer().await;
-        if self.agent.checkpoint_failed() {
-            self.agent.checkpoint()?;
-        }
+        settle_stopped_run(&mut self.agent)?;
         let mut next = self.agent.state().clone();
         if crate::RuntimeRecord::latest(self.agent.history()).is_some_and(|old| old.model != info) {
             next.replace_context(self.agent.history().to_vec(), None)?;
@@ -255,6 +250,7 @@ impl SessionRunner {
             _ = cancel.cancelled() => return Err(AgentInteractionError::Cancelled),
             writer = session.writer() => writer,
         };
+        settle_stopped_run(&mut self.agent)?;
         let outcome = self
             .workflow
             .compact(

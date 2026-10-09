@@ -5,6 +5,9 @@ use crate::core::CancelToken;
 use crate::generative_model::{Content, Message};
 
 mod session_turn;
+
+#[cfg(test)]
+mod recovery_tests;
 pub use session_turn::{SessionTurnOutcome, persist_session, run_session_turn, wire_checkpoint};
 
 mod followup;

@@ -217,8 +217,19 @@ impl AgentState {
 
     /// Explicitly abandon work whose future was dropped. Completed observations
     /// survive; an executing tool batch is reconciled as unknown, never replayed.
+    /// Live intents that never began have known, unexecuted outcomes.
     pub fn recover_interrupted(&mut self) -> Result<(), StateError> {
-        self.history = recover_checkpoint(self.history.clone(), self.pending_operation())?;
+        if self.executing {
+            self.history = recover_checkpoint(self.history.clone(), self.pending_operation())?;
+        } else if let Phase::Tools {
+            operation, count, ..
+        } = self.phase
+        {
+            let results = (0..count).map(|_| ToolResult::err(
+                "not executed: the run stopped before this tool batch began. Reconsider this action using the latest input before trying again.",
+            )).collect();
+            self.tools_completed(operation, results, true)?;
+        }
         self.phase = Phase::Ready;
         self.executing = false;
         Ok(())
