@@ -1559,9 +1559,9 @@ context_window = 100000
                     animation.pause(); animation.currentTime = time;
                 }
             })""", phase)
-            for panel in [tool, composer]:
+            for panel, color in [(tool, 'rgb(255, 255, 255)'), (composer, 'rgb(139, 213, 220)')]:
                 expect(panel).to_have_css('border-top-width', '2px')
-                expect(panel).to_have_css('border-top-color', 'rgb(139, 213, 220)')
+                expect(panel).to_have_css('border-top-color', color)
                 self.assertNotEqual(panel.evaluate('n => getComputedStyle(n).boxShadow'), 'none')
         for state, color in [('done', 'rgb(166, 218, 149)'), ('failed', 'rgb(237, 135, 150)'), ('unknown', 'rgb(229, 200, 144)')]:
             page.locator('.tool').first.evaluate('(n, state) => n.className = `tool ${state}`', state)
