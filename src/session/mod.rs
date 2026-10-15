@@ -13,6 +13,7 @@
 mod archive;
 mod attach;
 mod compact;
+pub mod inbox;
 mod lock;
 mod search;
 mod thread;
