@@ -94,11 +94,15 @@ fn inspect_words(mut words: &[Option<String>], depth: usize) -> Result<(), Strin
         let program = name.rsplit('/').next().unwrap_or(name);
         match program {
             "nohup" => return Err(REJECTED.into()),
-            "command" | "exec" | "env" | "nice" | "time" | "sudo" => {
+            "command" | "exec" | "env" | "nice" | "time" | "timeout" | "sudo" => {
                 let Some(command) = wrapped_command(program, arguments) else {
                     return Ok(());
                 };
-                words = command;
+                words = if program == "timeout" {
+                    command.get(1..).unwrap_or_default()
+                } else {
+                    command
+                };
             }
             "busybox" | "toybox" => words = arguments,
             "bash" | "sh" | "dash" | "zsh" | "ksh" => {
@@ -150,6 +154,7 @@ fn option_has_value(program: &str, option: &str) -> bool {
         ),
         "nice" => matches!(option, "-n" | "--adjustment"),
         "time" => matches!(option, "-f" | "--format" | "-o" | "--output"),
+        "timeout" => matches!(option, "-k" | "--kill-after" | "-s" | "--signal"),
         "sudo" => matches!(
             option,
             "-u" | "--user"
@@ -309,6 +314,9 @@ mod tests {
             "env --chdir /tmp nohup true",
             "nice -n 10 nohup true",
             "time -p nohup true",
+            "timeout 30s nohup true",
+            "timeout -k 1s --signal TERM 30s nohup true",
+            "timeout --kill-after=1s -- 30s /usr/bin/nohup true",
             "sudo -u worker nohup true",
             "busybox nohup true",
             "bash -lc 'nohup true'",
@@ -338,6 +346,7 @@ mod tests {
             "command -pv nohup",
             "env -u nohup echo okay",
             "exec -a nohup echo okay",
+            "timeout -k 1s 30s printf nohup",
             "sleep 1 & wait",
             "nohup\\\ntrue",
         ] {
