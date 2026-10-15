@@ -237,6 +237,12 @@ html.viewing-image { overflow: hidden; }
 #activity-empty { color: var(--dim); }
 .activity-section ul { margin: 12px 0 0; padding-left: 1.5em; color: var(--cyan); }
 .activity-section li { overflow-wrap: anywhere; margin-bottom: 10px; }
+.inbox-event { border-left: 2px solid var(--dim); padding: 0 0 0 12px; list-style: none; }
+.inbox-event[data-state="pending"], .inbox-event[data-state="running"] { border-color: var(--cyan); }
+.inbox-event p { color: #e6e6e6; margin: 0 0 6px; white-space: pre-wrap; }
+.inbox-state, .inbox-due, .inbox-expiry { display: block; color: var(--dim); font-size: .85em; }
+.inbox-state { text-transform: capitalize; }
+.inbox-event button { margin-top: 6px; }
 .active-call { position: relative; --rim-color: #fff; display: block; width: 100%; text-align: left; border: 2px solid var(--rim-color); background: var(--glass-control); color: var(--rim-color); padding: 10px 12px; white-space: normal; overflow-wrap: anywhere; }
 .active-call:hover { border-color: var(--rim-color); text-decoration: underline; }
 /* Settings modal */

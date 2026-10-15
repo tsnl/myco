@@ -23,7 +23,7 @@ export function sessionTimers(sendAction) {
   return function render(timers, online) {
     connected = online;
     $('active-timers').hidden = !timers.length;
-    const key = JSON.stringify([timers.map(({ id, message, due_at }) => [id, message, due_at]), online]);
+    const key = JSON.stringify([timers.map(({ id, message, due_at, priority, expires_at }) => [id, message, due_at, priority, expires_at]), online]);
     if (list.dataset.timers !== key) {
       const focused = document.activeElement?.dataset.timerId;
       list.dataset.timers = key;
@@ -47,7 +47,10 @@ export function sessionTimers(sendAction) {
             cancel.disabled = !connected;
           }
         };
-        item.append(element('p', 'timer-message', timer.message), remaining, when, cancel);
+        const priority = element('span', 'timer-due', `Priority: ${(timer.priority || 'normal').replaceAll('_', ' ')}`);
+        item.append(element('p', 'timer-message', timer.message), priority, remaining, when);
+        if (timer.expires_at) item.append(element('span', 'timer-due', `Expires ${new Date(timer.expires_at).toLocaleString()}`));
+        item.append(cancel);
         clocks.set(timer.id, { node: remaining, deadline: 0 }); list.append(item);
       }
       if (focused && $('activity').open) (list.querySelector(`[data-timer-id="${focused}"]`) || $('activity-close')).focus({ preventScroll: true });

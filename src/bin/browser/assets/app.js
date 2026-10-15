@@ -1,6 +1,7 @@
 import { $, api, element, error, clearError, requestId, setArchived, trackToolbarHeight, bindNewSessionLink } from './common.js';
 import { showActivity } from './activity.js';
 import { sessionTimers } from './timers.js';
+import { activeEvents, renderInbox } from './inbox.js';
 import { messageComposer } from './composer.js';
 import { messageNavigation } from './message-navigation.js';
 import { sessionRenamer } from './rename.js';
@@ -354,7 +355,9 @@ function activity() {
   const calls = state.blocks.flatMap((block, index) => block.kind === 'tool' && block.running ? [{ block, index }] : []);
   calls.sort((a, b) => Number(b.block.blocking) - Number(a.block.blocking));
   const timers = state.timers || [];
-  const count = calls.length + timers.length;
+  const inbox = state.inbox || [];
+  const pending = activeEvents(inbox);
+  const count = calls.length + pending.length;
   $('activity-count').textContent = count;
   $('activity-count').hidden = !count;
   $('activity-toggle').classList.toggle('has-activity', connected && (state.busy || !!count));
@@ -364,9 +367,10 @@ function activity() {
   $('active-calls').hidden = !calls.length;
   activityCalls(calls);
   renderTimers(timers, connected);
+  renderInbox(inbox, timers, state.session_id, connected);
   const current = calls.length ? `${calls.map(({ block }) => block.tool.name).join(', ')} · running` : state.status || 'Ready';
   const status = $('connection');
-  showActivity(status, state.busy ? state.status : calls.length ? 'Running' : timers.length ? 'Waiting' : state.status || 'Ready', state.busy, connected);
+  showActivity(status, state.busy ? state.status : calls.length ? 'Running' : pending.length ? 'Waiting' : state.status || 'Ready', state.busy, connected);
   $('composer-frame').dataset.state = !connected ? 'reconnecting'
     : state.status === 'Stopped' ? 'stopped' : state.status === 'Cancelling' ? 'cancelling'
     : state.busy || count ? 'running' : 'ready';

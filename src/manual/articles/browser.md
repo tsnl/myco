@@ -267,7 +267,7 @@ its controls on a separate row on narrow screens. Activity counts appear only
 while tools, background sessions, or timers are running.
 
 Each tool appears as soon as execution starts, with a truncated argument
-preview in its collapsed header. Running calls are cyan; completed calls turn
+preview in its collapsed header. Running calls are white; completed calls turn
 green, and failures red. Expand a block to inspect its complete recorded input,
 output, images, and outcome. Input shows each top-level key as a bold label above
 its value. Strings retain their newlines without JSON quoting; nested objects and
@@ -321,7 +321,9 @@ and owning sessions separate. Tool results retain an optional `resource` referen
 (`id` and `instance_id`); older stored results remain readable. Live status is a
 browser observation and does not rewrite the original result or consume output.
 
-### Session timers
+<a id="session-timers"></a>
+
+### Session timers and event inbox
 
 Ask the assistant to check back later, for example, “Check the build in two
 minutes.” In server sessions, the local **`timer`** tool supports:
@@ -335,11 +337,11 @@ minutes.” In server sessions, the local **`timer`** tool supports:
 
 Use exactly one of `after_seconds` or `at`. Absolute timestamps require a timezone.
 Timers accept delays from 0.1 seconds to 30 days; the worker checks deadlines every
-second. There can be up to 20 pending timers per session, with messages up to 8000
-characters. Scheduling returns immediately and does not keep a model request open.
+second. There can be up to 20 pending or running timers per session, with messages
+up to 8000 characters. Scheduling returns immediately and does not keep a model request open.
 
-When a timer becomes due, its message joins the same FIFO as user follow-ups. An
-idle session wakes automatically; a busy session receives it at the next settled
+When a normal-priority timer becomes due, its message joins the same FIFO as user
+follow-ups. An idle session wakes automatically; a busy session receives it at the next settled
 tool/model boundary. A full queue retains the overdue timer until space is available.
 Held edits keep their queue position. Due timer messages can be edited or unqueued
 using the normal controls, and appear under **SYSTEM · Timer fired** when delivered.
@@ -352,9 +354,59 @@ applies only to that timer; once delivery has started, use the normal run contro
 
 Timers belong to their session and profile. They survive tab closes, model changes,
 and compaction. Archiving preserves them; **Cancel run** stops the current turn but
-does not cancel scheduled timers. The server must remain running: pending timers
-and undelivered queue entries are in memory and are cleared on restart. Timers are
-one-shot; recurring schedules and terminal-only timers are not supported.
+does not cancel scheduled timers. Timers and event triggers are saved before
+acceptance. Starting the server restores profiles and sessions with pending inbox entries, including archived sessions,
+without requiring a browser tab. Overdue events run unless their expiry has passed.
+Ordinary queued user messages are still held in memory. Timers are one-shot;
+recurring schedules and terminal-only timers are not supported.
+
+The **`inbox`** tool supports `post`, `list`, and `cancel`. Posting requires
+`message`; `at` or `after_seconds` schedules it, otherwise delivery is immediate.
+`event_id` is an optional stable UUID for retrying the same post. Scheduled
+posts with a stable ID require `at` rather than a relative delay. Cancellation
+requires that UUID. `list` includes pending, delivering, running, and recent
+completed, failed, interrupted, expired, and cancelled events.
+
+Both `timer set` and `inbox post` accept `priority` (`normal`, `urgent`, or
+`time_sensitive`) and `expires_at` (RFC 3339 with timezone). Normal delivery
+backgrounds active bash calls and waits for a settled tool/model boundary.
+Urgent and time-sensitive delivery takes priority over ordinary queued input,
+including held edits. It first requests backgrounding for every active bash call,
+waits for their results, then cancels the current turn and starts a fresh turn with
+the event. Other active tools receive normal cancellation. Retained background
+processes remain owned by the same session. Cancellation already requested by the
+user settles before any event starts.
+
+Expiry applies only before delivery starts; it never kills a running turn or
+process. The **Activity → Event inbox** section shows event text, priority, due
+time, expiry, status, and cancellation. Scheduled timers keep their countdowns in
+**Timers**. Event text remains ordinary input; priority does not grant approval or
+additional tool authority.
+
+Each session accepts up to 100 active events in total and retains its last 100
+terminal outcomes. Idempotency lasts while the entry is retained. Reusing an ID
+with different input is rejected. Pending event edits and held delivery survive
+restart. A delivery claim is reconciled against saved input across all session
+threads: input already committed is marked interrupted after a crash and is never
+replayed; an uncommitted claim becomes pending again. Running effects are not
+replayed or represented as successfully completed after a restart.
+
+External triggers use the profile API (the same origin checks as other actions):
+
+```sh
+curl -X POST "$MYCO_SERVER_URL/api/sessions/$SESSION_ID/inbox" \
+  -H 'Content-Type: application/json' \
+  -d '{"event_id":"4c2f8996-5963-4c56-b495-d2c9c2166411","message":"Build finished; review its result.","priority":"urgent"}'
+```
+
+`event_id` is required for HTTP posts; generate a fresh UUID for each distinct
+event and reuse it when retrying. Optional `at` and `expires_at` are absolute
+RFC 3339 timestamps. A successful POST returns HTTP 202 and the accepted entry.
+`GET /api/sessions/{id}/inbox` returns `{"events":[...]}`;
+`POST /api/sessions/{id}/inbox/{event_id}/cancel` cancels pending delivery.
+Session and profile ownership apply to every operation. Inbox files live under
+the profile's `inbox/` directory with their own versioned format; the conversation
+file format is unchanged.
 
 ### Compaction activity
 

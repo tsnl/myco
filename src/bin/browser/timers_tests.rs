@@ -16,6 +16,28 @@ async fn tool(app: &Arc<App>, input: Value) -> myco::generative_model::ToolResul
 }
 
 #[tokio::test(start_paused = true)]
+async fn stable_timer_ids_preserve_exact_absolute_times_and_retry_after_the_due_time() {
+    let (app, _work) = app();
+    app.live.lock().unwrap().snapshot.busy = true;
+    let id = Uuid::new_v4();
+    let at = (app.clock.now() + chrono::Duration::seconds(1)).to_rfc3339();
+    let input = json!({"action":"set", "event_id":id, "at":at, "message":"Once"});
+    assert!(!tool(&app, input.clone()).await.is_error);
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(!tool(&app, input).await.is_error);
+    assert_eq!(app.inbox_entries().len(), 1);
+    assert_eq!(app.inbox_entries()[0].due_at.to_rfc3339(), at);
+    assert!(
+        tool(
+            &app,
+            json!({"action":"set", "event_id":id, "after_seconds":1, "message":"Once"})
+        )
+        .await
+        .is_error
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn timer_wakes_an_idle_session_once_without_a_browser_connection() {
     let (app, mut work) = app();
     let timer = app
@@ -78,7 +100,10 @@ async fn due_timers_queue_behind_user_input_and_can_be_cancelled_before_delivery
             .len(),
         1
     );
-    assert!(app.cancel_timer(timer.id).is_err());
+    assert!(
+        app.cancel_timer(timer.id).is_ok(),
+        "cancellation retries are idempotent"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -106,14 +131,14 @@ async fn full_queue_retains_due_timers_and_delivery_respects_deadline_order() {
     );
     app.live.lock().unwrap().snapshot.queued.clear();
     app.fire_timers();
-    let first = app.claim_followup().unwrap();
+    let first = app.claim_followup().unwrap().unwrap();
     assert_eq!(first.timer.unwrap().id, early.id);
     assert!(
         app.cancel_timer(early.id).is_err(),
         "claimed delivery must not be cancelled"
     );
     app.finish_followup(first.request_id, None);
-    let second = app.claim_followup().unwrap();
+    let second = app.claim_followup().unwrap().unwrap();
     assert_eq!(second.timer.unwrap().id, late.id);
 }
 
@@ -191,7 +216,7 @@ async fn timer_followups_are_labeled_system_messages_live_and_after_reload() {
         .unwrap();
     tokio::time::advance(Duration::from_secs(1)).await;
     app.fire_timers();
-    let message = app.claim_followup().unwrap();
+    let message = app.claim_followup().unwrap().unwrap();
     let content = message.content(1000).unwrap();
     assert!(matches!(&content[0], Content::System { kind, .. } if kind == "timer"));
     let live = Block::input(&content, Some(view::timestamp(&message.accepted_at)));

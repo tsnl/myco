@@ -81,7 +81,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
             if not isinstance(content, str):
                 content = " ".join(part.get("text", "") for part in content)
             resuming |= '# Resumption\n\n' in content
-            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links|profile|getlink|view image|timer|autonomy)\b", content)
+            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links|profile|getlink|view image|timer|autonomy|event)\b", content)
             if match:
                 prompts.append(match.group(0))
         prompt = prompts[-1] if prompts else 'Alpha images'
@@ -108,6 +108,8 @@ class Provider(http.server.BaseHTTPRequestHandler):
                 events = tool({'action': 'disable_auto_continue'}, 'session_meta')
             else:
                 events = reply('More work remains.' if not count else 'Task complete.')
+        elif "event" in prompt:
+            events = reply("Event handled.")
         elif "timer" in prompt:
             if not count:
                 events = tool(getattr(fixture, 'timer_input', {
@@ -194,6 +196,9 @@ class Provider(http.server.BaseHTTPRequestHandler):
                 fixture.compaction_release.wait(30)
             elif resuming:
                 fixture.continuation_release.wait(30)
+            if 'timer' in prompt and count == 1 and getattr(fixture, 'timer_generate', False):
+                fixture.timer_generation_received.set()
+                fixture.generation_releases[name].wait(30)
             if "generate" in prompt:
                 fixture.generation_releases[name].wait(30)
             for index, event in enumerate(events):
@@ -605,14 +610,15 @@ context_window = 100000
         expect(page.locator('.system .body')).to_contain_text('Timer fired')
         self.assertEqual(len(self.requests), 3, 'Reload must not fire a timer twice')
 
-    def test_timer_joins_running_tool_results_and_can_be_edited_before_cancel_delivers_it(self):
-        self.timer_wait = True
-        self.timer_input = {'action': 'set', 'after_seconds': 0.2, 'message': 'Alpha timer original'}
+    def test_timer_can_be_edited_during_generation_before_cancel_delivers_it(self):
+        self.timer_generate = True
+        self.timer_generation_received = threading.Event()
+        self.timer_input = {'action': 'set', 'after_seconds': 3, 'message': 'Alpha timer original'}
         page = self.session(self.page)
         self.submit(page, 'Alpha timer')
-        expect(page.locator('.tool.running')).to_have_count(1)
+        self.assertTrue(self.timer_generation_received.wait(5))
         expect(page.locator('#queued-list .queued-content')).to_have_text('Timer · Alpha timer original')
-        self.assertEqual(len(self.requests), 2, 'Expiry must not interrupt a running tool')
+        self.assertEqual(len(self.requests), 2, 'Normal expiry must wait for the model boundary')
         page.get_by_role('button', name='Edit', exact=True).click()
         page.fill('#prompt', 'Alpha timer edited')
         page.click('#send')
@@ -624,12 +630,13 @@ context_window = 100000
         expect(page.locator('.assistant .body').last).to_have_text('Timer woke the assistant.')
         expect(page.locator('#queued')).to_be_hidden()
         request = self.requests[-1]['input']
-        self.assertIn('cancel', json.dumps([item for item in request if item.get('type') == 'function_call_output']))
         self.assertIn('[myco: Timer fired]', json.dumps(request))
         self.assertEqual(len(self.requests), 3)
 
     def test_timer_activity_cancellation_is_scoped_and_survives_model_changes(self):
-        self.timer_input = {'action': 'set', 'after_seconds': 120, 'message': 'Check deployment status'}
+        expiry = (datetime.now().astimezone() + timedelta(minutes=5)).isoformat()
+        self.timer_input = {'action': 'set', 'after_seconds': 120, 'message': 'Check deployment status',
+                            'priority': 'urgent', 'expires_at': expiry}
         self.add_profile()
         page = self.session(self.page, profile='default')
         self.submit(page, 'Alpha timer')
@@ -649,6 +656,8 @@ context_window = 100000
             page.set_viewport_size({'width': width, 'height': 850})
             page.click('#activity-toggle')
             expect(page.locator('.active-timer')).to_contain_text('Check deployment status')
+            expect(page.locator('.active-timer')).to_contain_text('Priority: urgent')
+            expect(page.locator('.active-timer')).to_contain_text('Expires')
             page.screenshot(path=str(self.artifacts / f'timer-{width}.png'))
             page.click('#activity-close')
         page.click('#activity-toggle')
@@ -684,7 +693,130 @@ context_window = 100000
         self.assertNotEqual(old, new)
         expect(page.locator('#connection')).to_have_text('Ready')
 
-    def test_pending_timers_are_cleared_when_the_server_restarts(self):
+    def post_inbox_event(self, page, message='Beta event', priority='normal', **fields):
+        endpoint = page.url.replace('/sessions/', '/api/sessions/') + '/inbox'
+        payload = {'event_id': str(uuid.uuid4()), 'message': message, 'priority': priority, **fields}
+        response = self.context.request.post(endpoint, data=payload)
+        self.assertEqual(response.status, 202, response.text())
+        return endpoint, payload
+
+    def inbox_state(self, endpoint, event_id, expected):
+        for _ in range(100):
+            entries = self.context.request.get(endpoint).json()['events']
+            match = next((entry for entry in entries if entry['request']['event_id'] == event_id), None)
+            if match and match['state'] == expected:
+                return match
+            self.page.wait_for_timeout(100)
+        self.fail(f'Event {event_id} did not reach {expected}: {entries}')
+
+    def test_urgent_inbox_event_retains_bash_and_retries_do_not_replay_input(self):
+        page = self.session(self.page)
+        self.submit(page, 'Alpha wait')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        endpoint, payload = self.post_inbox_event(page, priority='urgent')
+        expect(page.locator('.assistant .body').last).to_have_text('Event handled.')
+        self.inbox_state(endpoint, payload['event_id'], 'completed')
+        self.assertFalse((self.home / 'Alpha-done').exists())
+        expect(page.locator('.tool.running')).to_have_count(1)
+        response = self.context.request.post(endpoint, data=payload)
+        self.assertEqual(response.status, 202)
+        self.assertEqual(self.turns.get('Beta event'), 1)
+        expect(page.locator('.system .body')).to_contain_text('Beta event')
+        (self.home / 'Alpha-release').touch()
+        expect(page.locator('.tool.running')).to_have_count(0)
+        self.assertTrue((self.home / 'Alpha-done').exists(), 'The original command must finish after the trigger')
+        page.click('#activity-toggle')
+        expect(page.locator('.inbox-event')).to_contain_text('completed · urgent')
+
+    def test_normal_timer_backgrounds_bash_and_delivers_at_its_settled_boundary(self):
+        self.timer_wait = True
+        self.timer_input = {'action': 'set', 'after_seconds': 3, 'message': 'Alpha timer while building'}
+        page = self.session(self.page)
+        self.submit(page, 'Alpha timer')
+        expect(page.locator('.assistant .body').last).to_have_text('Timer woke the assistant.')
+        expect(page.locator('.tool.running')).to_have_count(1)
+        (self.home / 'Alpha-release').touch()
+        expect(page.locator('.tool.running')).to_have_count(0)
+        self.assertEqual(len(self.requests), 3)
+
+    def test_inbox_input_is_not_replayed_after_a_profile_crashes_during_generation(self):
+        page = self.session(self.page)
+        endpoint, payload = self.post_inbox_event(page, message='Alpha generate')
+        self.assertTrue(self.request_received.wait(5))
+        self.inbox_state(endpoint, payload['event_id'], 'running')
+        pid = self.profile_pid('default')
+        self.assertIsNotNone(pid)
+        os.kill(pid, signal.SIGKILL)
+        page.reload()
+        expect(page.locator('#model')).to_be_enabled()
+        self.inbox_state(endpoint, payload['event_id'], 'interrupted')
+        self.assertEqual(self.turns.get('Alpha generate'), 1)
+        expect(page.locator('.system .body')).to_contain_text('Alpha generate')
+        self.assertEqual(self.context.request.post(endpoint, data=payload).status, 202)
+        self.assertEqual(self.turns.get('Alpha generate'), 1)
+
+    def test_normal_inbox_event_waits_for_generation_boundary(self):
+        page = self.session(self.page)
+        self.submit(page, 'Alpha generate')
+        self.assertTrue(self.request_received.wait(5))
+        endpoint, payload = self.post_inbox_event(page)
+        self.inbox_state(endpoint, payload['event_id'], 'pending')
+        page.wait_for_timeout(300)
+        self.assertNotIn('Beta event', self.turns)
+        self.generation_releases['Alpha'].set()
+        expect(page.locator('.assistant .body').last).to_have_text('Event handled.')
+        self.inbox_state(endpoint, payload['event_id'], 'completed')
+
+    def test_urgent_inbox_event_interrupts_a_waiting_model_request(self):
+        page = self.session(self.page)
+        self.submit(page, 'Alpha generate')
+        self.assertTrue(self.request_received.wait(5))
+        endpoint, payload = self.post_inbox_event(page, priority='time_sensitive')
+        expect(page.locator('.assistant .body').last).to_have_text('Event handled.')
+        self.assertFalse(self.generation_releases['Alpha'].is_set())
+        self.inbox_state(endpoint, payload['event_id'], 'completed')
+
+    def test_inbox_expiry_drops_stale_input_without_cancelling_the_turn(self):
+        page = self.session(self.page)
+        self.submit(page, 'Alpha generate')
+        self.assertTrue(self.request_received.wait(5))
+        expiry = (datetime.now().astimezone() + timedelta(seconds=1)).isoformat()
+        endpoint, payload = self.post_inbox_event(page, expires_at=expiry)
+        self.inbox_state(endpoint, payload['event_id'], 'expired')
+        self.assertNotIn('Beta event', self.turns)
+        self.generation_releases['Alpha'].set()
+        expect(page.locator('#model')).to_be_enabled()
+        self.assertNotIn('Beta event', self.turns)
+        page.click('#activity-toggle')
+        expect(page.locator('.inbox-event')).to_contain_text('expired · normal')
+
+    def test_inbox_cancellation_is_scoped_and_does_not_invoke_a_model(self):
+        page = self.session(self.page)
+        at = (datetime.now().astimezone() + timedelta(minutes=1)).isoformat()
+        endpoint, payload = self.post_inbox_event(page, at=at)
+        other = self.session()
+        foreign = other.url.replace('/sessions/', '/api/sessions/') + '/inbox/' + payload['event_id'] + '/cancel'
+        self.assertEqual(self.context.request.post(foreign, data={}).status, 409)
+        page.click('#activity-toggle')
+        expect(page.locator('.inbox-event')).to_contain_text('Scheduled · normal')
+        page.get_by_role('button', name='Cancel event', exact=True).click()
+        self.inbox_state(endpoint, payload['event_id'], 'cancelled')
+        expect(page.locator('.inbox-event')).to_contain_text('cancelled · normal')
+        self.assertEqual(len(self.requests), 0)
+
+    def test_timer_restores_and_wakes_after_restart_without_an_open_tab(self):
+        self.timer_woke = threading.Event()
+        self.timer_input = {'action': 'set', 'after_seconds': 8, 'message': 'Alpha timer after restart'}
+        page = self.session(self.page)
+        self.submit(page, 'Alpha timer')
+        expect(page.locator('#connection')).to_have_text('Waiting')
+        page.close()
+        self.stop(self.process)
+        self.process, _ = self.launch(port=urlsplit(self.origin).port)
+        self.assertTrue(self.timer_woke.wait(10), 'Saved timer must wake without opening its session')
+        self.assertEqual(self.turns.get('Alpha timer'), 3)
+
+    def test_pending_timers_survive_server_restart(self):
         self.timer_input = {'action': 'set', 'after_seconds': 120, 'message': 'Check build later'}
         page = self.session(self.page)
         self.submit(page, 'Alpha timer')
@@ -692,8 +824,8 @@ context_window = 100000
         self.stop(self.process)
         self.process, _ = self.launch(port=urlsplit(self.origin).port)
         page.reload()
-        expect(page.locator('#connection')).to_have_text('Ready')
-        expect(page.locator('#activity-count')).to_be_hidden()
+        expect(page.locator('#connection')).to_have_text('Waiting')
+        expect(page.locator('#activity-count')).to_have_text('1')
         expect(page.locator('.system')).to_have_count(0)
         self.assertEqual(len(self.requests), 2)
 

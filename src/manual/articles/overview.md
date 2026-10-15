@@ -662,3 +662,9 @@ workspace writes leave the shared prompt prefix intact for same-model forks.
 - Conversation resume ≠ restored bash sessions or editor state.
 - Bash sessions die when the host process exits (server exit, host crash, SSH drop). Local in-process
   sessions also end when their owning session runtime is released (for example, `/new`).
+
+Server sessions provide `timer` for durable one-shot follow-ups and `inbox` for
+immediate or scheduled event triggers. Normal events wait at a settled boundary;
+`urgent` and `time_sensitive` events background foreground bash before interrupting
+the turn. Optional expiry drops stale pending events. See `browser` for tool
+arguments, HTTP endpoints, persistence, and activity controls.

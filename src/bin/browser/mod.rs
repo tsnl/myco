@@ -60,6 +60,10 @@ async fn run_worker(args: Args) -> Result<(), String> {
             .await
             .map_err(|e| e.to_string())?;
     }
+    let inbox_server = server.clone();
+    tokio::spawn(async move {
+        inbox_server.sessions.restore_inboxes().await;
+    });
     println!(
         "{}",
         serde_json::to_string(&profile_worker::Ready {

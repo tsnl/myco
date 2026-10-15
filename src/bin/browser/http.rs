@@ -98,6 +98,14 @@ pub(super) fn router(server: Arc<Server>) -> Router {
         )
         .route("/api/sessions/{id}/cancel", post(session_cancel))
         .route("/api/sessions/{id}/background", post(session_background))
+        .route(
+            "/api/sessions/{id}/inbox",
+            get(session_inbox).post(post_session_event),
+        )
+        .route(
+            "/api/sessions/{id}/inbox/{event}/cancel",
+            post(cancel_session_event),
+        )
         .route("/api/sessions/{id}/archive", post(session_archive))
         .route("/api/sessions/{id}/rename", post(session_rename))
         .route(
@@ -274,6 +282,39 @@ async fn create_session(
     Json(request): Json<CreateSession>,
 ) -> Result<Json<Value>, Error> {
     Ok(Json(json!({"id": server.sessions.create(request).await?})))
+}
+
+pub(super) async fn session_inbox(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, Error> {
+    let app = server.sessions.open(&id).await?;
+    Ok(Json(json!({"events": app.inbox_entries()})))
+}
+
+pub(super) async fn post_session_event(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+    Json(request): Json<myco::session::inbox::EventRequest>,
+) -> Result<(StatusCode, Json<Value>), Error> {
+    let app = server.sessions.open(&id).await?;
+    let entry = tokio::task::spawn_blocking(move || {
+        app.post_event(request, myco::session::inbox::Source::Trigger)
+    })
+    .await
+    .map_err(|e| Error::Internal(e.to_string()))??;
+    Ok((StatusCode::ACCEPTED, Json(json!(entry))))
+}
+
+pub(super) async fn cancel_session_event(
+    State(server): State<Arc<Server>>,
+    Path((id, event)): Path<(String, uuid::Uuid)>,
+) -> Result<StatusCode, Error> {
+    let app = server.sessions.open(&id).await?;
+    tokio::task::spawn_blocking(move || app.cancel_timer(event))
+        .await
+        .map_err(|e| Error::Internal(e.to_string()))??;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

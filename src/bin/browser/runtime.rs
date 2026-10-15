@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use myco::generative_model::TokenUsage;
+use myco::session::inbox::{Entry as InboxEntry, Inbox, State as InboxState};
 use myco::session::{ActiveSession, ArchiveFilter, SessionListEntry, SessionWriteLock};
 use myco::{AgentEvent, CancelToken, EventSink};
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,10 @@ mod tests;
 #[cfg(test)]
 #[path = "timers_tests.rs"]
 mod timers_tests;
+
+#[cfg(test)]
+#[path = "inbox_tests.rs"]
+mod inbox_tests;
 
 #[derive(Debug)]
 pub(super) enum Error {
@@ -82,6 +87,7 @@ struct Snapshot {
     tasks: Vec<String>,
     queued: VecDeque<QueuedMessage>,
     timers: Vec<timers::Timer>,
+    inbox: Vec<InboxEntry>,
     blocks: Vec<Block>,
 }
 
@@ -92,6 +98,7 @@ impl Snapshot {
             "title": self.title, "archived": self.archived, "model": self.model,
             "auto_continue": self.auto_continue,
             "busy": self.busy, "status": self.status, "queued": self.queued, "timers": self.timers,
+            "inbox": self.inbox,
             "attachment_limits": self.attachment_limits,
             "usage": self.usage, "context_window_tokens": self.context_window_tokens,
         })
@@ -99,6 +106,7 @@ impl Snapshot {
 }
 
 struct Live {
+    inbox: Inbox,
     // Only message blocks from the current, unvalidated generation are replaceable.
     generation_start: Option<usize>,
     retry_notice: Option<usize>,
@@ -132,6 +140,7 @@ impl Update {
 }
 
 pub(super) struct App {
+    clock: timers::Clock,
     live: Mutex<Live>,
     events: broadcast::Sender<Arc<Update>>,
     work: mpsc::Sender<Work>,
@@ -439,6 +448,7 @@ impl EventSink for App {
         match event {
             AgentEvent::GenerationStarted { context } if context.depth == 0 => {
                 let mut live = self.live.lock().unwrap();
+                self.acknowledge_events(&mut live);
                 live.generation_start = Some(live.snapshot.blocks.len());
                 live.service.reset_draft();
                 drop(live);
@@ -499,6 +509,7 @@ impl EventSink for App {
                     &mut live.snapshot,
                     json!({"kind":"block", "index":index, "block":block}),
                 );
+                self.preempt_for_events(&mut live);
             }
             AgentEvent::ToolFinished {
                 call_id,
@@ -515,6 +526,7 @@ impl EventSink for App {
                     let change = json!({"kind":"block", "index":index, "block":snapshot.blocks[index]});
                     self.publish(snapshot, change);
                 }
+                self.preempt_for_events(&mut live);
             }
             AgentEvent::Failure {
                 failure,
@@ -710,6 +722,32 @@ impl Sessions {
         self.start_locked(&mut sessions, session).await
     }
 
+    pub(super) async fn restore_inboxes(&self) {
+        let pending = tokio::task::spawn_blocking(|| {
+            myco::core::myco_home().and_then(|home| pending_inboxes(home.join("inbox")))
+        })
+        .await;
+        let ids = match pending {
+            Ok(Ok(ids)) => ids,
+            Ok(Err(error)) => {
+                eprintln!("browser inbox: {error}");
+                return;
+            }
+            Err(error) => {
+                eprintln!("browser inbox: {error}");
+                return;
+            }
+        };
+        for id in ids {
+            if self.shutdown.is_cancelled() {
+                break;
+            }
+            if let Err(error) = self.open(&id).await {
+                eprintln!("browser inbox {id}: {error}");
+            }
+        }
+    }
+
     async fn start_locked(
         &self,
         sessions: &mut HashMap<String, RunningSession>,
@@ -756,8 +794,12 @@ impl Sessions {
             },
             |config, _, session| {
                 let session = session.snapshot();
-                Arc::new(App {
+                let mut inbox = Inbox::open(Inbox::path_for(&session.id)?, &session.id)?;
+                inbox.settle(&session, InboxState::Interrupted, Utc::now())?;
+                Ok(Arc::new(App {
+                    clock: timers::Clock::new(),
                     live: Mutex::new(Live {
+                        inbox,
                         generation_start: None,
                         retry_notice: None,
                         snapshot: Snapshot {
@@ -785,6 +827,7 @@ impl Sessions {
                             tasks: vec![],
                             queued: VecDeque::new(),
                             timers: vec![],
+                            inbox: vec![],
                             blocks: view::history(session.active_thread()),
                         },
                         cancel: None,
@@ -796,7 +839,7 @@ impl Sessions {
                     work,
                     shutdown: CancelToken::new(),
                     generation: self.generation.clone(),
-                })
+                }))
             },
         )
         .await
@@ -812,6 +855,7 @@ impl Sessions {
             )
             .map_err(Error::Internal)?;
         app.sync(&boot, "Ready");
+        app.fire_timers();
         if let Some(notice) = model_fallback {
             app.notice(notice);
         }
@@ -974,7 +1018,7 @@ impl Sessions {
             let live = running.get(&s.id).map(|session| session.app.live.lock().unwrap());
             let status = live.as_ref().map_or("Saved", |live| {
                 if !live.snapshot.busy && live.snapshot.blocks.iter().any(|block| matches!(block, Block::Tool { running: true, .. })) { "Running" }
-                else if !live.snapshot.busy && !live.snapshot.timers.is_empty() { "Waiting" }
+                else if !live.snapshot.busy && live.snapshot.inbox.iter().any(|entry| entry.state.active()) { "Waiting" }
                 else { live.snapshot.status.as_str() }
             });
             let title = s.title.unwrap_or_else(|| if s.snippet.is_empty() { "New session".into() } else { s.snippet });
@@ -1022,11 +1066,15 @@ async fn worker(
                 _ = &mut observations => unreachable!("resource observation loop ended"),
             }
         };
+        let settled = app.settle_events(&boot.session.snapshot(), &result, cancel.is_cancelled());
         app.sync_with(
             &boot,
             if result.is_ok() { "Ready" } else { "Stopped" },
             |receipts| receipts.finish(request_id, &result, cancel.is_cancelled()),
         );
+        if let Err(error) = settled {
+            app.notice(format!("Inbox: {error}"));
+        }
         if let Err(error) = result {
             app.notice(error);
         }
@@ -1117,7 +1165,10 @@ impl App {
     ) -> std::result::Result<bool, myco::agent::AgentInteractionError> {
         let mut delivered = false;
         for _ in 0..MAX_QUEUED_MESSAGES {
-            let Some(next) = self.claim_followup() else {
+            let Some(next) = self
+                .claim_followup()
+                .map_err(|e| myco::agent::AgentInteractionError::Checkpoint(e.to_string()))?
+            else {
                 break;
             };
             let content = match next.content(image_limit) {
@@ -1131,7 +1182,8 @@ impl App {
             if let Err(error) =
                 myco::chat::append_followup(agent, session, content.clone(), next.accepted_at)
             {
-                self.restore_followup(next.request_id);
+                self.restore_followup(next.request_id)
+                    .map_err(|e| myco::agent::AgentInteractionError::Checkpoint(e.to_string()))?;
                 return Err(error);
             }
             let block = Block::input(&content, Some(view::timestamp(&next.accepted_at)));
@@ -1167,6 +1219,11 @@ impl App {
                     "Request id already used for another action.".into(),
                 ))
             };
+        }
+        if live.inbox.get(request.request_id).is_some() {
+            return Err(Error::Conflict(
+                "Request ID already belongs to an inbox event.".into(),
+            ));
         }
         if request.session_id != live.snapshot.session_id {
             return Err(Error::Conflict(
@@ -1206,6 +1263,7 @@ impl App {
             Action::CancelTimer { timer_id } => self.remove_timer(&mut live, *timer_id)?,
             _ => self.start_work(&mut live, request.clone(), accepted_at)?,
         }
+        self.refresh_inbox(&mut live);
         live.accepted.insert(request.request_id, request);
         if let Err(error) = self.drain_queue(&mut live) {
             let block = Block::Notice {
@@ -1262,4 +1320,39 @@ impl App {
         let change = json!({"kind":"meta", "meta":live.snapshot.metadata()});
         self.publish(&mut live.snapshot, change);
     }
+}
+
+// Inbox discovery does not open sessions, hold writer locks, or run models.
+// A corrupt inbox is reported independently so other sessions can recover.
+pub(super) fn pending_inboxes(
+    directory: std::path::PathBuf,
+) -> std::result::Result<Vec<String>, String> {
+    let files = match std::fs::read_dir(&directory) {
+        Ok(files) => files,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(error) => return Err(format!("Read {}: {error}", directory.display())),
+    };
+    let mut ids = Vec::new();
+    for file in files {
+        let path = file.map_err(|e| e.to_string())?.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let Some(id) = path
+            .file_stem()
+            .and_then(|id| id.to_str())
+            .filter(|id| Uuid::parse_str(id).is_ok())
+        else {
+            continue;
+        };
+        match Inbox::open(path.clone(), id) {
+            Ok(inbox) if inbox.entries().iter().any(|event| event.state.active()) => {
+                ids.push(id.to_owned())
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("browser inbox {id}: {error}"),
+        }
+    }
+    ids.sort();
+    Ok(ids)
 }
