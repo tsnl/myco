@@ -282,7 +282,7 @@ fn exited_child_is_waitable(pid: u32) -> bool {
     result == 0 && unsafe { info.assume_init().si_pid() } == pid as libc::pid_t
 }
 
-fn process_is_running(pid: u32) -> bool {
+pub(super) fn process_is_running(pid: u32) -> bool {
     let output = crate::external_command::PS
         .command()
         .args(["-p", &pid.to_string(), "-o", "stat="])
@@ -595,10 +595,12 @@ fn bare_command_resolves_to_exec() {
         Action::Exec {
             command,
             timeout_ms,
+            background_after,
             max_bytes,
         } => {
             assert_eq!(command, "echo hi");
-            assert_eq!(timeout_ms, DEFAULT_EXEC_TIMEOUT_MS);
+            assert_eq!(timeout_ms, Some(DEFAULT_EXEC_TIMEOUT_MS));
+            assert!(background_after.is_none());
             assert_eq!(max_bytes, DEFAULT_MAX_BYTES);
         }
         _ => panic!("expected Exec"),
@@ -739,7 +741,8 @@ fn assert_timeout_resolution(base: serde_json::Value, default_ms: u64, max_ms: u
         resolve_action(&input)
     };
     let timeout_of = |action: Action| match action {
-        Action::Exec { timeout_ms, .. } | Action::Read { timeout_ms, .. } => timeout_ms,
+        Action::Exec { timeout_ms, .. } => timeout_ms.expect("legacy exec timeout"),
+        Action::Read { timeout_ms, .. } => timeout_ms,
         other => panic!("expected Exec/Read, got {other:?}"),
     };
 
