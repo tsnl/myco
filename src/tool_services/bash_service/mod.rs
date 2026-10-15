@@ -15,6 +15,7 @@ use crate::external_command::BASH;
 use uuid::Uuid;
 
 mod background;
+mod command_policy;
 mod operation;
 mod process;
 
@@ -134,6 +135,11 @@ impl BashService {
                 `status: exited` means that process exited and both output streams closed. \
                 Descendants may keep output open; use `read` for later output or `close` \
                 to stop the process group.\n\n\
+                **Managed jobs:** recognized nohup invocations in exec/start command fields are rejected \
+                before execution. Run the program in the foreground of the command and let \
+                background_after or start retain it. Avoid nohup, disown, and shell `&` for \
+                detached work: managed handles keep status, output, ownership, and stop controls \
+                visible. Use list to rediscover handles and read to collect later output.\n\n\
                 **Terminal:** sessions use pipes, with no TTY or job control. Prefer \
                 `host=<alias>` with a plain shell (`command: \"bash\"` or `\"bash -l\"`) \
                 for long-lived remote work. Check whether a program supports noninteractive \
@@ -1729,6 +1735,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
                 .clone()
                 .ok_or_else(|| "exec requires `command`".to_string())?;
             require_non_blank("command", &command)?;
+            command_policy::validate(&command)?;
             Ok(Action::Exec {
                 command,
                 timeout_ms: exec_timeout(input)?,
@@ -1744,6 +1751,7 @@ fn resolve_action(input: &Input) -> Result<Action, String> {
             require_non_blank("session_id", &session_id)?;
             if let Some(command) = input.command.as_deref() {
                 require_non_blank("command", command)?;
+                command_policy::validate(command)?;
             }
             Ok(Action::Start {
                 session_id,
