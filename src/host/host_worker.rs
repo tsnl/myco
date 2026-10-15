@@ -14,7 +14,8 @@ use crate::core::{CancelToken, ToolResource};
 use crate::generative_model::{self, ToolUse};
 use crate::host::protocol::{HOST_PROTOCOL_VERSION, Request, Response};
 use crate::tool_services::{
-    BashService, HostDispatchContext, TextEditorService, ToolService, ViewImageService,
+    BashService, HostDispatchContext, SkillsService, TextEditorService, ToolService,
+    ViewImageService,
 };
 
 /// Worker process: tool registry + NDJSON serve loop.
@@ -52,6 +53,7 @@ impl HostWorker {
             Arc::new(BashService::new()) as Arc<dyn ToolService>,
             Arc::new(TextEditorService::new()) as Arc<dyn ToolService>,
             Arc::new(ViewImageService::new(max_image_base64_bytes)) as Arc<dyn ToolService>,
+            Arc::new(SkillsService::new()) as Arc<dyn ToolService>,
         ]
     }
 
@@ -68,6 +70,7 @@ impl HostWorker {
             BashService::specs(),
             TextEditorService::specs(),
             ViewImageService::specs(max_image_base64_bytes),
+            SkillsService::specs(),
         ]
         .into_iter()
         .flatten()
@@ -94,7 +97,23 @@ impl HostWorker {
         let Some(service) = self.tool_to_service.get(&tool_use.name).cloned() else {
             return generative_model::ToolResult::err(format!("unknown tool '{}'", tool_use.name));
         };
-        service.dispatch_tool_use(tool_use, ctx).await
+        let mut result = service
+            .dispatch_tool_use(tool_use.clone(), ctx.clone())
+            .await;
+        if !result.is_error {
+            for observer in &self.services {
+                if let Some(notice) = observer
+                    .clone()
+                    .observe_successful_call(tool_use.clone(), ctx.clone())
+                    .await
+                {
+                    result.content.push(generative_model::Content::Text {
+                        text: format!("[myco: host {:?}]\n{notice}", self.name),
+                    });
+                }
+            }
+        }
+        result
     }
 
     pub fn notify_agent_finished(&self, agent_id: uuid::Uuid) {
@@ -154,6 +173,7 @@ impl HostWorker {
                 id,
                 agent_id: _,
                 max_image_base64_bytes: _,
+                thread_id: _,
                 tool_use,
             } => {
                 let result = self
@@ -247,12 +267,14 @@ impl HostWorker {
                     id,
                     agent_id,
                     max_image_base64_bytes,
+                    thread_id,
                     tool_use,
                 } => {
                     // Register before spawning so a following Cancel line can
                     // never race ahead of the tool task's token.
                     let mut context = HostDispatchContext::new(agent_id, CancelToken::new());
                     context.max_image_base64_bytes = max_image_base64_bytes;
+                    context.thread_id = thread_id.clone();
                     controls.lock().await.insert(id.clone(), context.clone());
                     let request_id = id.clone();
                     let worker = Arc::clone(self);
@@ -266,6 +288,7 @@ impl HostWorker {
                                     id,
                                     agent_id,
                                     max_image_base64_bytes,
+                                    thread_id,
                                     tool_use,
                                 },
                                 Some(context),
@@ -369,6 +392,7 @@ mod tests {
                     id: index.to_string(),
                     agent_id: uuid::Uuid::nil(),
                     max_image_base64_bytes: None,
+                    thread_id: None,
                     tool_use: ToolUse {
                         name: "unknown".into(),
                         input: serde_json::json!({}),

@@ -18,13 +18,13 @@ myco server / chat adapter
       └── Harness (routing, config, root-configured services)
           ├── HostController "local"   → in-process HostWorker (always on)
           └── HostController "…"       → ssh … myco --mode host (lazy remote)
-                └── bash, str_replace_based_edit_tool, view_image (per host)
+                └── bash, str_replace_based_edit_tool, view_image, skills (per host)
 ```
 
 - **Server process:** model, conversation history, cancel, event sink, and the in-process
   **local** host worker (standard tools plus root-only services such as `session_meta`).
 - **Remote host process (`myco --mode host`):** standard host tool services (`bash`, editor,
-  `view_image`) over NDJSON via SSH.
+  `view_image`, `skills`) over NDJSON via SSH.
 - **Nested agents:** clients create a hidden child through
   `POST /api/sessions` with `parent_session` and optional `fork: true`. The
   child shares the addressed profile and model catalog, with its own runner and
@@ -460,7 +460,7 @@ also loads the config file (`--config` → `$MYCO_CONFIG` →
 
 ## Host routing
 
-- Host tools (`bash`, `str_replace_based_edit_tool`, `view_image`) accept optional input field **`host`**.
+- Host tools (`bash`, `str_replace_based_edit_tool`, `view_image`, `skills`) accept optional input field **`host`**.
 - Omitted `host` → **`local`** (always in-process).
 - Bash `session_id`s are **per host** and owned by a session runtime. Do not assume a session on `local`
   exists on `devbox`.
@@ -474,13 +474,63 @@ also loads the config file (`--config` → `$MYCO_CONFIG` →
   The format is read from the file's magic number, so the extension may be wrong or
   missing (user `@path` attachments share the same detection and cap). Text files stay
   with the editor.
-- **Text search**: `bash` + `rg`/`grep` on the target host. myco ships no
-  search tools of its own; project guidance (`AGENTS.md`/`CLAUDE.md`, skill
-  packs) is read with the editor or `rg` like any other file.
+- **Text search**: `bash` + `rg`/`grep` on the target host. Read project guidance
+  (`AGENTS.md`/`CLAUDE.md`) and selected skill instructions with the editor.
+  The `skills` tool discovers skill metadata; it does not search file contents.
 - **Editor views**: whole-file reads, `view_range` slices, and directory listings
   reject output over 256 KiB. A single long line also counts toward the cap.
   Read a smaller range, or use bash with bounded output for long lines and large
   directories. A rejected view does not authorize subsequent edits.
+
+## Skills
+
+A skill is a directory containing `SKILL.md` with frontmatter declaring a
+`name` and `description`, followed by instructions. Myco adds a bounded local
+catalog to the startup prompt. The model uses those descriptions and the user's
+request to choose relevant skills, then reads their instructions with the editor.
+Discovery does not load instruction bodies into the prompt or run skill scripts.
+
+For a working directory, discovery checks `.agents/skills`, `.claude/skills`,
+and `.grok/skills` there and in its ancestors through the nearest Git root.
+Outside a Git checkout, only the supplied directory is checked. The same three
+layouts in the executing host user's home are also checked; `MYCO_HOME` does
+not relocate these user skill directories. Each layout has one immediate
+subdirectory per skill, such as `.agents/skills/review/SKILL.md`. Myco does not
+search the whole repository, follow symlinked skill directories or manifests,
+or discover plugin bundles. Duplicate names remain separate entries identified
+by their paths.
+
+Successful editor and image calls scan the operated file's directory, or the
+operated directory itself. Successful bash calls scan the host worker's launch
+directory. Changed catalogs appear as notices attached to tool results, tagged
+with their host and directory. Observations are scoped to the session runtime;
+unchanged catalogs normally do not repeat within a thread. A new thread receives
+the catalog again when it next operates in that directory. Discovery has bounded
+directory, metadata, and notice limits. A partial catalog reports omissions or
+scan errors.
+
+Use `skills` explicitly to inspect or refresh another directory:
+
+```json
+{"path":"/work/project","host":"devbox"}
+```
+
+Omitting `host` selects `local`; omitting `path` selects that host worker's launch
+directory. Relative paths use that launch directory. Shell-internal `cd` commands
+and retained shell working directories are not inferred. After changing a shell's
+directory, pass its new path explicitly. Remote discovery and subsequent editor
+reads happen on the selected host; the startup catalog does not connect remotes.
+
+Frontmatter supports plain, quoted, literal (`|`), and folded (`>`) scalar values
+for `name` and `description`; it is not a general YAML parser.
+`disable-model-invocation: true` marks a skill for explicit user requests only;
+the flag appears in the catalog and instructs the model not to select it
+implicitly. It accepts unquoted `true` or `false`. Other fields, including
+`allowed-tools` and `user-invocable`, are ignored; Myco does not implement skill
+slash commands or per-skill tool restrictions. Skill content is guidance:
+discovery grants no permissions, changes no approval policy, and does not
+override the user's instructions. Read supporting files only when the selected
+skill and task require them.
 
 ## Nested agents (the recipe)
 

@@ -392,6 +392,7 @@ impl HostController {
             cancel,
             background,
             max_image_base64_bytes,
+            thread_id,
         } = context;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
         let response_timeout = response_timeout(&tool_use);
@@ -400,6 +401,7 @@ impl HostController {
             id: id.clone(),
             agent_id,
             max_image_base64_bytes,
+            thread_id,
             tool_use,
         };
 
@@ -1240,7 +1242,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_older_host_protocol_is_rejected_before_tool_dispatch() {
-        for protocol in [None, Some(3)] {
+        for protocol in [None, Some(3), Some(4)] {
             let hello = serde_json::json!({"type":"hello_ok", "version":env!("CARGO_PKG_VERSION")});
             let mut hello = hello;
             if let Some(protocol) = protocol {
@@ -1257,7 +1259,10 @@ mod tests {
                 text.contains(&format!("protocol {}", protocol.unwrap_or(0))),
                 "{text}"
             );
-            assert!(text.contains("local 4"), "{text}");
+            assert!(
+                text.contains(&format!("local {HOST_PROTOCOL_VERSION}")),
+                "{text}"
+            );
             assert!(text.contains("rebuild"), "{text}");
         }
     }

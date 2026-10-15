@@ -27,6 +27,7 @@ pub mod prelude;
 pub mod prompts;
 pub mod session;
 pub mod session_runtime;
+pub mod skills;
 pub mod tool_services;
 
 #[cfg(test)]

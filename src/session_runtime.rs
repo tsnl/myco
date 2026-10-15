@@ -228,6 +228,10 @@ impl ToolExecutor for SessionRuntime {
                         cancel,
                         background,
                         max_image_base64_bytes: Some(limit),
+                        thread_id: Some(
+                            self.session
+                                .with(|session| session.active_thread().id.clone()),
+                        ),
                     },
                 )
                 .await;

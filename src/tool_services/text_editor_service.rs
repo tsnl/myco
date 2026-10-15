@@ -600,6 +600,7 @@ mod tests {
                 cancel: crate::core::CancelToken::new(),
                 background: crate::core::CancelToken::new(),
                 max_image_base64_bytes: None,
+                thread_id: None,
             },
         ))
     }

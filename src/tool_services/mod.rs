@@ -34,6 +34,9 @@ pub use list_recent_service::ListRecentService;
 pub mod getlink_service;
 pub use getlink_service::GetLinkTool;
 
+pub mod skills_service;
+pub use skills_service::SkillsService;
+
 /// Model-facing JSON Schema for a tool input type.
 ///
 /// `schemars`' default output is hostile to OpenAI-compatible gateways and
@@ -126,6 +129,9 @@ pub struct HostDispatchContext {
     /// Active model image cap; None retains the worker ceiling.
     /// A call can lower the worker ceiling, never raise it.
     pub max_image_base64_bytes: Option<u64>,
+    /// Conversation thread observing this call. Discovery notices are repeated
+    /// when compaction replaces context, while the live owner remains stable.
+    pub thread_id: Option<String>,
 }
 
 impl HostDispatchContext {
@@ -135,6 +141,7 @@ impl HostDispatchContext {
             cancel,
             background: CancelToken::new(),
             max_image_base64_bytes: None,
+            thread_id: None,
         }
     }
 }
@@ -174,6 +181,16 @@ pub trait ToolService: Send + Sync + 'static {
         tool_use: generative_model::ToolUse,
         ctx: HostDispatchContext,
     ) -> Async<generative_model::ToolResult>;
+
+    /// Optional host-local observations after a successful tool call. Notices
+    /// are data attached to that result; they cannot authorize or replay it.
+    fn observe_successful_call(
+        self: Arc<Self>,
+        _tool: generative_model::ToolUse,
+        _ctx: HostDispatchContext,
+    ) -> Async<Option<String>> {
+        Box::pin(async { None })
+    }
 
     /// Called when a session runtime ends so services can release its state.
     /// Default: no-op.
