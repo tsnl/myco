@@ -10,7 +10,7 @@ from urllib.parse import unquote, urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SITE = ROOT / "target/site"
+SITE = (ROOT / "target/site").resolve()
 
 
 class Page(HTMLParser):
