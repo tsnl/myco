@@ -1,0 +1,183 @@
+{
+  "counter": 1,
+  "generations": [
+    {
+      "applied": true,
+      "generation": {
+        "run": "rollout-1",
+        "sequence": 1
+      },
+      "input": {
+        "context": {
+          "at": {
+            "lineage": "conversation",
+            "revision": 0
+          },
+          "derived_from": null,
+          "messages": [
+            {
+              "Input": {
+                "author": {
+                  "Human": "operator"
+                },
+                "caused_by": null,
+                "content": [
+                  {
+                    "Text": "Increment the counter, then report its value."
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "settings": {
+          "documents": [
+            {
+              "content": [
+                {
+                  "Text": "Report observed results."
+                }
+              ],
+              "name": "prelude",
+              "revision": "1"
+            }
+          ],
+          "model": "scripted-policy",
+          "parameters": {},
+          "tools": [
+            {
+              "binding": "counter-incarnation-1",
+              "description": "add an integer",
+              "name": "add",
+              "schema": {
+                "type": "integer"
+              }
+            }
+          ]
+        }
+      },
+      "result": {
+        "Ok": {
+          "finish": "Complete",
+          "reply": {
+            "calls": [
+              {
+                "arguments": 1,
+                "tool": "add"
+              }
+            ],
+            "content": []
+          },
+          "tokens": null
+        }
+      }
+    },
+    {
+      "applied": true,
+      "generation": {
+        "run": "rollout-1",
+        "sequence": 3
+      },
+      "input": {
+        "context": {
+          "at": {
+            "lineage": "conversation",
+            "revision": 2
+          },
+          "derived_from": null,
+          "messages": [
+            {
+              "Input": {
+                "author": {
+                  "Human": "operator"
+                },
+                "caused_by": null,
+                "content": [
+                  {
+                    "Text": "Increment the counter, then report its value."
+                  }
+                ]
+              }
+            },
+            {
+              "Assistant": {
+                "generation": {
+                  "run": "rollout-1",
+                  "sequence": 1
+                },
+                "reply": {
+                  "calls": [
+                    {
+                      "arguments": 1,
+                      "tool": "add"
+                    }
+                  ],
+                  "content": []
+                }
+              }
+            },
+            {
+              "Tool": {
+                "generation": {
+                  "run": "rollout-1",
+                  "sequence": 1
+                },
+                "index": 0,
+                "outcome": {
+                  "Succeeded": [
+                    {
+                      "Text": "1"
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        "settings": {
+          "documents": [
+            {
+              "content": [
+                {
+                  "Text": "Report observed results."
+                }
+              ],
+              "name": "prelude",
+              "revision": "1"
+            }
+          ],
+          "model": "scripted-policy",
+          "parameters": {},
+          "tools": [
+            {
+              "binding": "counter-incarnation-1",
+              "description": "add an integer",
+              "name": "add",
+              "schema": {
+                "type": "integer"
+              }
+            }
+          ]
+        }
+      },
+      "result": {
+        "Ok": {
+          "finish": "Complete",
+          "reply": {
+            "calls": [],
+            "content": [
+              {
+                "Text": "1"
+              }
+            ]
+          },
+          "tokens": null
+        }
+      }
+    }
+  ],
+  "note": "Simulated environment and policy; no live model or training has run.",
+  "phase": {
+    "Finished": "Answered"
+  }
+}

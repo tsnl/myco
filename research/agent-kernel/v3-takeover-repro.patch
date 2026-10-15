@@ -1,0 +1,21 @@
+diff --git a/crates/instance/src/tests.rs b/crates/instance/src/tests.rs
+index a16f305..7ea4f4c 100644
+--- a/crates/instance/src/tests.rs
++++ b/crates/instance/src/tests.rs
+@@ -10,0 +11,16 @@ use myco_runtime::Signals;
++#[tokio::test]
++async fn readiness_takeover_and_return_must_fence_the_original_command() {
++    let pool = pool();
++    let caller = agent();
++    let info = pool.create(&caller, "counter", "", "probe", Value::Null).unwrap();
++    let queued = pool.call(&caller, &info.id, "incr", Value::Null);
++    tokio::pin!(queued);
++    // On this current-thread runtime, polling enqueues the command and waits
++    // for its reply without letting the resource task begin applying it.
++    assert!(futures::poll!(queued.as_mut()).is_pending());
++    pool.call(&ada(), &info.id, "sys.take", Value::Null).await.unwrap();
++    pool.call(&ada(), &info.id, "sys.release", Value::Null).await.unwrap();
++    let result = queued.await;
++    assert!(result.is_err(), "old command executed after takeover and return: {result:?}");
++}
++
