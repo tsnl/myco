@@ -139,7 +139,7 @@ html.viewing-image { overflow: hidden; }
 .image-viewer-close { position: absolute; top: max(12px, env(safe-area-inset-top)); right: max(12px, env(safe-area-inset-right)); min-width: 40px; min-height: 40px; padding: 0; font-size: 24px; background: var(--glass-raised); }
 #image-viewer [role="status"] { color: var(--dim); }
 .tool { position: relative; --tool-color: var(--dim); --rim-color: var(--tool-color); border: 2px solid var(--tool-color); border-radius: 0; background: rgb(var(--glass-tint) / .28); margin: 15px 0 22px; }
-.tool.running { --tool-color: var(--cyan); }
+.tool.running { --tool-color: #fff; }
 :is(.tool, .active-call, .active-timer, .toolbar #new-session, .attachment.invalid, #jump) {
   --rim-shadow: 0 0 3px color-mix(in srgb, var(--rim-color) 45%, transparent),
     0 0 15px color-mix(in srgb, var(--rim-color) 20%, transparent), 0 8px 24px #00000040;
@@ -237,7 +237,7 @@ html.viewing-image { overflow: hidden; }
 #activity-empty { color: var(--dim); }
 .activity-section ul { margin: 12px 0 0; padding-left: 1.5em; color: var(--cyan); }
 .activity-section li { overflow-wrap: anywhere; margin-bottom: 10px; }
-.active-call { position: relative; --rim-color: var(--cyan); display: block; width: 100%; text-align: left; border: 2px solid var(--rim-color); background: var(--glass-control); color: inherit; padding: 10px 12px; white-space: normal; overflow-wrap: anywhere; }
+.active-call { position: relative; --rim-color: #fff; display: block; width: 100%; text-align: left; border: 2px solid var(--rim-color); background: var(--glass-control); color: var(--rim-color); padding: 10px 12px; white-space: normal; overflow-wrap: anywhere; }
 .active-call:hover { border-color: var(--rim-color); text-decoration: underline; }
 /* Settings modal */
 .toolbar #settings-toggle { display: inline-flex; align-items: center; justify-content: center; width: 36px; padding: 8px; }
