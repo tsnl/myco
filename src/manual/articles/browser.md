@@ -287,7 +287,7 @@ the same thread. Saved history opened after a server restart has no timing data.
 Scheduled follow-ups appear in a separate **Timers** section with their own
 countdowns and cancellation controls.
 Every entry opens its transcript card. Shells launched with `bash start` and
-commands released with **Background** remain running in that card, with an
+commands released with `background_after` or **Background** remain running in that card, with an
 advancing timer and pulsing border, until the process and its output streams
 finish. The same border appears on Activity entries. Reduced-motion preferences
 keep the borders steady; hidden or disconnected tabs pause their animation.
@@ -300,6 +300,12 @@ show **state unknown** rather than reporting success. A process whose original
 call is outside the active thread retains a reachable card through compaction.
 The drawer starts closed; its button shows the activity count. Close it with its
 close button, Escape, or a click outside it.
+
+The assistant collects additional output with `bash read`; status polling does
+not drain it. Visibility covers Myco-owned handles. Launch the target program
+directly with `background_after` or `bash start` to retain one. Recognized `nohup`
+invocations in those command fields are rejected with this guidance. Arbitrary
+daemonized descendants are not independently discovered or adopted.
 
 Running shell calls offer **Background** in their tool header and in Activity.
 It releases that call's foreground wait, so the assistant can continue once any

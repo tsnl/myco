@@ -1705,6 +1705,53 @@ context_window = 100000
         page.screenshot(path=str(self.artifacts / 'steady-borders.png'))
         page.click('#cancel')
 
+    def test_nohup_rejection_guides_a_visible_managed_background_job(self):
+        def completed(events):
+            return events + [{'type': 'response.completed', 'response': {'status': 'completed'}}]
+
+        blocked = shlex.quote(str(self.home / 'blocked-effect'))
+        release = shlex.quote(str(self.home / 'managed-release'))
+        self.completion_replies = [
+            completed(tool({'command': f'touch {blocked}; nohup true'})),
+            completed(tool({'command': f'echo managed-ready; while [ ! -f {release} ]; do sleep 0.05; done; echo managed-done',
+                            'background_after': 50})),
+            completed(reply('The managed job is still running.')),
+        ]
+        page = self.session(self.page)
+        self.submit(page, 'Start a visible background job')
+        expect(page.locator('.assistant .body')).to_have_text('The managed job is still running.')
+        expect(page.locator('.tool.failed')).to_have_count(1)
+        expect(page.locator('.tool.failed .output')).to_contain_text('nohup is not supported')
+        expect(page.locator('.tool.failed .output')).to_contain_text('background_after')
+        self.assertFalse((self.home / 'blocked-effect').exists())
+        expect(page.locator('.tool.running')).to_have_count(1)
+        expect(page.locator('#connection')).to_have_text('Running')
+        self.assertEqual(len(self.requests), 3)
+        self.assertIn('nohup is not supported', json.dumps(self.requests[1]['input']))
+        self.assertIn('session_id: bg-', json.dumps(self.requests[2]['input']))
+        page.click('#activity-toggle')
+        expect(page.locator('#activity-list .active-call')).to_have_count(1)
+        page.locator('#activity-list .active-call').click()
+        expect(page.locator('.tool.running .output')).to_contain_text('session_id: bg-')
+        page.reload()
+        expect(page.locator('.tool.running')).to_have_count(1)
+        page.screenshot(path=str(self.artifacts / 'managed-background-job.png'))
+        (self.home / 'managed-release').touch()
+        expect(page.locator('.tool.running')).to_have_count(0)
+        expect(page.locator('.tool-status').last).to_have_text('exit 0')
+        expect(page.locator('#connection')).to_have_text('Ready')
+
+        snapshot = self.context.request.get(page.url.replace('/sessions/', '/api/sessions/')).json()
+        handle = next(block['resource']['id'] for block in snapshot['change']['snapshot']['blocks']
+                      if block.get('resource'))
+        self.completion_replies.extend([
+            completed(tool({'action': 'read', 'session_id': handle, 'timeout_ms': 100})),
+            completed(reply('Background output collected.')),
+        ])
+        self.submit(page, 'Read the completed job')
+        expect(page.locator('.assistant .body').last).to_have_text('Background output collected.')
+        expect(page.locator('.tool .output').last).to_contain_text('managed-done')
+
     def test_background_button_keeps_process_alive_across_reload_and_cancellation_of_a_later_turn(self):
         page = self.session(self.page)
         self.submit(page, 'Alpha wait')

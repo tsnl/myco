@@ -220,6 +220,21 @@ existing behavior of dropping the original timeout. Cancelling an in-flight
 exec still kills it; after promotion, the retained handle owns the process and
 `signal` or `close` controls it.
 
+Run the target program in the foreground of the command; let `background_after`
+or `bash start` own its background lifetime. Recognized `nohup` invocations in
+`exec` and `start` command fields are rejected before the whole command starts,
+with instructions for using managed jobs. The syntax check recognizes paths,
+quoting, common launch wrappers, and literal nested shell commands. Mentions in
+arguments, comments, and ordinary heredoc data remain usable.
+
+This check prevents common misuse; it does not contain arbitrary programs.
+Dynamically constructed commands, external scripts, and bytes sent through
+`stdin` are not fully inspected. Avoid `nohup`, `disown`, daemon modes, and shell
+`&` for detached work. Myco inventories retained tool handles, not every process
+created by a program. Managed handles expose host, command, process identity,
+status and captured output; use `list` to rediscover them, `read` for further
+output, and `signal` or `close` to control them.
+
 ## Models & credentials (the catalog)
 
 Myco ships **no built-in models**: the `[gateways]` / `[models]` tables in
