@@ -78,12 +78,20 @@ pub(super) enum Block {
 
 impl Block {
     pub fn input(content: &[Content], time: Option<String>) -> Self {
-        let timer = content
-            .iter()
-            .any(|part| matches!(part, Content::System { kind, .. } if kind == "timer"));
-        let mut block = Self::message(if timer { "system" } else { "user" }, content, time);
-        if timer && let Self::Message { text, .. } = &mut block {
-            *text = format!("Timer fired\n\n{text}");
+        let event = content.iter().find_map(|part| match part {
+            Content::System { kind, .. } if kind == "timer" => Some("Timer fired"),
+            Content::System { kind, .. } if kind == "inbox_event" => Some("Event received"),
+            _ => None,
+        });
+        let mut block = Self::message(
+            if event.is_some() { "system" } else { "user" },
+            content,
+            time,
+        );
+        if let Some(label) = event
+            && let Self::Message { text, .. } = &mut block
+        {
+            *text = format!("{label}\n\n{text}");
         }
         block
     }

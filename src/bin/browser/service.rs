@@ -162,9 +162,11 @@ impl App {
                 Err(expired())
             };
         }
-        if live.accepted.contains_key(&request.request_id) {
+        if live.accepted.contains_key(&request.request_id)
+            || live.inbox.get(request.request_id).is_some()
+        {
             return Err(Error::Conflict(
-                "Request id already used for a browser action.".into(),
+                "Request id already used for a browser action or inbox event.".into(),
             ));
         }
         if live.service.accepted.len() == MAX_REQUESTS {

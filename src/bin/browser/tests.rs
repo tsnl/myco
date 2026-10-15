@@ -131,7 +131,13 @@ fn automatic_failures_replace_one_diagnostic_without_growing_the_transcript() {
 fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc::Receiver<Work>) {
     let (work, receiver) = mpsc::channel(1);
     let app = Arc::new(App {
+        clock: timers::Clock::new(),
         live: Mutex::new(Live {
+            inbox: Inbox::open(
+                std::env::temp_dir().join(format!("myco-inbox-test-{}.json", Uuid::new_v4())),
+                id,
+            )
+            .unwrap(),
             generation_start: None,
             retry_notice: None,
             snapshot: Snapshot {
@@ -153,6 +159,7 @@ fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc:
                 tasks: vec![],
                 queued: VecDeque::new(),
                 timers: vec![],
+                inbox: vec![],
                 blocks: vec![],
             },
             cancel: None,
@@ -223,7 +230,7 @@ fn server(apps: &[Arc<App>]) -> Arc<Server> {
     ))
 }
 
-fn action_request() -> ActionRequest {
+pub(super) fn action_request() -> ActionRequest {
     ActionRequest {
         request_id: Uuid::new_v4(),
         session_id: "session".into(),
@@ -435,7 +442,7 @@ fn claimed_followups_reject_mutation_and_failed_delivery_leaves_them_editable() 
     work.try_recv().unwrap();
     let queued = action_request();
     app.accept(queued.clone()).unwrap();
-    let claimed = app.claim_followup().unwrap();
+    let claimed = app.claim_followup().unwrap().unwrap();
     for update in [
         json!({"kind":"edit"}),
         json!({"kind":"remove"}),
@@ -450,20 +457,20 @@ fn claimed_followups_reject_mutation_and_failed_delivery_leaves_them_editable() 
         app.snapshot().change["snapshot"]["queued"][0]["state"],
         "sending"
     );
-    app.restore_followup(claimed.request_id);
+    app.restore_followup(claimed.request_id).unwrap();
     app.accept(queue_update(
         &queued,
         0,
         json!({"kind":"save", "text":"retry content"}),
     ))
     .unwrap();
-    let retried = app.claim_followup().unwrap();
+    let retried = app.claim_followup().unwrap().unwrap();
     assert_eq!(retried.text, "retry content");
     assert_eq!(retried.accepted_at, claimed.accepted_at);
     app.finish_followup(retried.request_id, None);
-    assert!(app.claim_followup().is_none());
+    assert!(app.claim_followup().unwrap().is_none());
     app.accept(queued).unwrap();
-    assert!(app.claim_followup().is_none());
+    assert!(app.claim_followup().unwrap().is_none());
 }
 
 #[test]
@@ -483,7 +490,7 @@ fn queue_delivery_and_unqueue_have_one_atomic_winner() {
             });
             barrier.wait();
             let removed = app.accept(remove);
-            match delivery.join().unwrap() {
+            match delivery.join().unwrap().unwrap() {
                 Some(claimed) => {
                     assert!(matches!(removed, Err(Error::Conflict(_))));
                     assert_eq!(claimed.request_id, queued.request_id);

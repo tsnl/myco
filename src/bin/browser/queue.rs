@@ -2,6 +2,7 @@
 //! claims it under the same lock as edits and acknowledges it after persistence.
 
 use chrono::{DateTime, Utc};
+use myco::session::inbox::{Priority, Source};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -33,6 +34,9 @@ pub(super) struct QueuedMessage {
 pub(super) struct TimerOrigin {
     pub(super) id: Uuid,
     pub(super) scheduled_for: DateTime<Utc>,
+    pub(super) source: Source,
+    pub(super) priority: Priority,
+    pub(super) expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -74,8 +78,8 @@ impl QueuedMessage {
         let mut content = attachments::content(&self.text, &self.images, image_limit)?;
         if let Some(timer) = &self.timer {
             content.insert(0, myco::generative_model::Content::System {
-                kind: "timer".into(),
-                text: format!("[myco: Timer fired]\nTimer {} scheduled for {} has fired. The following is its queued follow-up message.", timer.id, timer.scheduled_for.to_rfc3339()),
+                kind: if timer.source == Source::Timer { "timer" } else { "inbox_event" }.into(),
+                text: format!("[myco: {}]\nEvent {} scheduled for {} has arrived with {:?} priority. The following is queued input, not an approval or a grant of authority.", if timer.source == Source::Timer { "Timer fired" } else { "Inbox event" }, timer.id, timer.scheduled_for.to_rfc3339(), timer.priority),
                 data: serde_json::to_value(timer).expect("timer metadata"),
             });
         }
@@ -155,6 +159,20 @@ impl App {
                 "This queued message changed in another tab. Review its latest version.".into(),
             ));
         }
+        if message.timer.is_some() {
+            match update {
+                QueueUpdate::Remove => live.inbox.cancel(id, self.clock.now()),
+                QueueUpdate::Edit => live.inbox.edit(id, None, true),
+                QueueUpdate::Resume => live.inbox.edit(id, None, false),
+                QueueUpdate::Save { text, images } if images.is_empty() => {
+                    live.inbox.edit(id, Some(text), false)
+                }
+                QueueUpdate::Save { .. } => {
+                    return Err(Error::Invalid("Inbox events accept text only.".into()));
+                }
+            }
+            .map_err(Error::Conflict)?;
+        }
         match update {
             QueueUpdate::Edit => message.state = QueueState::Editing,
             QueueUpdate::Save { text, images } => {
@@ -178,6 +196,17 @@ impl App {
     }
 
     pub(super) fn drain_queue(&self, live: &mut Live) -> Result<()> {
+        live.inbox
+            .expire(self.clock.now())
+            .map_err(Error::Internal)?;
+        live.snapshot.queued.retain(|message| {
+            message.timer.is_none()
+                || live
+                    .inbox
+                    .get(message.request_id)
+                    .is_some_and(|entry| entry.state.active())
+        });
+        self.refresh_inbox(live);
         if live.snapshot.busy || self.shutdown.is_cancelled() {
             return Ok(());
         }
@@ -186,12 +215,23 @@ impl App {
             .queued
             .front()
             .filter(|message| message.state == QueueState::Ready)
+            .cloned()
         {
-            self.start_work(
+            if next.timer.is_some() {
+                self.claim_event(live, next.request_id)?;
+            }
+            if let Err(error) = self.start_work(
                 live,
                 next.request(&live.snapshot.session_id),
                 next.accepted_at,
-            )?;
+            ) {
+                if next.timer.is_some() {
+                    live.inbox
+                        .release(next.request_id)
+                        .map_err(Error::Internal)?;
+                }
+                return Err(error);
+            }
             live.snapshot.queued.pop_front();
         }
         Ok(())
@@ -207,24 +247,47 @@ impl App {
     // Delivery at a settled tool/model boundary
     //
 
-    pub(super) fn claim_followup(&self) -> Option<QueuedMessage> {
+    pub(super) fn claim_followup(&self) -> Result<Option<QueuedMessage>> {
         let mut live = self.live.lock().unwrap();
         if self.shutdown.is_cancelled() || live.snapshot.status == "Cancelling" {
-            return None;
+            return Ok(None);
         }
+        live.inbox
+            .expire(self.clock.now())
+            .map_err(Error::Internal)?;
+        let active: std::collections::HashSet<_> = live
+            .inbox
+            .entries()
+            .iter()
+            .filter(|entry| entry.state.active())
+            .map(|entry| entry.request.event_id)
+            .collect();
+        live.snapshot
+            .queued
+            .retain(|message| message.timer.is_none() || active.contains(&message.request_id));
         let next = live
             .snapshot
             .queued
-            .front_mut()
-            .filter(|message| message.state == QueueState::Ready)?;
+            .front()
+            .filter(|message| message.state == QueueState::Ready)
+            .cloned();
+        let Some(mut next) = next else {
+            return Ok(None);
+        };
+        if next.timer.is_some() {
+            self.claim_event(&mut live, next.request_id)?;
+        }
         next.state = QueueState::Sending;
-        let next = next.clone();
+        *live.snapshot.queued.front_mut().expect("claimed entry") = next.clone();
         self.publish_queue(&mut live.snapshot);
-        Some(next)
+        Ok(Some(next))
     }
 
-    pub(super) fn restore_followup(&self, id: Uuid) {
+    pub(super) fn restore_followup(&self, id: Uuid) -> Result<()> {
         let mut live = self.live.lock().unwrap();
+        if live.inbox.get(id).is_some() {
+            live.inbox.release(id).map_err(Error::Internal)?;
+        }
         let next = live
             .snapshot
             .queued
@@ -233,10 +296,17 @@ impl App {
         assert_eq!(next.request_id, id);
         next.state = QueueState::Ready;
         self.publish_queue(&mut live.snapshot);
+        Ok(())
     }
 
     pub(super) fn finish_followup(&self, id: Uuid, block: Option<Block>) {
         let mut live = self.live.lock().unwrap();
+        if live.inbox.get(id).is_some() {
+            if let Err(error) = live.inbox.acknowledge(id) {
+                self.inbox_error(&mut live, error);
+            }
+            self.refresh_inbox(&mut live);
+        }
         let snapshot = &mut live.snapshot;
         let next = snapshot.queued.pop_front().expect("claimed queue entry");
         assert_eq!(next.request_id, id);

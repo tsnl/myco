@@ -98,6 +98,35 @@ impl Profiles {
         Ok(worker)
     }
 
+    async fn restore_inbox_workers(&self) {
+        let names = match self.names().await {
+            Ok(names) => names,
+            Err(error) => {
+                eprintln!("browser inbox: {error}");
+                return;
+            }
+        };
+        for name in names {
+            if self.shutdown.is_cancelled() {
+                break;
+            }
+            let directory = self.directory.join(&name).join("inbox");
+            let pending =
+                tokio::task::spawn_blocking(move || super::runtime::pending_inboxes(directory))
+                    .await;
+            match pending {
+                Ok(Ok(ids)) if !ids.is_empty() => {
+                    if let Err((_, error)) = self.worker(&name).await {
+                        eprintln!("browser inbox profile {name}: {error}");
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => eprintln!("browser inbox profile {name}: {error}"),
+                Err(error) => eprintln!("browser inbox profile {name}: {error}"),
+            }
+        }
+    }
+
     async fn stop(&self) {
         self.shutdown.cancel();
         let workers = std::mem::take(&mut *self.workers.lock().await);
@@ -155,6 +184,10 @@ pub(super) async fn run(args: Args) -> Result<(), String> {
     println!(
         "Press Ctrl-C here to stop all profile instances. Profiles: http://{address}/profiles/"
     );
+    let inbox_profiles = profiles.clone();
+    tokio::spawn(async move {
+        inbox_profiles.restore_inbox_workers().await;
+    });
     let shutdown = profiles.clone();
     let result = axum::serve(listener, router(profiles.clone()))
         .with_graceful_shutdown(async move {

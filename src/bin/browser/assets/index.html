@@ -49,7 +49,10 @@
     </section>
     <section id="active-timers" class="activity-section" hidden>
       <h3>Timers</h3><ul id="timer-list"></ul>
-      <p class="timer-note">Timers run while this server is running. Restarting clears them.</p>
+      <p class="timer-note">Timers survive restarts and resume when this profile's server starts.</p>
+    </section>
+    <section id="event-inbox" class="activity-section" hidden>
+      <h3>Event inbox</h3><p id="inbox-error" role="alert" hidden></p><ul id="inbox-list"></ul>
     </section>
   </dialog>
   <div id="composer-frame" class="composer-frame" data-state="reconnecting">

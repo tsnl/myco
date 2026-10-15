@@ -151,10 +151,10 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
 
 - [ ] **Config reload** — refresh each profile's config without restarting the
       server. Define how running sessions retain their model and tool settings.
-- [ ] **Browser activity sections** — add triggers and cron activity alongside
-      tool calls and background sessions in the Activity dialog.
-      One-shot session timers have their own section with cancellation. Durable
-      schedules, recurring execution, and triggers need a separate design.
+- [x] **Browser event inbox** — durable one-shot timers and external triggers,
+      with priority, expiry, queueing, cancellation, restart recovery, and visible
+      pending/running/recent outcomes in Activity.
+- [ ] **Recurring schedules** — cron-style repetition over the event inbox.
 - [x] (REJECTED) **Permission modes** — e.g. ask / allowlist / autopilot; optional network/fs boundaries.
   - Wrong mechanism: better to use OS-level protection or bubblewrap sandboxing.
 - [ ] **Dangerous-command gates** — `rm -rf`, `git push --force`, `sudo`, curl|sh, etc.

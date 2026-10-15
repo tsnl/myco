@@ -45,7 +45,7 @@ async fn boot<S: EventSink + 'static>(args: &Args, sink: Arc<S>) -> Result<Boot,
         preflight,
         session,
         |_| vec![],
-        |_, _, _| sink,
+        |_, _, _| Ok(sink),
     )
     .await?;
     if let Some(enabled) = args.auto_continue {

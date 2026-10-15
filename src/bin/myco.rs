@@ -327,7 +327,7 @@ async fn boot_session<S: EventSink + 'static>(
     preflight: StartupPreflight,
     mut loaded: Session,
     root_tools: impl FnOnce(&Arc<S>) -> Vec<Arc<dyn myco::ToolService>>,
-    make_sink: impl FnOnce(&Config, &StartupPreflight, &ActiveSession) -> Arc<S>,
+    make_sink: impl FnOnce(&Config, &StartupPreflight, &ActiveSession) -> Result<Arc<S>, String>,
 ) -> Result<(Boot, Arc<S>), String> {
     let session_lock = lock_session_or_report(&loaded.id)?;
     // A previous writer may have finished between discovery and acquiring the lock.
@@ -336,7 +336,7 @@ async fn boot_session<S: EventSink + 'static>(
     }
     // Session handle first so `session_meta` can share it with the agent harness.
     let session = ActiveSession::new(loaded);
-    let sink = make_sink(&app_config, &preflight, &session);
+    let sink = make_sink(&app_config, &preflight, &session)?;
     let mut root_tools = root_tools(&sink);
 
     let session_tool =
