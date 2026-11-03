@@ -421,6 +421,17 @@ impl StreamAccumulator {
                         }));
                     }
                     (
+                        Slot::Thinking {
+                            index: content_index,
+                        },
+                        AnthropicDelta::SignatureDelta { signature },
+                    ) => {
+                        out.push(MessagePart::ContentDelta(ContentDelta::Signature {
+                            index: content_index,
+                            delta: signature,
+                        }));
+                    }
+                    (
                         Slot::Content {
                             index: content_index,
                         }
@@ -449,6 +460,15 @@ impl StreamAccumulator {
                     ) => {
                         return Err(GenerateError::MalformedResponseError(
                             "text/thinking delta on tool_use block".into(),
+                        )
+                        .into());
+                    }
+                    (
+                        Slot::Content { .. } | Slot::ToolUse { .. },
+                        AnthropicDelta::SignatureDelta { .. },
+                    ) => {
+                        return Err(GenerateError::MalformedResponseError(
+                            "signature delta on a non-thinking block".into(),
                         )
                         .into());
                     }
@@ -574,6 +594,8 @@ enum AnthropicDelta {
     ThinkingDelta { thinking: String },
     #[serde(rename = "input_json_delta")]
     InputJsonDelta { partial_json: String },
+    #[serde(rename = "signature_delta")]
+    SignatureDelta { signature: String },
     #[serde(other)]
     Other,
 }
@@ -1243,6 +1265,34 @@ mod tests {
         assert_eq!(usage.input_tokens, 2195);
         assert_eq!(usage.cached_input_tokens, 100);
         assert_eq!(usage.context_tokens(), 2195);
+    }
+
+    /// The stream opens thinking with `signature: ""` and sends the real value
+    /// as a `signature_delta` after the text; dropping it stores an empty string.
+    #[test]
+    fn signature_delta_completes_the_thinking_signature() {
+        let mut acc = StreamAccumulator::default();
+        let mut message = MessageAccumulator::default();
+        message.push(&MessagePart::MessageStart).unwrap();
+        for event in [
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":1}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"step"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"c2ln"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":5}}"#,
+            r#"{"type":"message_stop"}"#,
+        ] {
+            for part in acc.handle_data(event).unwrap() {
+                message.push(&part).unwrap();
+            }
+        }
+        let output = message.finish().unwrap();
+        assert!(matches!(
+            output.content.as_slice(),
+            [Content::Thinking { text, signature: Some(signature), redacted: false }]
+                if text == "step" && signature == "c2ln"
+        ));
     }
 
     #[test]
