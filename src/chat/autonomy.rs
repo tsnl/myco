@@ -1,6 +1,6 @@
 //! Session policy for explicitly enabled autonomous continuation.
 
-use crate::agent::{Agent, AgentInteractionError, RunOutcome};
+use crate::agent::{Agent, AgentInteractionError, LOST_THINKING_PROMPT, RunOutcome, lost_thinking};
 use crate::core::CancelToken;
 use crate::generative_model::{Content, TurnEndReason};
 use crate::session::ActiveSession;
@@ -78,6 +78,16 @@ fn notice(reason: &str) -> Content {
     }
 }
 
+/// After a thinking-only `max_tokens` stop the generic instruction alone
+/// restarts the same reasoning from nothing; say what was lost.
+fn lost_thinking_notice() -> Content {
+    Content::System {
+        kind: "continuation".into(),
+        text: format!("{INSTRUCTION}\n\n{LOST_THINKING_PROMPT}"),
+        data: serde_json::json!({"reason": "auto_continue", "thinking_only": true}),
+    }
+}
+
 pub(super) fn announce(
     agent: &mut Agent,
     session: &ActiveSession,
@@ -103,6 +113,11 @@ pub(super) fn continue_after(
     {
         return Ok(false);
     }
-    super::followup::append_at_boundary(agent, session, vec![notice("auto_continue")], None)?;
+    let notice = if agent.history().last().is_some_and(lost_thinking) {
+        lost_thinking_notice()
+    } else {
+        notice("auto_continue")
+    };
+    super::followup::append_at_boundary(agent, session, vec![notice], None)?;
     Ok(true)
 }

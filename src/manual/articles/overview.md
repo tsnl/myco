@@ -347,6 +347,12 @@ against the cap, which exists because a model whose output cap is too low for ho
 much it writes would otherwise resume all night; any turn that ends for another
 reason clears the count. Per model because the right ceiling depends on that
 model's `max_output_tokens` versus how much it tends to write.
+A turn cut off while it was still only thinking is different: providers never
+receive thinking back, so that turn reaches the next request as nothing, and
+"continue where you stopped" would make the model redo the same reasoning until
+it hits the same cap. Its resume prompt (and, under auto-continue, its
+continuation notice) instead says the thinking was lost and asks for visible
+conclusions or a tool call early in the next response.
 **Auto-compaction** is enabled for every configured model through the session runner.
 `auto_compact_at` defaults to `0.8`. The effective threshold is the smaller of
 `floor(context_window * auto_compact_at)` and `context_window - max_output_tokens`.

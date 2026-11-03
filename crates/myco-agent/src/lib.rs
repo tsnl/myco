@@ -202,6 +202,27 @@ const CANCEL_TOOL_GRACE: std::time::Duration = std::time::Duration::from_secs(2)
 pub const CONTINUE_PROMPT: &str = "Continue from exactly where you stopped. Do not repeat anything you have already written, \
      and do not acknowledge this message.";
 
+/// The user turn sent after `max_tokens` cut off a reply that held only thinking.
+///
+/// Providers receive no thinking from history, so such a turn reaches the next
+/// request as nothing: "continue where you stopped" makes the model redo the
+/// same reasoning until it hits the same cap. Name the loss and ask for visible
+/// progress early so the next truncation keeps something.
+pub const LOST_THINKING_PROMPT: &str = "Your previous response reached the output limit while still thinking, \
+     before any visible text or tool call, and that thinking is not available to you. Keep thinking brief: \
+     write your conclusions so far as visible text or make the next tool call early in this response. \
+     Do not acknowledge this message.";
+
+/// Whether `message` is a `max_tokens` stop that produced no answer text and no
+/// tool call — its only output was thinking, which providers never receive back.
+pub fn lost_thinking(message: &Message) -> bool {
+    matches!(message, Message::AssistantMessage {
+        content,
+        tool_uses,
+        turn_end_reason: Some(TurnEndReason::MaxTokens),
+    } if tool_uses.is_empty() && generative_model::answer_content(content).is_empty())
+}
+
 /// A run ending at an output cap is distinct from a completed model turn.
 #[derive(Debug, Clone)]
 pub struct RunOutcome {
