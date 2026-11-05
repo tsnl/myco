@@ -1010,10 +1010,12 @@ mod tests {
                     ToolUse {
                         name: "slow_a".into(),
                         input: json!({}),
+                        thought_signature: None,
                     },
                     ToolUse {
                         name: "slow_b".into(),
                         input: json!({}),
+                        thought_signature: None,
                     },
                 ],
                 turn_end_reason: TurnEndReason::ToolUse,
@@ -1102,6 +1104,7 @@ mod tests {
                 tool_uses: vec![ToolUse {
                     name: "slow_a".into(),
                     input: json!({}),
+                    thought_signature: None,
                 }],
                 turn_end_reason: TurnEndReason::ToolUse,
                 usage: None,
@@ -1172,6 +1175,7 @@ mod tests {
                 tool_uses: vec![ToolUse {
                     name: "effect".into(),
                     input: json!({}),
+                    thought_signature: None,
                 }],
                 turn_end_reason: TurnEndReason::ToolUse,
                 usage: None,
@@ -1235,6 +1239,7 @@ mod tests {
                 tool_uses: vec![ToolUse {
                     name: "effect".into(),
                     input: json!({}),
+                    thought_signature: None,
                 }],
                 turn_end_reason: TurnEndReason::ToolUse,
                 usage: None,
@@ -1292,6 +1297,7 @@ mod tests {
                 tool_uses: vec![ToolUse {
                     name: "effect".into(),
                     input: json!({}),
+                    thought_signature: None,
                 }],
                 turn_end_reason: TurnEndReason::ToolUse,
                 usage: None,
@@ -1345,6 +1351,7 @@ mod tests {
                 tool_uses: vec![ToolUse {
                     name: "fast".into(),
                     input: json!({}),
+                    thought_signature: None,
                 }],
                 turn_end_reason: TurnEndReason::ToolUse,
                 usage: Some(TokenUsage {
@@ -1477,6 +1484,7 @@ mod tests {
             tool_uses: vec![ToolUse {
                 name: "slow_a".into(),
                 input: json!({}),
+                thought_signature: None,
             }],
             turn_end_reason: TurnEndReason::ToolUse,
             usage: None,
@@ -1546,6 +1554,7 @@ mod tests {
             tool_uses: vec![ToolUse {
                 name: "slow_a".into(),
                 input: json!({}),
+                thought_signature: None,
             }],
             turn_end_reason: TurnEndReason::ToolUse,
             usage: None,
@@ -1652,6 +1661,7 @@ mod tests {
                 tool_uses: vec![ToolUse {
                     name: "unavailable".into(),
                     input: serde_json::json!({}),
+                    thought_signature: None,
                 }],
                 turn_end_reason: TurnEndReason::MaxTokens,
                 usage: None,
@@ -1754,6 +1764,7 @@ mod tests {
             tool_uses: vec![ToolUse {
                 name: "bash".into(),
                 input: serde_json::json!({}),
+                thought_signature: None,
             }],
             turn_end_reason: TurnEndReason::MaxTokens,
             usage: None,

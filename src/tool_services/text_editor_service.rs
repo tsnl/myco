@@ -594,6 +594,8 @@ mod tests {
             generative_model::ToolUse {
                 name: "str_replace_based_edit_tool".into(),
                 input,
+
+                thought_signature: None,
             },
             HostDispatchContext {
                 agent_id: uuid::Uuid::nil(),
@@ -617,6 +619,8 @@ mod tests {
                 generative_model::ToolUse {
                     name: "str_replace_based_edit_tool".into(),
                     input,
+
+                    thought_signature: None,
                 },
                 HostDispatchContext::new(owner, crate::core::CancelToken::new()),
             ))

@@ -31,6 +31,7 @@ async fn cancel_during_local_exec_leaves_no_process_group_survivors() {
                 "command": format!("sleep {sleep_tag}"),
                 "timeout_ms": 60_000,
             }),
+            thought_signature: None,
         }],
         turn_end_reason: TurnEndReason::ToolUse,
         usage: None,

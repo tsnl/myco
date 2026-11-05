@@ -583,10 +583,12 @@ fn tool_calls_appear_before_results_and_finish_independently() {
     let first = ToolUse {
         name: "bash".into(),
         input: json!({"command":"sleep 10"}),
+        thought_signature: None,
     };
     let second = ToolUse {
         name: "editor".into(),
         input: json!({"text":"write this"}),
+        thought_signature: None,
     };
     for (index, tool) in [&first, &second].into_iter().enumerate() {
         app.emit(AgentEvent::ToolStarted {
@@ -623,6 +625,7 @@ fn background_controls_target_one_call_and_reject_stale_or_foreign_requests() {
     let tool = ToolUse {
         name: "bash".into(),
         input: json!({"command":"sleep 10"}),
+        thought_signature: None,
     };
     let first = Uuid::new_v4();
     let second = Uuid::new_v4();
@@ -675,6 +678,7 @@ fn tool_first_replies_have_one_heading_before_parallel_tools_live_and_replayed()
     let tool = ToolUse {
         name: "bash".into(),
         input: json!({"command":"pwd"}),
+        thought_signature: None,
     };
     for _ in 0..2 {
         app.emit(AgentEvent::ToolStarted {
@@ -711,6 +715,7 @@ fn snapshots_keep_measured_durations_for_repeated_calls_without_inventing_histor
     let tool = ToolUse {
         name: "bash".into(),
         input: json!({"command":"same command"}),
+        thought_signature: None,
     };
     let mut observed = Vec::new();
     for age in [None, Some(3), Some(1)] {
@@ -743,6 +748,7 @@ fn running_snapshots_measure_time_since_dispatch_instead_of_time_since_reconnect
     let tool = ToolUse {
         name: "bash".into(),
         input: json!({"command":"waiting"}),
+        thought_signature: None,
     };
     app.live.lock().unwrap().snapshot.blocks.push(Block::tool(
         tool.clone(),
@@ -877,6 +883,7 @@ fn cancelled_and_timed_out_calls_are_not_successful_outcomes() {
             ToolUse {
                 name: "any-tool".into(),
                 input: Value::Null,
+                thought_signature: None,
             },
             None,
         );
@@ -1176,6 +1183,7 @@ fn compaction_reports_activity_and_separates_tool_first_continuation_without_a_m
         tool_use: ToolUse {
             name: "bash".into(),
             input: json!({"command":"pwd"}),
+            thought_signature: None,
         },
         context: Default::default(),
     });
@@ -1357,6 +1365,7 @@ fn prelude_notices_stay_hidden_in_user_messages_and_tool_results() {
                 tool_uses: vec![ToolUse {
                     name: "bash".into(),
                     input: json!({"command":"pwd"}),
+                    thought_signature: None,
                 }],
                 turn_end_reason: None,
             },
@@ -1403,6 +1412,7 @@ fn recorded_history_hides_runtime_context_and_preserves_outcomes_and_turn_times(
             tool_uses: vec![ToolUse {
                 name: "any-tool".into(),
                 input: json!({"text":"input"}),
+                thought_signature: None,
             }],
             turn_end_reason: None,
         },

@@ -365,6 +365,8 @@ mod tests {
                 generative_model::ToolUse {
                     name: "bash".into(),
                     input,
+
+                    thought_signature: None,
                 },
                 HostDispatchContext::new(owner, crate::core::CancelToken::new()),
             )

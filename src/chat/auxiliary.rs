@@ -206,6 +206,7 @@ mod tests {
             tool_uses: vec![ToolUse {
                 name: "bash".into(),
                 input: json!({}),
+                thought_signature: None,
             }],
             turn_end_reason: TurnEndReason::ToolUse,
             usage: None,

@@ -32,6 +32,7 @@ fn view(path: &std::path::Path) -> ToolUse {
     ToolUse {
         name: "str_replace_based_edit_tool".into(),
         input: json!({"command":"view", "path":path}),
+        thought_signature: None,
     }
 }
 
@@ -43,6 +44,7 @@ fn in_process_discovery_supports_an_executor_without_tokio() {
         ToolUse {
             name: "skills".into(),
             input: json!({}),
+            thought_signature: None,
         },
         context(),
     ));
@@ -205,6 +207,7 @@ async fn explicit_scans_resolve_on_the_host_and_shell_text_is_not_parsed() {
     let bash = ToolUse {
         name: "bash".into(),
         input: json!({"command":format!("cd {} && true", project.display())}),
+        thought_signature: None,
     };
     assert!(
         service
@@ -216,6 +219,7 @@ async fn explicit_scans_resolve_on_the_host_and_shell_text_is_not_parsed() {
     let call = ToolUse {
         name: "skills".into(),
         input: json!({"path":"other"}),
+        thought_signature: None,
     };
     for _ in 0..2 {
         let result = service
@@ -228,6 +232,7 @@ async fn explicit_scans_resolve_on_the_host_and_shell_text_is_not_parsed() {
     let invalid = ToolUse {
         name: "skills".into(),
         input: json!({"path":""}),
+        thought_signature: None,
     };
     assert!(service.dispatch_tool_use(invalid, ctx).await.is_error);
 }

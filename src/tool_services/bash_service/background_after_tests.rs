@@ -13,6 +13,8 @@ async fn call(
             generative_model::ToolUse {
                 name: "bash".into(),
                 input,
+
+                thought_signature: None,
             },
             HostDispatchContext::new(owner, crate::core::CancelToken::new()),
         )
@@ -173,6 +175,7 @@ async fn cancellation_before_timed_yield_kills_without_retaining_a_handle() {
                 "command":format!("echo $$ > '{}/pid'; sleep 30", dir.path().display()),
                 "background_after":5000,
             }),
+            thought_signature: None,
         },
         context.clone(),
     );

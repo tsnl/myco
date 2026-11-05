@@ -653,6 +653,7 @@ mod tests {
                 .map(|index| ToolUse {
                     name: "test".into(),
                     input: json!({"index": index}),
+                    thought_signature: None,
                 })
                 .collect(),
             turn_end_reason: reason,

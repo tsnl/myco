@@ -204,6 +204,7 @@ mod tests {
                 ToolUse {
                     name: "list_recent".into(),
                     input: json!({}),
+                    thought_signature: None,
                 },
                 HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new()),
             )

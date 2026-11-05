@@ -7,6 +7,7 @@ fn tool_use_json(value: serde_json::Value) -> generative_model::ToolUse {
     generative_model::ToolUse {
         name: "bash".into(),
         input: value,
+        thought_signature: None,
     }
 }
 

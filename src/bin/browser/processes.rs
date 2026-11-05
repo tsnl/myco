@@ -127,6 +127,7 @@ pub(crate) fn refresh_processes(blocks: &mut Vec<Block>, hosts: &[HostResources]
                     input: json!({
                         "host": entry.host, "session_id": resource.id, "command": process.command,
                     }),
+                    thought_signature: None,
                 },
                 None,
             );

@@ -508,6 +508,7 @@ mod tests {
             tool_uses: vec![crate::generative_model::ToolUse {
                 name: "bash".into(),
                 input: serde_json::json!({"command": format!("printf x >> '{}'", effect.display())}),
+                thought_signature: None,
             }],
             turn_end_reason: TurnEndReason::ToolUse,
             usage: None,

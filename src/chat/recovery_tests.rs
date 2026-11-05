@@ -80,6 +80,7 @@ async fn runner(home: &Path, before_tools: bool) -> (SessionRunner, Arc<Scripted
         output(vec![ToolUse {
             name: "bash".into(),
             input: json!({"command": format!("printf executed >> '{}'", home.join("effect").display())}),
+            thought_signature: None,
         }]),
         output(vec![]),
     ]);

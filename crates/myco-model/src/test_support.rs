@@ -22,6 +22,7 @@ pub(crate) fn assistant_tool(text: Option<&str>, name: &str, input: serde_json::
         tool_uses: vec![ToolUse {
             name: name.into(),
             input,
+            thought_signature: None,
         }],
         turn_end_reason: Some(TurnEndReason::ToolUse),
     }
@@ -57,6 +58,7 @@ pub(crate) fn expect_tool_start(part: &MessagePart, index: usize, name: &str) {
         MessagePart::ToolUseStart(ToolUseStart {
             index: i,
             name: got_name,
+            thought_signature: _,
         }) if *i == index && got_name == name => {}
         other => panic!("expected tool start {index}/{name}, got {other:?}"),
     }
