@@ -244,7 +244,7 @@ async fn remote_inventory_preserves_lazy_connections_and_partitions_resources_by
     assert!(!client.is_connected());
     let result = client.call(owner, ToolUse { name: "bash".into(), input: json!({
         "action":"start", "session_id":"retained", "command":"cat", "idle_ms":10, "timeout_ms":1000,
-    }) }, CancelToken::new()).await;
+    }), thought_signature: None }, CancelToken::new()).await;
     assert!(!result.is_error, "{result:?}");
     let resources = client.resources(owner).await.unwrap();
     assert_eq!(resources.len(), 1);
@@ -297,7 +297,7 @@ async fn a_lost_tool_reply_preserves_other_remote_shells_when_health_check_succe
     let owner = uuid::Uuid::new_v4();
     let start = client.call(owner, ToolUse { name: "bash".into(), input: json!({
         "action":"start", "session_id":"keep", "command":"bash", "stdin":"saved=still-here\n", "idle_ms":10, "timeout_ms":100,
-    }) }, CancelToken::new()).await;
+    }), thought_signature: None }, CancelToken::new()).await;
     assert!(!start.is_error, "{start:?}");
     let lost = client
         .call(
@@ -319,7 +319,7 @@ async fn a_lost_tool_reply_preserves_other_remote_shells_when_health_check_succe
     );
     let read = client.call(owner, ToolUse { name: "bash".into(), input: json!({
         "action":"write", "session_id":"keep", "stdin":"printf '%s\\n' \"$saved\"\n", "idle_ms":10, "timeout_ms":1000,
-    }) }, CancelToken::new()).await;
+    }), thought_signature: None }, CancelToken::new()).await;
     assert!(!read.is_error, "{read:?}");
     assert!(tool_text(&read).contains("still-here"), "{read:?}");
 }
