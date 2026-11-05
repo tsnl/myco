@@ -21,6 +21,7 @@ fn running_bash(app: &App) -> (Uuid, CancelToken) {
         tool_use: ToolUse {
             name: "bash".into(),
             input: json!({"command":"long-running-build"}),
+            thought_signature: None,
         },
         background: background.clone(),
         context: myco::TraceContext::root(),
@@ -34,6 +35,7 @@ fn finish_bash(app: &App, id: Uuid) {
         tool_use: ToolUse {
             name: "bash".into(),
             input: json!({"command":"long-running-build"}),
+            thought_signature: None,
         },
         result: ToolResult::text("Retained as bg-1").with_status("backgrounded"),
         context: myco::TraceContext::root(),

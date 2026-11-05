@@ -198,6 +198,13 @@ fn convert_messages(
                             name: tool_use.name.clone(),
                             arguments: tool_use.input.to_string(),
                         },
+                        extra_content: tool_use.thought_signature.clone().map(|signature| {
+                            GeminiExtraContent {
+                                google: GeminiGoogleContent {
+                                    thought_signature: signature,
+                                },
+                            }
+                        }),
                     })
                     .collect();
                 if text.is_empty() && tool_calls.is_empty() {
@@ -374,9 +381,21 @@ impl StreamAccumulator {
                          without a name"
                     )));
                 }
+                let thought_signature = call.extra_content.as_ref().and_then(|extra| {
+                    extra.google.as_ref().and_then(|google| {
+                        google
+                            .thought_signature
+                            .clone()
+                            .filter(|signature| !signature.is_empty())
+                    })
+                });
                 let index = self.slots.open_tool_use(slot);
                 self.saw_tool_call = true;
-                out.push(MessagePart::ToolUseStart(ToolUseStart { index, name }));
+                out.push(MessagePart::ToolUseStart(ToolUseStart {
+                    index,
+                    name,
+                    thought_signature,
+                }));
                 index
             }
         };
@@ -505,6 +524,20 @@ struct ChatToolCall {
     #[serde(rename = "type")]
     type_: &'static str,
     function: ChatToolCallFunction,
+    /// Gemini attaches a `thought_signature` here and requires it back on the
+    /// next turn. Omitted for every other provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    extra_content: Option<GeminiExtraContent>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct GeminiExtraContent {
+    google: GeminiGoogleContent,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct GeminiGoogleContent {
+    thought_signature: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -552,6 +585,21 @@ struct ChatToolCallDelta {
     index: Option<usize>,
     #[serde(default)]
     function: Option<ChatToolCallFunctionDelta>,
+    /// Gemini's thought signature. Only the first chunk of a call carries it.
+    #[serde(default)]
+    extra_content: Option<GeminiExtraContentIn>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GeminiExtraContentIn {
+    #[serde(default)]
+    google: Option<GeminiGoogleContentIn>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GeminiGoogleContentIn {
+    #[serde(default)]
+    thought_signature: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -652,6 +700,7 @@ mod tests {
             tool_uses: vec![ToolUse {
                 name: "bash".into(),
                 input: serde_json::json!({}),
+                thought_signature: None,
             }],
             turn_end_reason: Some(TurnEndReason::ToolUse),
         }];
@@ -683,10 +732,12 @@ mod tests {
                     ToolUse {
                         name: "view_image".into(),
                         input: serde_json::json!({}),
+                        thought_signature: None,
                     },
                     ToolUse {
                         name: "bash".into(),
                         input: serde_json::json!({}),
+                        thought_signature: None,
                     },
                 ],
                 turn_end_reason: Some(TurnEndReason::ToolUse),
@@ -838,6 +889,65 @@ mod tests {
             .unwrap();
         expect_turn_end(&items[0], TurnEndReason::ToolUse);
         acc.finish().unwrap();
+    }
+
+    #[test]
+    fn gemini_thought_signature_round_trips_onto_the_next_request() {
+        // Gemini sends the signature only on the first chunk of a call and
+        // rejects the following turn unless that exact token comes back on
+        // the assistant tool call.
+        let mut acc = StreamAccumulator::default();
+        let items = acc
+            .handle_chunk(chunk(serde_json::json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0,
+                    "function": {"name": "bash", "arguments": "{\"command\":\"date\"}"},
+                    "extra_content": {"google": {"thought_signature": "sig-abc"}}
+                }]}}]
+            })))
+            .unwrap();
+        match &items[0] {
+            MessagePart::ToolUseStart(ToolUseStart {
+                thought_signature, ..
+            }) => {
+                assert_eq!(thought_signature.as_deref(), Some("sig-abc"));
+            }
+            other => panic!("expected a tool start, got {other:?}"),
+        }
+        acc.handle_chunk(chunk(serde_json::json!({
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+        })))
+        .unwrap();
+
+        let call = ToolUse {
+            name: "bash".into(),
+            input: serde_json::json!({"command": "date"}),
+            thought_signature: Some("sig-abc".into()),
+        };
+        let input = [
+            Message::AssistantMessage {
+                content: vec![],
+                tool_uses: vec![call],
+                turn_end_reason: Some(TurnEndReason::ToolUse),
+            },
+            tool_results(&["ok"]),
+        ];
+        let json = serde_json::to_value(convert_messages("", &input).unwrap()).unwrap();
+        let sent = &json[0]["tool_calls"][0];
+        assert_eq!(
+            sent["extra_content"]["google"]["thought_signature"],
+            "sig-abc"
+        );
+
+        // A call without a signature must not grow an empty extra_content.
+        let plain = serde_json::to_value(
+            convert_messages("", &[assistant_tool(None, "bash", serde_json::json!({}))]).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            plain[0]["tool_calls"][0].get("extra_content").is_none(),
+            "{plain}"
+        );
     }
 
     #[test]

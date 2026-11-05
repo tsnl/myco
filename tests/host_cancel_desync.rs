@@ -60,6 +60,7 @@ async fn background_remote_exec_preserves_the_process_and_connection() {
             ToolUse {
                 name: "bash".into(),
                 input: json!({"command":"echo before-background; sleep 30", "timeout_ms":60000}),
+                thought_signature: None,
             },
             context.clone(),
         ),
@@ -78,6 +79,7 @@ async fn background_remote_exec_preserves_the_process_and_connection() {
             ToolUse {
                 name: "bash".into(),
                 input: json!({"action":"read", "session_id":id, "timeout_ms":1000}),
+                thought_signature: None,
             },
             CancelToken::new(),
         )
@@ -90,6 +92,7 @@ async fn background_remote_exec_preserves_the_process_and_connection() {
             ToolUse {
                 name: "bash".into(),
                 input: json!({"command":"echo foreground-ready"}),
+                thought_signature: None,
             },
             CancelToken::new(),
         )
@@ -101,6 +104,7 @@ async fn background_remote_exec_preserves_the_process_and_connection() {
             ToolUse {
                 name: "bash".into(),
                 input: json!({"action":"close", "session_id":id}),
+                thought_signature: None,
             },
             CancelToken::new(),
         )
@@ -123,6 +127,7 @@ async fn cancel_midcall_then_next_call_succeeds() {
                 "command": format!("sleep {sleep_tag}; echo done-slow"),
                 "timeout_ms": 180_000
             }),
+            thought_signature: None,
         },
         cancel.clone(),
     ));
@@ -153,6 +158,7 @@ async fn cancel_midcall_then_next_call_succeeds() {
             ToolUse {
                 name: "bash".into(),
                 input: json!({"command": "echo hello-after-cancel"}),
+                thought_signature: None,
             },
             CancelToken::new(),
         ),
@@ -173,6 +179,7 @@ async fn cancel_midcall_then_next_call_succeeds() {
             ToolUse {
                 name: "bash".into(),
                 input: json!({"command": "echo second-ok"}),
+                thought_signature: None,
             },
             CancelToken::new(),
         )
@@ -191,6 +198,7 @@ async fn drop_midcall_then_next_call_succeeds() {
         ToolUse {
             name: "bash".into(),
             input: json!({"command": "sleep 2; echo done-slow"}),
+            thought_signature: None,
         },
         CancelToken::new(),
     );
@@ -206,6 +214,7 @@ async fn drop_midcall_then_next_call_succeeds() {
             ToolUse {
                 name: "bash".into(),
                 input: json!({"command": "echo after-drop"}),
+                thought_signature: None,
             },
             CancelToken::new(),
         ),
@@ -254,6 +263,7 @@ async fn remote_inventory_preserves_lazy_connections_and_partitions_resources_by
             ToolUse {
                 name: "bash".into(),
                 input: json!({"action":"close", "session_id":"retained"}),
+                thought_signature: None,
             },
             CancelToken::new(),
         )
@@ -297,6 +307,7 @@ async fn a_lost_tool_reply_preserves_other_remote_shells_when_health_check_succe
                 input: json!({
                     "command":"true", "timeout_ms":1,
                 }),
+                thought_signature: None,
             },
             CancelToken::new(),
         )
@@ -340,6 +351,8 @@ async fn remote_json(
             ToolUse {
                 name: "bash".into(),
                 input,
+
+                thought_signature: None,
             },
             CancelToken::new(),
         )
@@ -446,6 +459,7 @@ async fn editor_read_fingerprints_expire_with_idle_workers_and_require_a_fresh_r
                 input: json!({
                     "command":"view", "path":path,
                 }),
+                thought_signature: None,
             },
             CancelToken::new(),
         )
@@ -467,6 +481,7 @@ async fn editor_read_fingerprints_expire_with_idle_workers_and_require_a_fresh_r
                 input: json!({
                     "command":"str_replace", "path":path, "old_str":"before", "new_str":"after",
                 }),
+                thought_signature: None,
             },
             CancelToken::new(),
         )

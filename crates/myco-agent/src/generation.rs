@@ -357,6 +357,7 @@ mod tests {
             parts.push(MessagePart::ToolUseStart(myco_model::ToolUseStart {
                 index,
                 name: "effect".into(),
+                thought_signature: None,
             }));
             parts.push(MessagePart::ToolUseDelta(myco_model::ToolUseDelta {
                 index,

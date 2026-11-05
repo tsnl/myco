@@ -60,6 +60,8 @@ async fn call(runner: &SessionRunner, host: &str, name: &str, mut input: Value) 
             ToolUse {
                 name: name.into(),
                 input,
+
+                thought_signature: None,
             },
             CancelToken::new(),
             CancelToken::new(),
@@ -153,6 +155,7 @@ async fn scenario(host: &str, home: &Path) {
                 ToolUse {
                     name: "view_image".into(),
                     input: json!({"host":host,"path":image}),
+                    thought_signature: None,
                 },
                 context,
             )

@@ -52,6 +52,8 @@ fn output(input: Option<serde_json::Value>) -> GenerateOutput {
             .map(|input| ToolUse {
                 name: "bash".into(),
                 input,
+
+                thought_signature: None,
             })
             .collect(),
         usage: None,

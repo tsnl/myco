@@ -906,6 +906,8 @@ mod tests {
                 .map(|input| ToolUse {
                     name: "bash".into(),
                     input,
+
+                    thought_signature: None,
                 })
                 .collect(),
             turn_end_reason: reason,
@@ -1651,7 +1653,7 @@ mod tests {
             let file = home.path().join("observed.txt");
             std::fs::write(&file, "read before editing").unwrap();
             let mut start = output(90, Some(json!({"action":"start", "session_id":"live", "command":"bash --noprofile --norc", "idle_ms":10, "timeout_ms":1000})), TurnEndReason::ToolUse);
-            start.tool_uses.push(ToolUse { name: "str_replace_based_edit_tool".into(), input: json!({"command":"view", "path":file}) });
+            start.tool_uses.push(ToolUse { name: "str_replace_based_edit_tool".into(), input: json!({"command":"view", "path":file}), thought_signature: None });
             let (mut runner, _) = setup(vec![start, output(20, None, TurnEndReason::EndTurn)], Arc::new(Summarizer::default())).await;
             submit(&mut runner, CancelToken::new()).await.result.unwrap();
             let current = crate::RuntimeRecord::latest(runner.agent().history()).unwrap();

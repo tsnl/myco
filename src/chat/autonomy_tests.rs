@@ -18,6 +18,7 @@ fn response(reason: TurnEndReason, disable: bool) -> GenerateOutput {
             vec![ToolUse {
                 name: "session_meta".into(),
                 input: serde_json::json!({"action":"disable_auto_continue"}),
+                thought_signature: None,
             }]
         } else {
             vec![]
@@ -404,6 +405,7 @@ fn cancellation_keeps_failed_save_visible_and_retains_live_tool_observations() {
                     tool_uses: vec![ToolUse {
                         name: "effect".into(),
                         input: serde_json::json!({}),
+                        thought_signature: None,
                     }],
                     turn_end_reason: Some(TurnEndReason::ToolUse),
                 },

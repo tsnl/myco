@@ -69,6 +69,7 @@ fn step(input_tokens: u64, tool: Option<serde_json::Value>) -> Vec<MessagePart> 
         parts.push(MessagePart::ToolUseStart(ToolUseStart {
             index: 0,
             name: "bash".into(),
+            thought_signature: None,
         }));
         parts.push(MessagePart::ToolUseDelta(ToolUseDelta {
             index: 0,

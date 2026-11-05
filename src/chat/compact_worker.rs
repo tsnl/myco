@@ -310,6 +310,7 @@ mod tests {
                         name: "session_history".into(),
                         input: json!({"action":"write_summary", "session_id":predecessor.id,
                             "thread_id":predecessor.active_thread().id, "markdown":summary}),
+                        thought_signature: None,
                     }],
                     usage: None,
                     turn_end_reason: TurnEndReason::ToolUse,
@@ -460,7 +461,7 @@ mod tests {
             let tools = CompactTools::new(&session);
             assert_eq!(tools.tool_specs().len(), 1);
             let input = json!({"action":"stats", "session_id":session.id, "thread_id":session.active_thread().id});
-            let call = |name: &str, input| ToolUse { name: name.into(), input };
+            let call = |name: &str, input| ToolUse { name: name.into(), input, thought_signature: None };
             for name in ["bash", "str_replace_based_edit_tool", "prelude", "session_meta"] {
                 assert!(tools.clone().dispatch(call(name, input.clone()), CancelToken::new(), CancelToken::new()).await.is_error);
             }

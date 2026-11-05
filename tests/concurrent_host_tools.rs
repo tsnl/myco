@@ -16,6 +16,7 @@ fn bash_tool(command: &str) -> ToolUse {
     ToolUse {
         name: "bash".into(),
         input: json!({"command": command, "timeout_ms": 5000}),
+        thought_signature: None,
     }
 }
 
@@ -119,6 +120,7 @@ async fn agent_concurrent_bash_and_editor_complete() {
                         "path": tmp.to_string_lossy(),
                         "file_text": "hello-from-editor\n"
                     }),
+                    thought_signature: None,
                 },
             ],
         ),

@@ -124,6 +124,7 @@ mod tests {
             tool_use: ToolUse {
                 name: "bash".into(),
                 input: json!({"command": "echo hi"}),
+                thought_signature: None,
             },
         };
         let line = String::from_utf8(msg.encode().unwrap()).unwrap();

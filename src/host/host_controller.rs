@@ -1111,6 +1111,8 @@ mod tests {
             let tool = ToolUse {
                 name: "bash".into(),
                 input,
+
+                thought_signature: None,
             };
             assert_eq!(
                 response_timeout(&tool),
@@ -1155,6 +1157,7 @@ mod tests {
             ToolUse {
                 name: "bash".into(),
                 input: json!({"command": command}),
+                thought_signature: None,
             },
             CancelToken::new(),
         )
@@ -1250,6 +1253,7 @@ mod tests {
                     "command": "sleep 120; echo done-slow",
                     "timeout_ms": 180_000
                 }),
+                thought_signature: None,
             },
             cancel.clone(),
         ));
@@ -1371,6 +1375,7 @@ mod tests {
                 ToolUse {
                     name: "bash".into(),
                     input: json!({"command": "true", "timeout_ms": 1}),
+                    thought_signature: None,
                 },
                 CancelToken::new(),
             ),

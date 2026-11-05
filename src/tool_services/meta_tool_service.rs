@@ -431,6 +431,7 @@ mod tests {
                         "action": "set_title",
                         "title": "  My Feature  "
                     }),
+                    thought_signature: None,
                 },
                 HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new()),
             )
@@ -443,6 +444,7 @@ mod tests {
                 generative_model::ToolUse {
                     name: "session_meta".into(),
                     input: serde_json::json!({"action": "get"}),
+                    thought_signature: None,
                 },
                 HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new()),
             )
@@ -508,6 +510,8 @@ mod tests {
         let call = |input: serde_json::Value| generative_model::ToolUse {
             name: "session_meta".into(),
             input,
+
+            thought_signature: None,
         };
 
         // Seed a title, then try the all-keys-null fill some models emit.
@@ -585,6 +589,7 @@ mod tests {
                 generative_model::ToolUse {
                     name: "session_meta".into(),
                     input: serde_json::json!({"action": "executable_path"}),
+                    thought_signature: None,
                 },
                 HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new()),
             )
@@ -607,6 +612,7 @@ mod tests {
                 generative_model::ToolUse {
                     name: "session_meta".into(),
                     input: serde_json::json!({"action": "pid"}),
+                    thought_signature: None,
                 },
                 HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new()),
             )

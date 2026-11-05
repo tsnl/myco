@@ -26,13 +26,18 @@ impl MessageAccumulator {
                 ensure_slot(&mut self.content, index, block);
             }
             MessagePart::ContentDelta(delta) => apply_content_delta(&mut self.content, delta)?,
-            MessagePart::ToolUseStart(ToolUseStart { index, name }) => {
+            MessagePart::ToolUseStart(ToolUseStart {
+                index,
+                name,
+                thought_signature,
+            }) => {
                 ensure_slot(
                     &mut self.tool_uses,
                     *index,
                     IncompleteToolUse {
                         name: name.clone(),
                         input_json: String::new(),
+                        thought_signature: thought_signature.clone(),
                     },
                 );
             }
@@ -97,6 +102,7 @@ impl MessageAccumulator {
 struct IncompleteToolUse {
     name: String,
     input_json: String,
+    thought_signature: Option<String>,
 }
 
 impl IncompleteToolUse {
@@ -111,6 +117,7 @@ impl IncompleteToolUse {
         Ok(ToolUse {
             name: self.name,
             input,
+            thought_signature: self.thought_signature,
         })
     }
 }
@@ -215,6 +222,7 @@ mod tests {
             MessagePart::ToolUseStart(ToolUseStart {
                 index: 0,
                 name: "bash".into(),
+                thought_signature: None,
             }),
             MessagePart::ToolUseDelta(ToolUseDelta {
                 index: 0,
@@ -266,6 +274,7 @@ mod tests {
                 MessagePart::ToolUseStart(ToolUseStart {
                     index: 0,
                     name: "bash".into(),
+                    thought_signature: None,
                 }),
                 MessagePart::ToolUseDelta(ToolUseDelta {
                     index: 0,

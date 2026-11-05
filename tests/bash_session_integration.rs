@@ -24,6 +24,8 @@ fn bash_turn(input: serde_json::Value) -> GenerateOutput {
         tool_uses: vec![ToolUse {
             name: "bash".into(),
             input,
+
+            thought_signature: None,
         }],
         turn_end_reason: TurnEndReason::ToolUse,
         usage: None,

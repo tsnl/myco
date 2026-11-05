@@ -378,6 +378,7 @@ impl StreamAccumulator {
                     out.push(MessagePart::ToolUseStart(ToolUseStart {
                         index: tool_index,
                         name,
+                        thought_signature: None,
                     }));
                 }
                 AnthropicStreamContentBlock::Other => {
@@ -955,10 +956,12 @@ mod tests {
                     ToolUse {
                         name: "x".into(),
                         input: serde_json::Value::Null,
+                        thought_signature: None,
                     },
                     ToolUse {
                         name: "x".into(),
                         input: serde_json::Value::Null,
+                        thought_signature: None,
                     },
                 ],
                 turn_end_reason: None,

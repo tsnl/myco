@@ -81,6 +81,7 @@ impl GenerativeModel for DemoModel {
                 MessagePart::ToolUseStart(ToolUseStart {
                     index: 0,
                     name: "echo".into(),
+                    thought_signature: None,
                 }),
                 MessagePart::ToolUseDelta(ToolUseDelta {
                     index: 0,

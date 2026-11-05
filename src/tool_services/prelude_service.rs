@@ -216,6 +216,8 @@ mod tests {
                 generative_model::ToolUse {
                     name: "prelude".into(),
                     input,
+
+                    thought_signature: None,
                 },
                 HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new()),
             )

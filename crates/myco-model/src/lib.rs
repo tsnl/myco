@@ -505,6 +505,13 @@ pub struct ToolSpec {
 pub struct ToolUse {
     pub name: String,
     pub input: serde_json::Value,
+    /// Opaque token a provider attached to this call that it requires back on
+    /// the next turn. Gemini (the Chat Completions dialect) sends a
+    /// `thought_signature` and rejects the following request without it.
+    /// `None` for every other provider; absent on sessions written before the
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -833,6 +840,9 @@ pub enum ContentDelta {
 pub struct ToolUseStart {
     pub index: usize,
     pub name: String,
+    /// Provider token to echo back with the result of this call. See
+    /// [`ToolUse::thought_signature`].
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1307,6 +1317,7 @@ mod tests {
                 tool_uses: vec![ToolUse {
                     name: "bash".into(),
                     input: serde_json::json!({"command": "true"}),
+                    thought_signature: None,
                 }],
                 turn_end_reason: Some(TurnEndReason::ToolUse),
             },

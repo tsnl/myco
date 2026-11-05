@@ -9,6 +9,8 @@ async fn tool(app: &Arc<App>, input: Value) -> myco::generative_model::ToolResul
             ToolUse {
                 name: "timer".into(),
                 input,
+
+                thought_signature: None,
             },
             HostDispatchContext::new(Uuid::new_v4(), CancelToken::new()),
         )
@@ -264,6 +266,7 @@ async fn timer_ownership_and_limits_include_fired_messages_waiting_for_delivery(
             ToolUse {
                 name: "timer".into(),
                 input: json!({"action":"set", "after_seconds":1, "message":"Cancelled call"}),
+                thought_signature: None,
             },
             HostDispatchContext::new(Uuid::new_v4(), cancel),
         )

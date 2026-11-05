@@ -129,6 +129,7 @@ mod tests {
                 ToolUse {
                     name: "view_image".into(),
                     input: json!({ "path": path }),
+                    thought_signature: None,
                 },
                 HostDispatchContext {
                     agent_id: uuid::Uuid::nil(),

@@ -84,6 +84,7 @@ impl GenerativeModel for ScriptedModel {
             parts.push(MessagePart::ToolUseStart(ToolUseStart {
                 index: i,
                 name: tu.name.clone(),
+                thought_signature: None,
             }));
             parts.push(MessagePart::ToolUseDelta(ToolUseDelta {
                 index: i,

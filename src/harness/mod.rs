@@ -502,6 +502,8 @@ mod tests {
                 ToolUse {
                     name: name.into(),
                     input,
+
+                    thought_signature: None,
                 },
                 agent_id,
                 CancelToken::new(),
@@ -536,18 +538,21 @@ mod tests {
         let tu = ToolUse {
             name: "bash".into(),
             input: json!({"command": "echo"}),
+            thought_signature: None,
         };
         assert_eq!(resolve_host_for_call(&tu, "local").unwrap(), "local");
 
         let tu = ToolUse {
             name: "bash".into(),
             input: json!({"command": "echo", "host": "devbox"}),
+            thought_signature: None,
         };
         assert_eq!(resolve_host_for_call(&tu, "local").unwrap(), "devbox");
 
         let tu = ToolUse {
             name: "bash".into(),
             input: json!({"host": "  "}),
+            thought_signature: None,
         };
         assert_eq!(resolve_host_for_call(&tu, "local").unwrap(), "local");
     }
@@ -557,6 +562,7 @@ mod tests {
         let mut tu = ToolUse {
             name: "bash".into(),
             input: json!({"command": "echo", "host": "devbox", "timeout_ms": 500}),
+            thought_signature: None,
         };
         strip_host_field(&mut tu);
         assert_eq!(tu.input, json!({"command": "echo", "timeout_ms": 500}));

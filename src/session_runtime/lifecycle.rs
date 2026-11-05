@@ -115,6 +115,7 @@ mod tests {
                 crate::generative_model::ToolUse {
                     name: "bash".into(),
                     input: serde_json::json!({"host":"offline", "command":"true"}),
+                    thought_signature: None,
                 },
                 owner,
                 crate::core::CancelToken::new(),

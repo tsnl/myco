@@ -133,6 +133,8 @@ impl Host {
                 tool_use: ToolUse {
                     name: name.into(),
                     input,
+
+                    thought_signature: None,
                 },
             })
             .await;

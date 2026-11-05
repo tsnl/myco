@@ -118,6 +118,7 @@ impl GenerativeModel for ScriptedModel {
             parts.push(MessagePart::ToolUseStart(ToolUseStart {
                 index: i,
                 name: tu.name.clone(),
+                thought_signature: None,
             }));
             parts.push(MessagePart::ToolUseDelta(ToolUseDelta {
                 index: i,
@@ -159,6 +160,8 @@ pub(crate) fn assistant_tool(text: Option<&str>, name: &str, input: serde_json::
         tool_uses: vec![ToolUse {
             name: name.into(),
             input,
+
+            thought_signature: None,
         }],
         turn_end_reason: Some(TurnEndReason::ToolUse),
     }

@@ -396,6 +396,7 @@ mod tests {
                     tool_use: ToolUse {
                         name: "unknown".into(),
                         input: serde_json::json!({}),
+                        thought_signature: None,
                     },
                 };
                 replies

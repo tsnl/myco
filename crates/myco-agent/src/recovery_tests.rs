@@ -49,6 +49,7 @@ fn output(tools: bool) -> GenerateOutput {
             vec![ToolUse {
                 name: "effect".into(),
                 input: serde_json::json!({}),
+                thought_signature: None,
             }]
         } else {
             vec![]

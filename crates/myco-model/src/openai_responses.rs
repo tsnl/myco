@@ -325,6 +325,7 @@ impl StreamAccumulator {
                     out.push(MessagePart::ToolUseStart(ToolUseStart {
                         index: tool_index,
                         name,
+                        thought_signature: None,
                     }));
                 }
                 ResponsesOutputItem::Other => {
