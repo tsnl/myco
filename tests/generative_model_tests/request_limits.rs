@@ -2,8 +2,8 @@
 
 use myco::generative_model::{
     self, AnthropicBackendConfig, BackendConfig, Content, GenerateError, GenerateOutput,
-    GenerativeModelConfig, Message, ModelSpec, OpenAIBackendConfig, Protocol, Recovery,
-    ThinkingMode, ToolSpec,
+    GenerativeModelConfig, GoogleGenAIBackendConfig, Message, ModelSpec, OpenAIBackendConfig,
+    Protocol, Recovery, ThinkingMode, ToolSpec,
 };
 use serde_json::json;
 
@@ -27,6 +27,11 @@ fn model(
         }),
         Protocol::OpenAIResponses => BackendConfig::OpenAIResponses(openai),
         Protocol::OpenAICompletions => BackendConfig::OpenAICompletions(openai),
+        Protocol::GoogleGenAI => BackendConfig::GoogleGenAI(GoogleGenAIBackendConfig {
+            base_url: server.base_url(),
+            max_request_bytes: limit,
+            ..Default::default()
+        }),
     };
     generative_model::new(GenerativeModelConfig {
         model: ModelSpec {
@@ -77,6 +82,7 @@ async fn every_protocol_counts_encoded_images_history_and_json_overhead_against_
         Protocol::AnthropicMessages,
         Protocol::OpenAIResponses,
         Protocol::OpenAICompletions,
+        Protocol::GoogleGenAI,
     ] {
         let history = history();
         let baseline = StubHttpServer::status(400, "test response").await;
@@ -139,6 +145,7 @@ async fn every_protocol_rejects_oversized_inline_and_legacy_images_before_upload
         Protocol::AnthropicMessages,
         Protocol::OpenAIResponses,
         Protocol::OpenAICompletions,
+        Protocol::GoogleGenAI,
     ] {
         for prefix in ["data:image/png;base64,", ""] {
             let rejected = StubHttpServer::status(400, "must not receive a request").await;

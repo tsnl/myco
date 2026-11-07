@@ -61,7 +61,7 @@ auth = { source = "env", var_name = "MY_MODEL_API_KEY" }
 ```
 
 Use the protocol your endpoint implements. The
-[configuration guide](configuration.md) explains all three protocols and
+[configuration guide](configuration.md) explains all four protocols and
 credential sources; the [manual](../manual/overview.md#models--credentials-the-catalog)
 contains fuller catalog examples.
 

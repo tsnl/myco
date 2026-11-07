@@ -1,4 +1,5 @@
-//! Backend-independent messages and one-attempt streaming model drivers.
+//! Backend-independent messages and one-attempt streaming model drivers
+//! (Anthropic Messages, OpenAI Responses, OpenAI Chat Completions, Google GenAI).
 //!
 //! Construct a driver with [`new`] and [`GenerativeModelConfig`], then pass a
 //! complete conversation to [`GenerativeModel::generate`]. The library accepts
@@ -39,6 +40,9 @@ pub use accumulator::MessageAccumulator;
 
 mod driver_core;
 
+mod google_genai;
+pub use google_genai::GoogleGenAIBackendConfig;
+
 mod openai_common;
 pub use openai_common::OpenAIBackendConfig;
 
@@ -78,6 +82,9 @@ pub enum Protocol {
     OpenAIResponses,
     #[serde(rename = "openai-completions")]
     OpenAICompletions,
+    /// Gemini Developer API (`generateContent`).
+    #[serde(rename = "google-genai")]
+    GoogleGenAI,
 }
 
 impl std::fmt::Display for Protocol {
@@ -86,6 +93,7 @@ impl std::fmt::Display for Protocol {
             Protocol::AnthropicMessages => f.write_str("anthropic-messages"),
             Protocol::OpenAIResponses => f.write_str("openai-responses"),
             Protocol::OpenAICompletions => f.write_str("openai-completions"),
+            Protocol::GoogleGenAI => f.write_str("google-genai"),
         }
     }
 }
@@ -94,7 +102,8 @@ impl std::fmt::Display for Protocol {
 ///
 /// Serde strings are the config.toml `thinking` values. Compatibility is
 /// per-protocol (validated at catalog resolution): Anthropic Messages takes
-/// `adaptive` | `budget` | `none`; OpenAI Responses takes `effort` | `none`.
+/// `adaptive` | `budget` | `none`; the OpenAI dialects take `effort` | `none`;
+/// Google GenAI takes all four.
 #[derive(
     Debug,
     Clone,
@@ -109,12 +118,14 @@ impl std::fmt::Display for Protocol {
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingMode {
     /// Anthropic `thinking.type: "adaptive"` + `output_config.effort`
-    /// (frontier models; older models reject it).
+    /// (frontier models; older models reject it). Gemini: the dynamic
+    /// `thinkingBudget: -1`.
     Adaptive,
     /// Anthropic `thinking.type: "enabled"` + a `budget_tokens` mapped from
-    /// [`Effort`] (e.g. Haiku 4.5).
+    /// [`Effort`] (e.g. Haiku 4.5). Gemini: `thinkingBudget` mapped the same
+    /// way (every Gemini 2.5 and 3 model accepts it).
     Budget,
-    /// OpenAI-style `reasoning.effort`.
+    /// OpenAI-style `reasoning.effort`. Gemini 3: `thinkingLevel`.
     Effort,
     /// Do not request thinking.
     None,
@@ -137,6 +148,7 @@ impl ThinkingMode {
         match protocol {
             Protocol::AnthropicMessages => ThinkingMode::Adaptive,
             Protocol::OpenAIResponses | Protocol::OpenAICompletions => ThinkingMode::Effort,
+            Protocol::GoogleGenAI => ThinkingMode::Budget,
         }
     }
 
@@ -152,6 +164,7 @@ impl ThinkingMode {
             Protocol::OpenAIResponses | Protocol::OpenAICompletions => {
                 matches!(self, ThinkingMode::Effort | ThinkingMode::None)
             }
+            Protocol::GoogleGenAI => true,
         }
     }
 }
@@ -393,6 +406,8 @@ pub enum BackendConfig {
     OpenAIResponses(OpenAIBackendConfig),
     /// Chat Completions API (`{base_url}/chat/completions`).
     OpenAICompletions(OpenAIBackendConfig),
+    /// Gemini Developer API (`{base_url}/v1beta/models/{id}:streamGenerateContent`).
+    GoogleGenAI(GoogleGenAIBackendConfig),
 }
 
 impl BackendConfig {
@@ -400,6 +415,7 @@ impl BackendConfig {
         match self {
             Self::Anthropic(config) => config.retry,
             Self::OpenAIResponses(config) | Self::OpenAICompletions(config) => config.retry,
+            Self::GoogleGenAI(config) => config.retry,
         }
     }
 
@@ -408,6 +424,7 @@ impl BackendConfig {
             BackendConfig::Anthropic(_) => Protocol::AnthropicMessages,
             BackendConfig::OpenAIResponses(_) => Protocol::OpenAIResponses,
             BackendConfig::OpenAICompletions(_) => Protocol::OpenAICompletions,
+            BackendConfig::GoogleGenAI(_) => Protocol::GoogleGenAI,
         }
     }
 }
@@ -443,6 +460,10 @@ pub fn new(config: GenerativeModelConfig) -> Result<Arc<dyn GenerativeModel>, Mo
         }
         BackendConfig::OpenAICompletions(backend) => {
             let model = openai_completions::OpenAICompletionsGenerativeModel::new(config, backend)?;
+            Ok(model as Arc<dyn GenerativeModel>)
+        }
+        BackendConfig::GoogleGenAI(backend) => {
+            let model = google_genai::GoogleGenAIGenerativeModel::new(config, backend)?;
             Ok(model as Arc<dyn GenerativeModel>)
         }
     }
@@ -506,10 +527,10 @@ pub struct ToolUse {
     pub name: String,
     pub input: serde_json::Value,
     /// Opaque token a provider attached to this call that it requires back on
-    /// the next turn. Gemini (the Chat Completions dialect) sends a
-    /// `thought_signature` and rejects the following request without it.
-    /// `None` for every other provider; absent on sessions written before the
-    /// field existed.
+    /// the next turn. Gemini sends a thought signature (natively and through
+    /// its Chat Completions dialect) and rejects the following request without
+    /// it. `None` for every other provider; absent on sessions written before
+    /// the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
 }
@@ -1133,6 +1154,20 @@ mod tests {
         assert!(!ThinkingMode::Adaptive.compatible_with(Protocol::OpenAICompletions));
         assert!(!ThinkingMode::Adaptive.compatible_with(Protocol::OpenAIResponses));
         assert!(!ThinkingMode::Budget.compatible_with(Protocol::OpenAIResponses));
+        // Gemini takes a budget by default (every 2.5 and 3 model accepts
+        // one) and every other shape on request.
+        assert_eq!(
+            ThinkingMode::default_for(Protocol::GoogleGenAI),
+            ThinkingMode::Budget
+        );
+        for mode in [
+            ThinkingMode::Adaptive,
+            ThinkingMode::Budget,
+            ThinkingMode::Effort,
+            ThinkingMode::None,
+        ] {
+            assert!(mode.compatible_with(Protocol::GoogleGenAI), "{mode}");
+        }
     }
 
     #[test]
@@ -1149,6 +1184,11 @@ mod tests {
             serde_json::from_value::<Protocol>(serde_json::json!("openai-completions")).unwrap(),
             Protocol::OpenAICompletions
         );
+        assert_eq!(
+            serde_json::from_value::<Protocol>(serde_json::json!("google-genai")).unwrap(),
+            Protocol::GoogleGenAI
+        );
+        assert_eq!(Protocol::GoogleGenAI.to_string(), "google-genai");
     }
 
     #[test]
@@ -1228,7 +1268,8 @@ mod tests {
     fn older_backend_configs_default_to_a_thirty_megabyte_request_cap() {
         let mut anthropic = serde_json::to_value(AnthropicBackendConfig::default()).unwrap();
         let mut openai = serde_json::to_value(OpenAIBackendConfig::default()).unwrap();
-        for config in [&mut anthropic, &mut openai] {
+        let mut google = serde_json::to_value(GoogleGenAIBackendConfig::default()).unwrap();
+        for config in [&mut anthropic, &mut openai, &mut google] {
             assert_eq!(config["max_request_bytes"], 30_000_000);
             config.as_object_mut().unwrap().remove("max_request_bytes");
         }
@@ -1240,6 +1281,12 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_value::<OpenAIBackendConfig>(openai)
+                .unwrap()
+                .max_request_bytes,
+            30_000_000
+        );
+        assert_eq!(
+            serde_json::from_value::<GoogleGenAIBackendConfig>(google)
                 .unwrap()
                 .max_request_bytes,
             30_000_000

@@ -6,8 +6,8 @@ use std::time::Duration;
 use futures::StreamExt;
 use myco::generative_model::{
     AnthropicBackendConfig, BackendConfig, Content, GenerationEvent, GenerativeModel,
-    GenerativeModelConfig, Message, ModelSpec, OpenAIBackendConfig, Protocol, RetryPolicy,
-    ThinkingMode,
+    GenerativeModelConfig, GoogleGenAIBackendConfig, Message, ModelSpec, OpenAIBackendConfig,
+    Protocol, RetryPolicy, ThinkingMode,
 };
 use myco::{Agent, AgentEvent, CancelToken, EventSink};
 use serde_json::{Value, json};
@@ -22,15 +22,17 @@ enum Dialect {
     ResponsesError,
     ResponsesNestedError,
     Completions,
+    GoogleGenAI,
 }
 
-const DIALECTS: [Dialect; 6] = [
+const DIALECTS: [Dialect; 7] = [
     Dialect::Anthropic,
     Dialect::ResponsesFailed,
     Dialect::ResponsesCompletedFailed,
     Dialect::ResponsesError,
     Dialect::ResponsesNestedError,
     Dialect::Completions,
+    Dialect::GoogleGenAI,
 ];
 
 impl Dialect {
@@ -38,6 +40,7 @@ impl Dialect {
         match self {
             Self::Anthropic => Protocol::AnthropicMessages,
             Self::Completions => Protocol::OpenAICompletions,
+            Self::GoogleGenAI => Protocol::GoogleGenAI,
             _ => Protocol::OpenAIResponses,
         }
     }
@@ -49,6 +52,12 @@ impl Dialect {
                 "api_error",
                 "timeout_error",
                 "rate_limit_error",
+            ],
+            Self::GoogleGenAI => [
+                "UNAVAILABLE",
+                "RESOURCE_EXHAUSTED",
+                "INTERNAL",
+                "DEADLINE_EXCEEDED",
             ],
             _ => [
                 "server_error",
@@ -73,6 +82,10 @@ impl Dialect {
             }
             Self::ResponsesNestedError => json!({"type":"error", "error":error}),
             Self::Completions => json!({"error":error}),
+            // Gemini reports a `google.rpc.Status`; its `status` names the condition.
+            Self::GoogleGenAI => {
+                json!({"error":{"code":503, "status":code, "message":"overloaded_error server_error UNAVAILABLE"}})
+            }
         }
     }
 
@@ -88,6 +101,12 @@ impl Dialect {
                 json!({"choices":[{"delta":{"tool_calls":[{"index":0, "function":{"name":"bash", "arguments":"{}"}}]}}]})
             }
             (Self::Completions, false) => json!({"choices":[{"delta":{"content":"DISCARDED"}}]}),
+            (Self::GoogleGenAI, true) => {
+                json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"bash", "args":{}}}]}}]})
+            }
+            (Self::GoogleGenAI, false) => {
+                json!({"candidates":[{"content":{"parts":[{"text":"DISCARDED"}]}}]})
+            }
             (_, true) => {
                 json!({"type":"response.output_item.added", "output_index":0, "item":{"type":"function_call", "name":"bash", "arguments":"{}"}})
             }
@@ -106,6 +125,11 @@ impl Dialect {
             ],
             Self::Completions => {
                 vec![json!({"choices":[{"delta":{"content":"OK"}, "finish_reason":"stop"}]})]
+            }
+            Self::GoogleGenAI => {
+                vec![
+                    json!({"candidates":[{"content":{"parts":[{"text":"OK"}]}, "finishReason":"STOP"}]}),
+                ]
             }
             _ => vec![
                 json!({"type":"response.output_text.delta", "output_index":0, "delta":"OK"}),
@@ -139,6 +163,10 @@ fn model(server: &StubHttpServer, dialect: Dialect) -> Arc<dyn GenerativeModel> 
                 ..Default::default()
             }),
             Dialect::Completions => BackendConfig::OpenAICompletions(openai),
+            Dialect::GoogleGenAI => BackendConfig::GoogleGenAI(GoogleGenAIBackendConfig {
+                base_url: server.base_url(),
+                ..Default::default()
+            }),
             _ => BackendConfig::OpenAIResponses(openai),
         },
     })

@@ -99,7 +99,7 @@ hidden from normal browsing. Remotes stay tool workers without model keys.
 | `src/harness/` | Host pool (remote hosts from `~/.ssh/config` `Host` aliases), startup preflight (executables + ssh-agent) |
 | `src/host/` | `HostController` + `HostWorker` + NDJSON protocol |
 | `src/tool_services/` | Host tool implementations (`ToolService`) |
-| `crates/myco-model/` | Protocol drivers (Anthropic Messages, OpenAI Responses, OpenAI Chat Completions) + `ModelSpec`/`ModelCatalog`; no built-in models |
+| `crates/myco-model/` | Protocol drivers (Anthropic Messages, OpenAI Responses, OpenAI Chat Completions, Google GenAI) + `ModelSpec`/`ModelCatalog`; no built-in models |
 | `src/manual/` | Embedded runtime articles: exported to `~/.myco/manual/<version>/<commit>/` at startup, printed by `--help <id>` |
 | `src/prompts/` | System prompt fragments (worktrees, computer-use, coding norms, user authority) + prelude / project-guidance injection + the session stamp carried by a session's first user message |
 | `src/prelude.rs` | The agent prelude (always-in-prompt knowledge, not a Rust re-export module): maildir-style write-once entries under `~/.myco/workspace/prelude/`, rendered into every prompt and edited via the root-only `prelude` tool |
@@ -201,8 +201,8 @@ cargo run --locked --bin myco
   entries. Inspect the behavior, fix what fails, and repeat until it works;
   automated tests alone are not enough. Report what you tried and any limits
   on the verification.
-- API credentials: see `README.md` / `myco --help overview` (Anthropic +
-  xAI/OpenAI Responses env vars; `.env` loaded at startup).
+- API credentials: see `README.md` / `myco --help overview` (Anthropic,
+  Google Gemini, and xAI/OpenAI env vars; `.env` loaded at startup).
 - Runtime docs for agents: `~/.myco/manual/<version>/<commit>/` (written at
   startup) or `myco --help overview|cli|harness-ops`.
 

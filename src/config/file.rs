@@ -57,8 +57,8 @@ pub struct FileConfig {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayEntry {
-    /// Wire protocol: `"anthropic-messages"`, `"openai-responses"`, or
-    /// `"openai-completions"`.
+    /// Wire protocol: `"anthropic-messages"`, `"openai-responses"`,
+    /// `"openai-completions"`, or `"google-genai"`.
     pub protocol: Protocol,
     /// Base URL including any path prefix, e.g. `https://openrouter.ai/api/v1`.
     pub base_url: String,
@@ -132,7 +132,7 @@ pub struct ModelEntry {
     pub context_window: u64,
     /// `"adaptive"` | `"budget"` | `"effort"` | `"none"`.
     /// Default per protocol: anthropic-messages → adaptive, both OpenAI
-    /// dialects → effort.
+    /// dialects → effort, google-genai → budget.
     #[serde(default)]
     pub thinking: Option<ThinkingMode>,
     /// Per-generate output token cap (default 8192).

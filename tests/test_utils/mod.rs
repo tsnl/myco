@@ -2,7 +2,8 @@
 use std::sync::Once;
 
 use myco::generative_model::{
-    AnthropicBackendConfig, BackendConfig, ModelSpec, OpenAIBackendConfig, Protocol, ThinkingMode,
+    AnthropicBackendConfig, BackendConfig, GoogleGenAIBackendConfig, ModelSpec,
+    OpenAIBackendConfig, Protocol, ThinkingMode,
 };
 
 mod scripted_model;
@@ -109,6 +110,29 @@ pub fn live_openrouter_kimi(protocol: Protocol) -> (ModelSpec, BackendConfig) {
         Protocol::OpenAICompletions => BackendConfig::OpenAICompletions(openai),
         _ => BackendConfig::OpenAIResponses(openai),
     };
+    (spec, backend)
+}
+
+/// One Gemini model over the native Google GenAI protocol.
+pub fn live_google_gemini() -> (ModelSpec, BackendConfig) {
+    let spec = ModelSpec {
+        key: "gemini-2.5-flash".into(),
+        api_id: "gemini-2.5-flash".into(),
+        protocol: Protocol::GoogleGenAI,
+        thinking: ThinkingMode::Budget,
+        context_window_tokens: 1_048_576,
+        max_image_base64_bytes: myco::config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
+        max_truncated_resumes: 3,
+        auto_compact_at_tokens: None,
+    };
+    let backend = BackendConfig::GoogleGenAI(GoogleGenAIBackendConfig {
+        base_url: std::env::var("GEMINI_BASE_URL")
+            .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".into()),
+        auth_token: std::env::var("GEMINI_API_KEY")
+            .or_else(|_| std::env::var("GOOGLE_API_KEY"))
+            .unwrap_or_default(),
+        ..Default::default()
+    });
     (spec, backend)
 }
 

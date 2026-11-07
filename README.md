@@ -110,7 +110,7 @@ tools keep running in the server profile workspace.
 
 Configure your models first: myco ships none built in. `~/.myco/profiles/default/config.toml`
 holds a small catalog — `[gateways.*]` (protocol + base URL + auth, e.g.
-Anthropic, xAI, OpenRouter, or a local server) and `[models.*]` (the keys you
+Anthropic, Google Gemini, xAI, OpenRouter, or a local server) and `[models.*]` (the keys you
 pass to `--model`). The `auth` value is the token itself or a source such as
 `{ source = "env", var_name = "XAI_API_KEY" }` (`.env` in the cwd is loaded
 at startup) or `{ source = "file", path = "~/.secrets/x.token" }`. The exact variables are documented in the

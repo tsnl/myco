@@ -4,6 +4,7 @@ use futures::StreamExt;
 use myco::generative_model::{Content, GenerateOutput, GenerativeModel, Message, TurnEndReason};
 
 mod anthropic;
+mod google_genai;
 mod openai_completions;
 mod openai_responses;
 mod request_limits;

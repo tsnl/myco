@@ -1,7 +1,7 @@
 # myco-model
 
 Backend-independent message types and streaming model drivers for Anthropic
-Messages, OpenAI Responses, and OpenAI Chat Completions.
+Messages, OpenAI Responses, OpenAI Chat Completions, and Google GenAI (Gemini).
 
 Supply resolved model settings, credentials, and history. Each `generate` call
 performs one attempt; callers own retry policy, tool execution, and persistence.

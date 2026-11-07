@@ -1,7 +1,8 @@
 # Inference API
 
 `myco-model` provides backend-independent messages and streaming drivers for
-Anthropic Messages, OpenAI Responses, and OpenAI Chat Completions. It has no
+Anthropic Messages, OpenAI Responses, OpenAI Chat Completions, and Google
+GenAI (the Gemini Developer API). It has no
 dependency on Myco's server, profile configuration, tool runtime, or session store.
 
 Start with [`GenerativeModel`](../api/myco_model/trait.GenerativeModel.html),

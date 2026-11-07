@@ -35,6 +35,12 @@ fn backend(settings: &BackendConfig) -> Value {
             value.max_request_bytes,
             value.effort,
         ),
+        BackendConfig::GoogleGenAI(value) => (
+            &value.base_url,
+            value.max_output_tokens,
+            value.max_request_bytes,
+            value.effort,
+        ),
     };
     // An allowlist keeps new credential-bearing backend fields out of artifacts.
     json!({

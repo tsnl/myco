@@ -36,8 +36,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::generative_model::{
-    AnthropicBackendConfig, BackendConfig, CatalogModel, ModelCatalog, ModelSpec,
-    OpenAIBackendConfig, Protocol, RetryPolicy, ThinkingMode,
+    AnthropicBackendConfig, BackendConfig, CatalogModel, GoogleGenAIBackendConfig, ModelCatalog,
+    ModelSpec, OpenAIBackendConfig, Protocol, RetryPolicy, ThinkingMode,
 };
 use crate::harness::{HarnessConfig, load_ssh_host_aliases};
 
@@ -335,7 +335,8 @@ fn resolve_catalog(
             return Err(format!(
                 "model `{key}`: thinking `{thinking}` is not valid for protocol `{protocol}` \
                  (anthropic-messages: adaptive|budget|none; \
-                 openai-responses / openai-completions: effort|none)"
+                 openai-responses / openai-completions: effort|none; \
+                 google-genai: adaptive|budget|effort|none)"
             ));
         }
 
@@ -426,6 +427,14 @@ fn resolve_catalog(
                     _ => BackendConfig::OpenAIResponses(openai),
                 }
             }
+            Protocol::GoogleGenAI => BackendConfig::GoogleGenAI(GoogleGenAIBackendConfig {
+                base_url,
+                auth_token: token,
+                max_output_tokens: Some(max_output),
+                max_request_bytes,
+                retry,
+                ..Default::default()
+            }),
         };
 
         entries.insert(
@@ -630,6 +639,7 @@ context_window = 200_000
             "anthropic-messages",
             "openai-responses",
             "openai-completions",
+            "google-genai",
         ] {
             let cfg = resolve_toml(
                 format!(
@@ -680,6 +690,7 @@ context_window = 1000
                     BackendConfig::OpenAIResponses(b) | BackendConfig::OpenAICompletions(b) => {
                         b.max_request_bytes
                     }
+                    BackendConfig::GoogleGenAI(b) => b.max_request_bytes,
                 };
                 assert_eq!(limit, expected, "{protocol}/{key}");
             }
@@ -791,6 +802,54 @@ max_output_tokens = 4096
                 assert_eq!(b.max_output_tokens, Some(4096));
             }
             other => panic!("expected OpenAI Chat Completions backend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn google_genai_protocol_gets_a_gemini_backend_with_a_budget_default() {
+        let toml_text = r#"
+[gateways.google]
+protocol = "google-genai"
+base_url = "https://generativelanguage.googleapis.com"
+auth = { source = "env", var_name = "GEMINI_API_KEY" }
+
+[models.gemini-2-5-pro]
+gateway = "google"
+api_id = "gemini-2.5-pro"
+context_window = 1_048_576
+
+[models.gemini-3-pro]
+gateway = "google"
+api_id = "gemini-3-pro-preview"
+thinking = "effort"
+context_window = 1_048_576
+max_output_tokens = 16_384
+"#;
+        let cfg = resolve_toml(
+            toml_text,
+            ConfigUserSettings {
+                model: Some("gemini-2-5-pro".into()),
+                ..Default::default()
+            },
+            env_of(&[("GEMINI_API_KEY", "AIzaTest")]),
+        )
+        .unwrap();
+        let entry = cfg.models.get("gemini-2-5-pro").unwrap();
+        assert_eq!(entry.spec.protocol, Protocol::GoogleGenAI);
+        assert_eq!(entry.spec.thinking, ThinkingMode::Budget);
+        match &entry.backend {
+            BackendConfig::GoogleGenAI(b) => {
+                assert_eq!(b.base_url, "https://generativelanguage.googleapis.com");
+                assert_eq!(b.auth_token, "AIzaTest");
+                assert_eq!(b.max_output_tokens, Some(DEFAULT_MAX_OUTPUT_TOKENS));
+            }
+            other => panic!("expected Google GenAI backend, got {other:?}"),
+        }
+        let entry = cfg.models.get("gemini-3-pro").unwrap();
+        assert_eq!(entry.spec.thinking, ThinkingMode::Effort);
+        match &entry.backend {
+            BackendConfig::GoogleGenAI(b) => assert_eq!(b.max_output_tokens, Some(16_384)),
+            other => panic!("expected Google GenAI backend, got {other:?}"),
         }
     }
 

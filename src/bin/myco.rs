@@ -440,6 +440,12 @@ fn build_model(
             }
             c.effort = Some(effort);
         }
+        BackendConfig::GoogleGenAI(c) => {
+            if debug_dump_api_requests {
+                c.debug_dump_api_requests = true;
+            }
+            c.effort = Some(effort);
+        }
     }
 
     let (epilogue, prelude) = prompts::agent_prompt_epilogue();

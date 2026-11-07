@@ -137,6 +137,10 @@ fn model_hash(model: &CatalogModel, config: &Config) -> String {
             c.auth_token.clear();
             c.debug_dump_api_requests = false;
         }
+        BackendConfig::GoogleGenAI(c) => {
+            c.auth_token.clear();
+            c.debug_dump_api_requests = false;
+        }
     }
     sha256(
         format!(
@@ -662,6 +666,10 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
             c.debug_dump_api_requests = false;
         }
         BackendConfig::OpenAIResponses(c) | BackendConfig::OpenAICompletions(c) => {
+            c.effort = Some(job.effort);
+            c.debug_dump_api_requests = false;
+        }
+        BackendConfig::GoogleGenAI(c) => {
             c.effort = Some(job.effort);
             c.debug_dump_api_requests = false;
         }

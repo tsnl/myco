@@ -176,6 +176,7 @@ Choose the driver for the protocol you are investigating:
 - [anthropic.rs](crates/myco-model/src/anthropic.rs): Anthropic Messages.
 - [openai_responses.rs](crates/myco-model/src/openai_responses.rs): OpenAI Responses.
 - [openai_completions.rs](crates/myco-model/src/openai_completions.rs): OpenAI Chat Completions.
+- [google_genai.rs](crates/myco-model/src/google_genai.rs): Google GenAI (Gemini).
 
 Each driver translates shared message types to wire JSON and accumulates
 provider events. [driver_core.rs](crates/myco-model/src/driver_core.rs) owns the

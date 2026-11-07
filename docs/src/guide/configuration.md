@@ -23,11 +23,14 @@ sole catalog entry. It reports an error when the choice is ambiguous.
 | `anthropic-messages` | `/v1/messages` | `adaptive`, `budget`, `none` |
 | `openai-responses` | `/responses` | `effort`, `none` |
 | `openai-completions` | `/chat/completions` | `effort`, `none` |
+| `google-genai` | `/v1beta/models/{api_id}:streamGenerateContent` | `budget`, `effort`, `adaptive`, `none` |
 
 These names describe wire formats. Select the format your gateway serves.
-The Anthropic base URL normally excludes `/v1`; the OpenAI dialect base URL
-normally includes it. Set `thinking = "none"` if the served model does not
-accept reasoning settings.
+The Anthropic and Google base URLs normally exclude the API version; the
+OpenAI dialect base URL normally includes `/v1`. Set `thinking = "none"` if
+the served model does not accept reasoning settings. For Gemini, `budget`
+(the default) sends a thinking budget derived from `--effort`, which every
+Gemini 2.5 and 3 model accepts; `effort` sends a Gemini 3 thinking level.
 
 ```toml
 model = "coding"

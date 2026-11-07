@@ -258,6 +258,11 @@ auth = { source = "env", var_name = "OPENROUTER_API_KEY" }
 protocol = "openai-completions"        # requests go to {base_url}/chat/completions
 base_url = "http://localhost:11434/v1"
 
+[gateways.google]
+protocol = "google-genai"              # {base_url}/v1beta/models/{api_id}:streamGenerateContent
+base_url = "https://generativelanguage.googleapis.com"
+auth = { source = "env", var_name = "GEMINI_API_KEY" }
+
 [gateways.anthropic.retry]             # optional; per gateway
 max_attempts = 5                       # total tries, including the first
 initial_backoff_ms = 500
@@ -279,6 +284,11 @@ gateway = "openrouter"
 api_id = "moonshotai/kimi-k3"          # wire id; defaults to the key
 context_window = 1_000_000
 
+[models.gemini-2-5-pro]
+gateway = "google"
+api_id = "gemini-2.5-pro"
+context_window = 1_048_576             # thinking defaults to a budget from --effort
+
 [models.local-qwen]                    # inline, no gateway ref; no auth
 protocol = "openai-completions"
 base_url = "http://localhost:11434/v1"
@@ -295,13 +305,24 @@ DeepSeek, Groq and friends speak. Chat Completions has no reasoning-summary
 channel, so thinking there comes from the provider's `reasoning_content` /
 `reasoning` deltas (nothing shown when a server sends neither), the output cap
 goes out as `max_completion_tokens`, and a tool result's images follow in a
-user message because a `tool` message may only carry text.
+user message because a `tool` message may only carry text. `google-genai` is
+the Gemini Developer API itself (`generativelanguage.googleapis.com`; a key
+`AIza…` goes out as `x-goog-api-key`, any other token as a bearer token).
+Gemini thought text is shown and kept in the session like other thinking; the
+thought signature on a function call is echoed back on the next turn, and a
+call that came from another provider carries Gemini's documented
+validation-skip value so a session can switch models. A tool result's images
+follow its `functionResponse` as sibling parts of the same user turn.
 
 Per-model fields: `api_id` (wire id, defaults to the key), required
 `context_window` (drives `USER n/m` + auto-compact), `thinking`
 (`anthropic-messages`: `adaptive` (default) | `budget` | `none`;
 `openai-responses` / `openai-completions`: `effort` (default) | `none` — use
-`none` for models that reject a reasoning effort), `max_output_tokens`
+`none` for models that reject a reasoning effort; `google-genai`: `budget`
+(default; `thinkingBudget` mapped from `--effort`, accepted by every Gemini 2.5
+and 3 model) | `effort` (Gemini 3 `thinkingLevel`) | `adaptive` (dynamic
+budget) | `none` (no thinking request; models that always think keep their
+default and show no thought text)), `max_output_tokens`
 (default 8192), `max_image_base64_bytes` (largest image the model accepts, as
 the name says measured on the uploaded base64 payload — 4/3 of the file on
 disk; default 5 MiB, matching Anthropic's per-image cap). The image cap is enforced locally by
