@@ -6,7 +6,7 @@ use myco_model::{
     answer_content,
 };
 
-use crate::CONTINUE_PROMPT;
+use crate::{CONTINUE_PROMPT, LOST_THINKING_PROMPT, lost_thinking};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OperationId(u64);
@@ -445,11 +445,13 @@ impl AgentState {
         let answer = answer_content(&output.content);
         let reason = output.turn_end_reason;
         let calls = output.tool_uses;
-        self.push(Message::AssistantMessage {
+        let assistant = Message::AssistantMessage {
             content: output.content,
             tool_uses: calls.clone(),
             turn_end_reason: Some(reason.clone()),
-        });
+        };
+        let thinking_only = lost_thinking(&assistant);
+        self.push(assistant);
         self.phase = Phase::Ready;
         let resume = if reason == TurnEndReason::MaxTokens {
             self.truncations = self.truncations.saturating_add(1);
@@ -468,8 +470,13 @@ impl AgentState {
                 self.push(Message::UserMessage {
                     content: vec![Content::System {
                         kind: "continuation".into(),
-                        text: CONTINUE_PROMPT.into(),
-                        data: serde_json::json!({"reason":"max_tokens"}),
+                        text: if thinking_only {
+                            LOST_THINKING_PROMPT
+                        } else {
+                            CONTINUE_PROMPT
+                        }
+                        .into(),
+                        data: serde_json::json!({"reason":"max_tokens","thinking_only":thinking_only}),
                     }],
                 });
             }
@@ -663,6 +670,44 @@ mod tests {
                 cached_input_tokens: 20,
             }),
         }
+    }
+
+    fn continuation_text(machine: &AgentState) -> &str {
+        match machine.history().last() {
+            Some(Message::UserMessage { content }) => match content.as_slice() {
+                [Content::System { text, .. }] => text,
+                other => panic!("expected one continuation part, got {other:?}"),
+            },
+            other => panic!("expected a continuation turn, got {other:?}"),
+        }
+    }
+
+    /// A thinking-only truncation reaches the provider as nothing, so its
+    /// resume prompt must say the thinking was lost instead of "continue".
+    #[test]
+    fn thinking_only_truncation_resumes_with_the_lost_thinking_prompt() {
+        let mut machine = state();
+        let first = generation(machine.start().unwrap());
+        let mut thinking_only = response(TurnEndReason::MaxTokens, 0);
+        thinking_only.content = vec![Content::Thinking {
+            text: "planning".into(),
+            signature: Some("sig".into()),
+            redacted: false,
+        }];
+        let next = generation(machine.generated(first, thinking_only).unwrap());
+        assert_eq!(continuation_text(&machine), LOST_THINKING_PROMPT);
+
+        let mut partial = response(TurnEndReason::MaxTokens, 0);
+        partial.content.insert(
+            0,
+            Content::Thinking {
+                text: "planning".into(),
+                signature: None,
+                redacted: false,
+            },
+        );
+        generation(machine.generated(next, partial).unwrap());
+        assert_eq!(continuation_text(&machine), CONTINUE_PROMPT);
     }
 
     #[test]

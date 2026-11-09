@@ -831,9 +831,24 @@ pub enum ContentStart {
 
 #[derive(Debug, Clone)]
 pub enum ContentDelta {
-    Text { index: usize, delta: String },
-    Image { index: usize, delta: String },
-    Thinking { index: usize, delta: String },
+    Text {
+        index: usize,
+        delta: String,
+    },
+    Image {
+        index: usize,
+        delta: String,
+    },
+    Thinking {
+        index: usize,
+        delta: String,
+    },
+    /// Appends to a thinking block's opaque provider signature (Anthropic
+    /// `signature_delta`); carries no visible text.
+    Signature {
+        index: usize,
+        delta: String,
+    },
 }
 
 #[derive(Debug, Clone)]

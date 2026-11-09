@@ -99,6 +99,52 @@ fn auto_continue_is_opt_in_and_agent_disable_is_durable() {
 }
 
 #[test]
+fn auto_continue_after_thinking_only_truncation_names_the_lost_thinking() {
+    let _home = temp_home("auto-continue-lost-thinking");
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let mut thinking_only = response(TurnEndReason::MaxTokens, false);
+        thinking_only.content = vec![Content::Thinking {
+            text: "planning".into(),
+            signature: None,
+            redacted: false,
+        }];
+        let (mut runner, model) = runner(vec![
+            thinking_only,
+            response(TurnEndReason::ToolUse, true),
+            response(TurnEndReason::EndTurn, false),
+        ])
+        .await;
+        runner.agent_mut().set_max_truncated_resumes(0);
+        runner.runtime().session().set_auto_continue(true).unwrap();
+        submit(&mut runner, CancelToken::new())
+            .await
+            .result
+            .unwrap();
+        assert_eq!(model.remaining(), 0);
+        let notices: Vec<_> = runner
+            .agent_mut()
+            .history()
+            .iter()
+            .filter_map(|message| match message {
+                Message::UserMessage { content } => content.iter().find_map(|part| match part {
+                    Content::System { kind, text, data } if kind == "continuation" => {
+                        Some((text.clone(), data.clone()))
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect();
+        let (text, data) = notices
+            .iter()
+            .find(|(_, data)| data["reason"] == "auto_continue")
+            .expect("auto-continue notice");
+        assert!(text.contains(crate::agent::LOST_THINKING_PROMPT));
+        assert_eq!(data["thinking_only"], true);
+    });
+}
+
+#[test]
 fn auto_continue_handles_output_caps_and_respects_cancellation() {
     let _home = temp_home("auto-continue-stops");
     tokio::runtime::Runtime::new().unwrap().block_on(async {

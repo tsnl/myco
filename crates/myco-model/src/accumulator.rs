@@ -182,7 +182,8 @@ fn apply_content_delta(
     let index = match delta {
         ContentDelta::Text { index, .. }
         | ContentDelta::Image { index, .. }
-        | ContentDelta::Thinking { index, .. } => *index,
+        | ContentDelta::Thinking { index, .. }
+        | ContentDelta::Signature { index, .. } => *index,
     };
     match (content.get_mut(index).and_then(Option::as_mut), delta) {
         (Some(Content::Text { text }), ContentDelta::Text { delta, .. }) => text.push_str(delta),
@@ -192,6 +193,18 @@ fn apply_content_delta(
         (Some(Content::Thinking { text, redacted, .. }), ContentDelta::Thinking { delta, .. }) => {
             if !*redacted {
                 text.push_str(delta);
+            }
+        }
+        (
+            Some(Content::Thinking {
+                signature,
+                redacted,
+                ..
+            }),
+            ContentDelta::Signature { delta, .. },
+        ) => {
+            if !*redacted {
+                signature.get_or_insert_with(String::new).push_str(delta);
             }
         }
         _ => {
