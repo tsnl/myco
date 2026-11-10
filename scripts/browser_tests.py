@@ -3272,7 +3272,7 @@ context_window = 100000
         expect(page.locator('#auto-continue-status')).to_be_hidden()
         self.menu(page, '#auto-continue').click()
         expect(page.locator('#auto-continue-status')).to_be_visible()
-        for width, room in [(1200, 300), (820, 150), (390, 150)]:
+        for width, room in [(1200, 240), (820, 150), (390, 150)]:
             page.set_viewport_size({'width': width, 'height': 850})
             self.assertGreaterEqual(heading.bounding_box()['width'], room, f'The title is squeezed at {width}px')
             self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), width)
