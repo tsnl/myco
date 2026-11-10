@@ -241,8 +241,11 @@ function blockNode(block) {
   if (thinking) {
     const summary = element('summary', '', 'Thinking');
     article.append(summary);
+    // The trace is ordinary selectable text. A toggle on the text itself would
+    // also swallow the first click of a double-click or Shift-click selection,
+    // so only the rail beside it (the article's own box) toggles.
     article.onclick = event => {
-      if (event.target.closest('summary')) return;
+      if (event.target !== article || !getSelection().isCollapsed) return;
       article.open = !article.open;
       summary.focus({ preventScroll: true });
     };
