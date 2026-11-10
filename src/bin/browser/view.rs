@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use myco::generative_model::{Content, Message, ToolResourceRef, ToolResult, ToolUse};
-use myco::session::Thread;
+use myco::session::{Session, Thread};
 use serde::Serialize;
 
 #[path = "processes.rs"]
@@ -259,11 +259,15 @@ pub(super) fn assistant_heading(blocks: &[Block]) -> Option<Block> {
 }
 
 pub(super) fn history(thread: &Thread) -> Vec<Block> {
+    history_until(thread, thread.messages.len())
+}
+
+fn history_until(thread: &Thread, end: usize) -> Vec<Block> {
     let mut blocks = Vec::new();
     let mut time = None;
     let mut pending = Vec::new();
     let mut boundary = compaction_boundary(thread);
-    for (index, message) in thread.messages.iter().enumerate() {
+    for (index, message) in thread.messages[..end].iter().enumerate() {
         if boundary == Some(index) {
             time = Some(timestamp(&thread.created_at));
             blocks.push(Block::Boundary {
@@ -341,7 +345,7 @@ pub(super) fn history(thread: &Thread) -> Vec<Block> {
             _ => {}
         }
     }
-    if boundary.is_some() {
+    if boundary == Some(end) {
         blocks.push(Block::Boundary {
             time: timestamp(&thread.created_at),
         });
@@ -363,18 +367,101 @@ pub(super) fn history(thread: &Thread) -> Vec<Block> {
     blocks
 }
 
-// The successor begins with a summary and copied recent context. Its boundary
-// belongs after that context, not before the user's retained messages.
-fn compaction_boundary(thread: &Thread) -> Option<usize> {
+fn compaction(thread: &Thread) -> Option<&serde_json::Value> {
     let Message::UserMessage { content } = thread.messages.first()? else {
         return None;
     };
-    let data = content.iter().find_map(|part| match part {
+    content.iter().find_map(|part| match part {
         Content::System { kind, data, .. } if kind == "compaction" => Some(data),
         _ => None,
-    })?;
-    data["tail_messages"]
+    })
+}
+
+// The successor begins with a summary and copied recent context. Its boundary
+// belongs after that context, not before the user's retained messages.
+fn compaction_boundary(thread: &Thread) -> Option<usize> {
+    compaction(thread)?["tail_messages"]
         .as_u64()
         .and_then(|count| usize::try_from(count).ok()?.checked_add(1))
         .filter(|&index| index <= thread.messages.len())
+}
+
+//
+// Threads replaced by a successor
+//
+
+/// A replaced thread's history that its successor does not already show.
+#[derive(Serialize)]
+pub(super) struct Earlier {
+    /// When the successor took over.
+    replaced_at: String,
+    blocks: Vec<Block>,
+}
+
+/// Replaced threads with history of their own, oldest first.
+pub(super) fn earlier_threads(session: &Session) -> Vec<String> {
+    session
+        .threads()
+        .windows(2)
+        .filter(|pair| !restarts(&pair[1], &pair[0]))
+        .map(|pair| pair[0].id.clone())
+        .collect()
+}
+
+pub(super) fn earlier(session: &Session, id: &str) -> Option<Earlier> {
+    let threads = session.threads();
+    let index = threads.iter().position(|thread| thread.id == id)?;
+    let (thread, successor) = (&threads[index], threads.get(index + 1)?);
+    Some(Earlier {
+        replaced_at: timestamp(&successor.created_at),
+        blocks: history_until(thread, carried_from(thread, successor)),
+    })
+}
+
+// Removing a rejected submission restarts from a copy of everything before
+// it, under a new thread stamp. That successor repeats this thread in order.
+fn restarts(successor: &Thread, thread: &Thread) -> bool {
+    fn unstamped(thread: &Thread) -> Option<Vec<&Content>> {
+        let Message::UserMessage { content } = thread.messages.first()? else {
+            return None;
+        };
+        Some(
+            content
+                .iter()
+                .filter(|part| !matches!(part, Content::System { kind, .. } if kind == "session"))
+                .collect(),
+        )
+    }
+    let first = unstamped(successor);
+    first.is_some() && first == unstamped(thread)
+}
+
+// Compaction copies whole recent turns, so the successor's retained context
+// begins at one of this thread's user turns. When the copy cannot be located,
+// keep the whole thread: a repeated turn is better than a missing one.
+fn carried_from(thread: &Thread, successor: &Thread) -> usize {
+    if restarts(successor, thread) {
+        return 0;
+    }
+    let all = thread.messages.len();
+    let summarizes =
+        compaction(successor).is_some_and(|data| data["predecessor_id"] == thread.id.as_str());
+    let Some(end) = compaction_boundary(successor).filter(|_| summarizes) else {
+        return all;
+    };
+    let carried = successor.messages[1..end]
+        .iter()
+        .filter(|message| message.is_user_turn())
+        .count();
+    let Some(before) = carried.checked_sub(1) else {
+        return all;
+    };
+    thread
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, message)| message.is_user_turn())
+        .nth(before)
+        .map_or(all, |(index, _)| index)
 }

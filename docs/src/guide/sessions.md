@@ -29,7 +29,7 @@ Ask the agent to check current state before continuing work that depends on it.
 
 `/compact` creates a successor thread in the **same session**, containing a
 summary and bounded recent context. The predecessor keeps its original messages
-and tool results. Live shells and editor read stamps continue through
+and tool results; scroll to the top of the conversation to read them. Live shells and editor read stamps continue through
 compaction, as do the title, links, and scratchpad.
 
 Automatic compaction is enabled for every model. The per-model `auto_compact_at`

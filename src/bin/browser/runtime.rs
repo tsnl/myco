@@ -74,6 +74,7 @@ struct Snapshot {
     revision: u64,
     session_id: String,
     thread_id: String,
+    earlier_threads: Vec<String>,
     title: String,
     archived: bool,
     auto_continue: bool,
@@ -316,6 +317,7 @@ impl App {
         view::retain_processes(&mut blocks, &snapshot.blocks);
         snapshot.session_id = session.id.clone();
         snapshot.thread_id = session.active_thread().id.clone();
+        snapshot.earlier_threads = view::earlier_threads(&session);
         snapshot.title = session
             .title
             .clone()
@@ -806,6 +808,7 @@ impl Sessions {
                             revision: 0,
                             session_id: session.id.clone(),
                             thread_id: session.active_thread().id.clone(),
+                            earlier_threads: view::earlier_threads(&session),
                             title: session
                                 .title
                                 .clone()
@@ -911,6 +914,17 @@ impl Sessions {
                 .map_err(|e| Error::Internal(format!("browser worker: {e}")))?;
         }
         Ok(())
+    }
+
+    /// The saved document behind a session, for reads outside its live projection.
+    pub(super) async fn session(&self, id: &str) -> Result<ActiveSession> {
+        let app = self.open(id).await?;
+        let id = app.live.lock().unwrap().snapshot.session_id.clone();
+        let running = self.running.lock().await;
+        let session = running
+            .get(&id)
+            .ok_or_else(|| Error::NotFound("Session closed".into()))?;
+        Ok(session.session.clone())
     }
 
     pub(super) async fn set_auto_continue(&self, id: String, enabled: bool) -> Result<()> {
