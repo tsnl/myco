@@ -1772,7 +1772,14 @@ context_window = 100000
         page.wait_for_function("document.querySelector('#composer-frame').getAnimations({subtree: true}).some(a => a.playState === 'running' && a.effect.getComputedTiming().iterations === Infinity)")
         before = ring.evaluate("n => getComputedStyle(n, '::before').transform")
         page.wait_for_function("before => getComputedStyle(document.querySelector('.composer-light-ring'), '::before').transform !== before", arg=before)
-        self.assertIn('drop-shadow', light.evaluate('n => getComputedStyle(n).filter'))
+        # The glow is the same turning light under a mask drawn once, not a filter run per frame.
+        glow = page.locator('.composer-light-glow')
+        self.assertEqual(frame.evaluate("n => [...n.querySelectorAll('*')].map(node => getComputedStyle(node).filter).filter(value => value !== 'none')"), [])
+        self.assertIn('data:image/png', glow.evaluate('n => getComputedStyle(n).maskImage'))
+        self.assertEqual(glow.evaluate("n => getComputedStyle(n, '::before').animationName"), 'composer-orbit')
+        turns = page.evaluate("""() => ['.composer-light-glow', '.composer-light-ring'].map(selector =>
+            getComputedStyle(document.querySelector(selector), '::before').transform.match(/[-\\d.e]+/g).slice(0, 4).join())""")
+        self.assertEqual(turns[0], turns[1], 'The glow turns with the highlight')
         page.emulate_media(reduced_motion='reduce')
         self.assertFalse(frame.evaluate('n => n.getAnimations({subtree: true}).some(a => a.effect.getComputedTiming().iterations === Infinity)'))
         expect(light).to_have_css('opacity', '1')
@@ -2421,6 +2428,21 @@ context_window = 100000
                     expect(dialog).to_be_hidden()
                     expect(toggle).to_be_focused()
 
+    def cloud_pixels(self, page, canvas='#sky-clouds'):
+        """What a cloud canvas shows: total alpha, and hashes of its shapes and colours."""
+        return page.locator(canvas).evaluate("""canvas => {
+            const pixels = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+            let alpha = 0, shape = 0, color = 0;
+            pixels.forEach((value, index) => {
+                if (index % 4 === 3) { alpha += value; shape = (Math.imul(shape, 31) + value) | 0; }
+                else color = (Math.imul(color, 31) + value) | 0;
+            });
+            return {alpha, shape, color};
+        }""")
+
+    def cloud_drift(self, page):
+        return [float(value) for value in page.locator('#sky-clouds').get_attribute('data-drift').split()]
+
     def open_settings(self, page):
         if page.locator('#menu-toggle').count():
             page.click('#menu-toggle')
@@ -2515,9 +2537,10 @@ context_window = 100000
         expect(page.locator("#sky-low")).to_have_text("0%")
         self.assertIn("latitude=51.51&longitude=-0.13", calls[-1])
         for layer, cover in [("high", "90"), ("mid", "65"), ("low", "0")]:
-            expect(page.locator(f".cloud-{layer}")).to_have_attribute("data-cover", cover)
-        self.assertTrue(page.locator(".cloud-low .cloud-sprite").evaluate_all("nodes => nodes.every(n => getComputedStyle(n).opacity === '0')"))
-        self.assertTrue(page.locator(".cloud-high .cloud-sprite").evaluate_all("nodes => nodes.some(n => getComputedStyle(n).opacity === '1')"))
+            expect(page.locator("#sky-clouds")).to_have_attribute(f"data-{layer}", cover)
+        expect(page.locator("#sky")).to_have_attribute("data-clouds", "ready", timeout=30000)
+        self.assertGreater(self.cloud_pixels(page)["alpha"], 0)
+        self.assertGreater(self.cloud_pixels(page, "#sky-clouds-soft")["alpha"], 0)
         page.press("#sky-city", "Escape")
         self.session(page)
         expect(page.locator("#sky")).to_have_attribute("data-weather", "live")
@@ -2559,13 +2582,33 @@ context_window = 100000
     def test_sky_motion_preferences_mobile_settings_and_location_denial(self):
         page = self.page
         page.set_viewport_size({"width": 390, "height": 844})
+        page.clock.install()
+        page.reload()
+        expect(page.locator("#sky")).to_have_attribute("data-clouds", "ready", timeout=30000)
+        # Clouds drift with the clock, a pixel or so at a time.
+        page.clock.pause_at(page.evaluate("Date.now()") + 20000)
+        still = self.cloud_drift(page)
+        page.clock.fast_forward(1000)
+        moved = self.cloud_drift(page)
+        self.assertNotEqual(moved, still)
+        self.assertTrue(all(abs(after - before) * 1440 < 1 for before, after in zip(still, moved)))
+        # Reduced motion holds them where they are.
         page.emulate_media(reduced_motion="reduce")
-        self.assertEqual(page.locator(".cloud-track").first.evaluate("n => getComputedStyle(n).animationName"), "none")
+        page.clock.fast_forward(600000)
+        self.assertEqual(self.cloud_drift(page), moved)
         page.emulate_media(reduced_motion="no-preference")
-        self.assertGreater(float(page.locator(".cloud-track").first.evaluate("n => parseFloat(getComputedStyle(n).animationDuration)")), 1000)
+        # A hidden tab paints nothing, then catches up.
+        page.clock.fast_forward(1000)
+        expect(page.locator("#sky")).to_have_attribute("data-clouds", "ready")
+        # A window this narrow shows only the soft clouds behind the conversation.
+        shown, painted = self.cloud_drift(page), self.cloud_pixels(page, '#sky-clouds-soft')
+        self.assertGreater(painted['alpha'], 0)
         page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: true}); document.dispatchEvent(new Event('visibilitychange'))")
-        self.assertEqual(page.locator(".cloud-track").first.evaluate("n => getComputedStyle(n).animationPlayState"), "paused")
+        page.clock.fast_forward(600000)
+        self.assertEqual(self.cloud_drift(page), shown)
+        self.assertEqual(self.cloud_pixels(page, '#sky-clouds-soft'), painted)
         page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: false}); document.dispatchEvent(new Event('visibilitychange'))")
+        self.assertNotEqual(self.cloud_drift(page), shown)
         self.menu(page, '#settings-toggle').click()
         page.evaluate("() => { navigator.geolocation.getCurrentPosition = (_ok, fail) => fail({code: 1}); }")
         page.click("#sky-locate")
@@ -2583,7 +2626,7 @@ context_window = 100000
         anonymous = self.playwright.request.new_context()
         try:
             for path in ["/clouds.js", "/cloud-renderer.js", "/aircraft.js", "/rain.js",
-                         "/sky-weather.js", "/sky-noise.js", "/sky-light.js", "/sky-atmosphere.js", "/cloud-field.js", "/cloud-textures.js", "/settings.js"]:
+                         "/sky-weather.js", "/sky-noise.js", "/sky-light.js", "/sky-atmosphere.js", "/cloud-field.js", "/settings.js"]:
                 self.assertEqual(anonymous.get(self.origin + path).status, 200)
             for path in ["/api/sky/weather?latitude=91&longitude=0", "/api/sky/weather?latitude=nan&longitude=0", "/api/sky/locations?query=a"]:
                 self.assertEqual(anonymous.get(self.origin + path).status, 400)
@@ -2653,6 +2696,49 @@ context_window = 100000
         self.submit(page, "Alpha markdown")
         expect(page.locator(".assistant .markdown table")).to_be_visible()
 
+    def test_rain_falls_beside_the_conversation_and_a_narrow_window_draws_only_the_sky_behind_it(self):
+        page = self.page
+        page.clock.install()
+        self.context.route("**/api/sky/weather?*", lambda route: route.fulfill(json={
+            "utc_offset_seconds": 0, "current": {"time": int(time.time()), "interval": 900,
+            "cloud_cover_low": 100, "cloud_cover_mid": 100, "cloud_cover_high": 60,
+            "wind_speed_10m": 8, "wind_direction_10m": 250, "rain": 4, "showers": 0, "weather_code": 65}}))
+        page.evaluate("localStorage.setItem('myco.sky.location.v1', JSON.stringify({name: 'Test city', latitude: 50, longitude: 0}))")
+        page.reload()
+        rain, clouds = page.locator("#sky-rain"), page.locator("#sky-clouds")
+        expect(rain).to_be_visible()
+        expect(page.locator("#sky")).to_have_attribute("data-clouds", "ready", timeout=30000)
+        # With the clock stopped and every fade finished, only rain still moves.
+        page.clock.pause_at(page.evaluate("Date.now()") + 20000)
+        page.evaluate("document.getAnimations().forEach(animation => animation instanceof CSSTransition && animation.finish())")
+        def moving(x):
+            clip = {"x": x, "y": 300, "width": 120, "height": 400}
+            before = page.screenshot(clip=clip)
+            page.wait_for_timeout(250)
+            return page.screenshot(clip=clip) != before
+        self.assertTrue(moving(10))
+        self.assertFalse(moving(540))
+        self.assertGreater(self.cloud_pixels(page, "#sky-clouds-soft")["alpha"], 0)
+        # A window no wider than the conversation has no open sky to draw.
+        page.set_viewport_size({"width": 800, "height": 850})
+        expect(rain).to_be_hidden()
+        expect(clouds).to_be_hidden()
+        self.assertFalse(moving(10))
+        self.assertGreater(self.cloud_pixels(page, "#sky-clouds-soft")["alpha"], 0)
+        # The open sky returns already painted: a stopped clock allows no later repaint.
+        page.set_viewport_size({"width": 1200, "height": 850})
+        expect(rain).to_be_visible()
+        self.assertGreater(self.cloud_pixels(page)["alpha"], 0)
+        self.assertTrue(moving(10))
+        # An unbounded conversation covers a window of any width.
+        self.open_settings(page)
+        page.select_option("#well-width", "unbounded")
+        expect(clouds).to_be_hidden()
+        page.select_option("#well-width", "100")
+        expect(clouds).to_be_visible()
+        self.assertGreater(self.cloud_pixels(page)["alpha"], 0)
+        page.screenshot(path=str(self.artifacts / "sky-rain-beside-well.png"))
+
     def test_sky_wind_changes_preserve_cloud_positions(self):
         page = self.page
         page.clock.install()
@@ -2663,17 +2749,28 @@ context_window = 100000
         page.evaluate("localStorage.setItem('myco.sky.location.v1', JSON.stringify({name: 'Test city', latitude: 50, longitude: 0}))")
         page.reload()
         expect(page.locator("#sky")).to_have_attribute("data-weather", "live")
-        tracks = page.locator(".cloud-track")
-        tracks.evaluate_all("nodes => nodes.forEach(n => { n.getAnimations()[0].currentTime = 1200000; })")
-        before = tracks.evaluate_all("nodes => nodes.map(n => n.getBoundingClientRect().x)")
+        expect(page.locator("#sky")).to_have_attribute("data-clouds", "ready", timeout=30000)
+        # Positions are fractions of a 1440px track that wraps around.
+        apart = lambda a, b: min((a - b) % 1, (b - a) % 1) * 1440
+        page.clock.fast_forward(1000)
+        first = self.cloud_drift(page)
+        page.clock.fast_forward(60000)
+        second = self.cloud_drift(page)
+        speeds = [((after - before + 0.5) % 1 - 0.5) / 60 for before, after in zip(first, second)]
+        self.assertTrue(all(speed < 0 for speed in speeds), "Wind from the west carries clouds east")
         report["current"]["wind_direction_10m"] = 90
         report["current"]["wind_speed_10m"] = 15
         report["current"]["cloud_cover_low"] = 85
-        page.clock.fast_forward(15 * 60 * 1000)
-        expect(page.locator(".cloud-low")).to_have_attribute("data-cover", "85")
-        after = tracks.evaluate_all("nodes => nodes.map(n => n.getBoundingClientRect().x)")
-        for start, end in zip(before, after):
-            self.assertLess(abs(end - start), 2, "Weather updates must not jump drifting clouds")
+        # The old wind holds until the next report arrives, fourteen minutes on.
+        page.clock.fast_forward(14 * 60 * 1000)
+        expect(page.locator("#sky-clouds")).to_have_attribute("data-low", "85")
+        turned = self.cloud_drift(page)
+        for start, speed, end in zip(second, speeds, turned):
+            self.assertLess(apart(end, start + speed * 14 * 60), 2, "Weather updates must not jump drifting clouds")
+        page.clock.fast_forward(60000)
+        for before, after, old in zip(turned, self.cloud_drift(page), speeds):
+            self.assertGreater((after - before + 0.5) % 1 - 0.5, 0, "Wind from the east carries clouds west")
+            self.assertGreater(abs((after - before + 0.5) % 1 - 0.5) / 60, abs(old), "Stronger wind drifts faster")
 
     def test_sky_lighting_follows_city_time_without_changing_cloud_shapes(self):
         page = self.session(self.page)
@@ -2684,8 +2781,10 @@ context_window = 100000
             "wind_speed_10m": 5, "wind_direction_10m": 260, "rain": 0, "showers": 0, "weather_code": 2}}
         self.context.route("**/api/sky/weather?*", lambda route: route.fulfill(json=report))
         page.evaluate("localStorage.setItem('myco.sky.location.v1', JSON.stringify({name: 'Test city', latitude: 50, longitude: 0}))")
+        # Still clouds: only the light may change what the canvas shows.
+        page.emulate_media(reduced_motion="reduce")
         page.reload()
-        sky, glow = page.locator("#sky"), page.locator(".sky-glow")
+        sky = page.locator("#sky")
         expect(sky).to_have_attribute("data-weather", "live")
         expect(sky).to_have_attribute("data-clouds", "ready")
         glass = lambda: page.locator('.toolbar').evaluate("n => getComputedStyle(n, '::before').backgroundColor.match(/[\\d.]+/g).slice(0, 3).map(Number)")
@@ -2694,29 +2793,20 @@ context_window = 100000
         emission = lambda: page.locator('#composer-frame').evaluate("n => getComputedStyle(n).getPropertyValue('--composer-emission').match(/[\\d.]+/g).map(Number)")
         day_light = emission()
         self.assertGreater(day_light[2], day_light[0])
-        morning = float(glow.evaluate("n => n.style.getPropertyValue('--light-x').replace('%', '')"))
-        cloud = page.locator(".cloud-low img").first
-        # Compare rendered alpha and RGB independently: relighting must preserve
+        light_x = lambda: float(sky.evaluate("n => n.style.getPropertyValue('--light-x').replace('%', '')"))
+        morning = light_x()
+        # Compare painted alpha and RGB independently: relighting must preserve
         # every edge and opening while visibly changing the direction of shading.
-        fingerprint = """image => {
-            const canvas = document.createElement('canvas');
-            canvas.width = image.naturalWidth; canvas.height = image.naturalHeight;
-            canvas.getContext('2d').drawImage(image, 0, 0);
-            const pixels = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
-            let alpha = 0, color = 0;
-            pixels.forEach((v, i) => { if (i % 4 === 3) alpha = (Math.imul(alpha, 31) + v) | 0;
-                else color = (Math.imul(color, 31) + v) | 0; });
-            return {alpha, color};
-        }"""
-        before = cloud.evaluate(fingerprint)
+        before = self.cloud_pixels(page)
+        self.assertGreater(before["alpha"], 0)
         page.clock.set_fixed_time("2030-03-20T12:00:00Z")
         page.clock.fast_forward(60000)
         expect(sky).to_have_attribute("data-clouds", "ready")
-        afternoon = float(glow.evaluate("n => n.style.getPropertyValue('--light-x').replace('%', '')"))
-        after = cloud.evaluate(fingerprint)
+        afternoon = light_x()
+        after = self.cloud_pixels(page)
         self.assertLess(morning, 50)
         self.assertGreater(afternoon, 50)
-        self.assertEqual(before["alpha"], after["alpha"])
+        self.assertEqual(before["shape"], after["shape"])
         self.assertNotEqual(before["color"], after["color"])
         for hour in ['03', '15']:  # Dawn and dusk in the selected city's UTC+3 clock.
             page.clock.set_fixed_time(f"2030-03-20T{hour}:00:00Z")
@@ -2732,7 +2822,7 @@ context_window = 100000
         page.clock.fast_forward(60000)
         expect(sky).to_have_attribute("data-phase", "night")
         expect(sky).to_have_attribute("data-clouds", "ready")
-        self.assertEqual(before["alpha"], cloud.evaluate(fingerprint)["alpha"])
+        self.assertEqual(before["shape"], self.cloud_pixels(page)["shape"])
         self.assertGreater(float(page.locator("#sky-stars").evaluate("n => n.style.opacity")), 0)
         night_glass = glass()
         self.assertGreater(night_glass[2], night_glass[0])
@@ -2741,15 +2831,14 @@ context_window = 100000
         self.assertGreater(night_light[2], night_light[0])
         self.assertLess(sum(night_light), sum(day_light))
 
-    def test_cloud_images_share_textures_and_preserve_rendered_pixels(self):
+    def test_cloud_textures_are_painted_once_for_each_lighting(self):
         self.context.add_init_script("""(() => {
             const NativeWorker = Worker;
+            window.cloudTextures = [];
             window.Worker = class extends NativeWorker {
                 constructor(...args) {
                     super(...args);
-                    this.addEventListener('message', ({data}) => {
-                        if (data.id === 'low-0') window.cloudPixels = data;
-                    });
+                    this.addEventListener('message', ({data}) => window.cloudTextures.push(data.id));
                 }
             };
         })();""")
@@ -2758,36 +2847,32 @@ context_window = 100000
         page.clock.set_fixed_time('2030-03-20T12:00:00Z')
         page.reload()
         expect(page.locator('#sky')).to_have_attribute('data-clouds', 'ready')
-        images = page.locator('.cloud-sprite img')
-        expect(images).to_have_count(72)
-        self.assertEqual(images.evaluate_all('nodes => new Set(nodes.map(n => n.src)).size'), 24)
-        self.assertTrue(images.evaluate_all('nodes => nodes.every(n => n.complete && n.naturalWidth === 512)'))
-        self.assertTrue(page.evaluate("""() => {
-            const {width, height, pixels} = window.cloudPixels;
-            const canvas = document.createElement('canvas'); canvas.width = width; canvas.height = height;
-            const context = canvas.getContext('2d', {willReadFrequently: true});
-            context.putImageData(new ImageData(pixels, width, height), 0, 0);
-            const before = context.getImageData(0, 0, width, height).data;
-            context.clearRect(0, 0, width, height);
-            context.drawImage(document.querySelector('.cloud-low img'), 0, 0);
-            return context.getImageData(0, 0, width, height).data.every((v, i) => v === before[i]);
-        }"""), 'Lossless caching must preserve the cloud renderer output')
-        sources = images.evaluate_all('nodes => nodes.map(n => n.src)')
+        self.assertEqual(page.evaluate('[cloudTextures.length, new Set(cloudTextures).size]'), [24, 24])
+        # Every cloud is one of those textures on a canvas; none is an element.
+        self.assertEqual(page.locator('#sky canvas').count(), 2)
+        self.assertEqual(page.locator('#sky img').count(), 0)
+        page.clock.fast_forward(20000)
+        self.assertGreater(self.cloud_pixels(page)['alpha'], 0)
         page.clock.fast_forward(60000)
-        self.assertEqual(images.evaluate_all('nodes => nodes.map(n => n.src)'), sources)
+        self.assertEqual(page.evaluate('cloudTextures.length'), 24, 'Unchanged light must not repaint textures')
+        page.clock.set_fixed_time('2030-03-20T18:00:00Z')
+        page.clock.fast_forward(60000)
+        expect(page.locator('#sky')).to_have_attribute('data-clouds', 'ready')
+        self.assertEqual(page.evaluate('[cloudTextures.length, new Set(cloudTextures).size]'), [48, 24])
 
-    def test_cloud_decode_completion_cannot_supersede_new_lighting_or_worker_failure(self):
+    def test_superseded_cloud_textures_cannot_replace_new_lighting_or_a_failed_worker(self):
         self.context.add_init_script("""(() => {
-            const NativeWorker = Worker, decode = HTMLImageElement.prototype.decode;
+            const NativeWorker = Worker;
+            const handler = Object.getOwnPropertyDescriptor(Worker.prototype, 'onmessage');
+            window.cloudReplies = []; window.holdClouds = false;
             window.Worker = class extends NativeWorker {
                 constructor(...args) { super(...args); window.cloudWorker = this; }
-            };
-            window.cloudDecodes = []; window.holdClouds = false;
-            HTMLImageElement.prototype.decode = function() {
-                return decode.call(this).then(() => {
-                    if (window.holdClouds && this.closest('.cloud-sprite'))
-                        return new Promise(resolve => window.cloudDecodes.push(resolve));
-                });
+                set onmessage(deliver) {
+                    handler.set.call(this, event => {
+                        if (window.holdClouds && event.data.bitmap) window.cloudReplies.push(() => deliver(event));
+                        else deliver(event);
+                    });
+                }
             };
         })();""")
         page, sky = self.page, self.page.locator('#sky')
@@ -2799,21 +2884,24 @@ context_window = 100000
         for index, hour in enumerate(['18', '21']):
             page.clock.set_fixed_time(f'2030-03-20T{hour}:00:00Z')
             page.clock.fast_forward(60000)
-            page.wait_for_function('count => cloudDecodes.length === count', arg=(index + 1) * 72)
-        page.evaluate('cloudDecodes.splice(0, 72).forEach(resolve => resolve())')
-        page.wait_for_timeout(100)
+            page.wait_for_function('count => cloudReplies.length === count', arg=(index + 1) * 24)
+        noon = self.cloud_pixels(page)
+        page.evaluate('cloudReplies.splice(0, 24).forEach(deliver => deliver())')
         expect(sky).to_have_attribute('data-clouds', 'painting')
-        page.evaluate('cloudDecodes.splice(0).forEach(resolve => resolve())')
+        self.assertEqual(self.cloud_pixels(page)['color'], noon['color'], 'Dusk textures arrived after night was requested')
+        page.evaluate('cloudReplies.splice(0).forEach(deliver => deliver())')
         expect(sky).to_have_attribute('data-clouds', 'ready')
+        self.assertNotEqual(self.cloud_pixels(page)['color'], noon['color'])
         page.clock.set_fixed_time('2030-03-21T12:00:00Z')
         page.clock.fast_forward(60000)
-        page.wait_for_function('() => cloudDecodes.length === 72')
+        page.wait_for_function('() => cloudReplies.length === 24')
         page.evaluate("cloudWorker.dispatchEvent(new Event('error', {cancelable: true}))")
         expect(sky).to_have_attribute('data-clouds', 'fallback')
-        page.evaluate('cloudDecodes.splice(0).forEach(resolve => resolve())')
-        page.wait_for_timeout(100)
+        fallback = self.cloud_pixels(page)
+        self.assertGreater(fallback['alpha'], 0)
+        page.evaluate('cloudReplies.splice(0).forEach(deliver => deliver())')
         expect(sky).to_have_attribute('data-clouds', 'fallback')
-        page.wait_for_function("() => [...document.querySelectorAll('.cloud-sprite img')].every(n => n.complete && n.naturalWidth === 512)")
+        self.assertEqual(self.cloud_pixels(page), fallback)
 
     def test_stars_sleep_in_daylight_and_twinkle_again_at_night(self):
         page = self.page
@@ -2826,6 +2914,9 @@ context_window = 100000
         page.evaluate("localStorage.setItem('myco.sky.location.v1', JSON.stringify({name: 'Test city', latitude: 50, longitude: 0}))")
         page.reload()
         expect(page.locator('#sky')).to_have_attribute('data-weather', 'live')
+        expect(page.locator('#sky')).to_have_attribute('data-clouds', 'ready', timeout=30000)
+        page.clock.fast_forward(20000)
+        self.assertEqual(self.cloud_pixels(page)['alpha'], 0, 'A clear sky paints no clouds')
         stars = page.locator('#sky-stars')
         expect(stars).to_be_hidden()
         self.assertEqual(stars.evaluate('n => n.getAnimations({subtree: true}).length'), 0)

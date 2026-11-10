@@ -5,11 +5,17 @@ import { rainfall } from './sky-weather.js';
 // Rain textures and wind
 //
 
+// The whole scene steps together, thirty times a second.
+const FRAMES = 30;
+
 function texture(count, depth) {
   const canvas = document.createElement('canvas');
   canvas.width = 768; canvas.height = 512;
   const context = canvas.getContext('2d');
   const roll = random(481 + depth * 379);
+  // The farthest sheet is slightly out of focus. Blurring its texture once
+  // costs nothing while it falls.
+  if (!depth && 'filter' in context) context.filter = 'blur(.35px)';
   for (let i = 0; i < count; i++) {
     const x = roll() * canvas.width, y = roll() * canvas.height;
     const length = (8 + roll() * 19) * (0.65 + depth * 0.3);
@@ -36,7 +42,7 @@ export function createRain(sky) {
   sky.append(rain);
   return conditions => {
     const rate = rainfall(conditions), strength = Math.min(1, Math.log1p(rate) / Math.log(13));
-    rain.hidden = rate === 0; sky.dataset.rain = rate > 0 ? 'rain' : 'none';
+    rain.hidden = rate === 0;
     if (!rate) return;
     const slant = -Math.sin(conditions.wind_direction_10m * Math.PI / 180) * Math.min(conditions.wind_speed_10m, 16) * 1.5;
     rain.style.setProperty('--rain-slant', `${slant}deg`);
@@ -46,7 +52,10 @@ export function createRain(sky) {
         sheet.style.backgroundImage = texture(count, depth); sheet.dataset.drops = count;
       }
       sheet.style.opacity = String((0.2 + strength * 0.4) * (1 - depth * 0.12));
-      sheet.style.animationDuration = `${(2.4 - depth * 0.55) / (0.85 + strength * 0.35)}s`;
+      // Whole frames per fall keep every sheet stepping on the same instants.
+      const frames = Math.round((2.4 - depth * 0.55) / (0.85 + strength * 0.35) * FRAMES);
+      sheet.style.animationDuration = `${frames / FRAMES}s`;
+      sheet.style.animationTimingFunction = `steps(${frames})`;
     });
   };
 }

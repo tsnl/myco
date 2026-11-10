@@ -5,10 +5,13 @@ import { density, paint } from './cloud-field.js';
 const fields = new Map();
 let pending = [], lighting, generation = 0, paused = false, scheduled = false;
 
-function render(spec) {
+// A bitmap is ready to draw: the page neither encodes nor decodes an image.
+async function render(spec) {
   if (!fields.has(spec.id)) fields.set(spec.id, density(spec));
+  const reply = { id: spec.id, generation };
   const pixels = paint(spec, fields.get(spec.id), lighting);
-  self.postMessage({ id: spec.id, width: spec.width, height: spec.height, generation, pixels }, [pixels.buffer]);
+  const bitmap = await createImageBitmap(new ImageData(pixels, spec.width, spec.height));
+  self.postMessage({ ...reply, bitmap }, [bitmap]);
 }
 
 function schedule() {
@@ -17,7 +20,8 @@ function schedule() {
   setTimeout(() => {
     scheduled = false;
     if (paused) return;
-    render(pending.shift());
+    // An error inside a promise would vanish; rethrow it for the scene's handler.
+    render(pending.shift()).catch(error => setTimeout(() => { throw error; }));
     schedule();
   }, 0);
 }

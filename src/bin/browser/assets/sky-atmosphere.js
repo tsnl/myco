@@ -15,12 +15,14 @@ function star(roll) {
   return node;
 }
 
+// Every layer steps on the same half-second grid, so a night sky asks for two
+// frames a second however many layers twinkle.
 function starLayer(index) {
   const layer = document.createElement('div'), stars = document.createElementNS(namespace, 'svg');
-  const duration = 6 + index * 1.25;
+  const duration = [6, 7.5, 8.5, 10][index];
   layer.className = 'star-layer';
   layer.style.setProperty('--twinkle-duration', `${duration}s`);
-  layer.style.setProperty('--twinkle-steps', duration * 4);
+  layer.style.setProperty('--twinkle-steps', duration * 2);
   layer.style.setProperty('--twinkle-delay', `${-index * 1.5}s`);
   stars.setAttribute('viewBox', '0 0 1600 1000');
   stars.setAttribute('preserveAspectRatio', 'xMidYMid slice');
@@ -43,28 +45,38 @@ function starfield() {
 // Gradient and diffuse glow
 //
 
-function updateGlow(glow, light) {
-  glow.style.setProperty('--light-x', `${light.x}%`);
-  glow.style.setProperty('--light-y', `${light.y}%`);
-  glow.style.setProperty('--light-color', light.color);
-  glow.style.opacity = String(light.strength);
+// The sky is drawn twice, and both views read their light from properties on
+// the sky. The open view holds every detail. The well shows the sky as
+// frosted glass would: its light and soft clouds, without stars, aircraft, or rain.
+function view(id) {
+  const node = document.createElement('div'), atmosphere = document.createElement('div'), glow = document.createElement('div');
+  node.id = id; atmosphere.className = 'sky-atmosphere'; glow.className = 'sky-glow';
+  node.append(atmosphere, glow);
+  return node;
 }
 
 export function createAtmosphere(sky) {
-  const atmosphere = document.createElement('div'), glow = document.createElement('div');
-  const stars = starfield();
-  atmosphere.className = 'sky-atmosphere'; glow.className = 'sky-glow';
-  sky.append(atmosphere, glow, stars);
-  return state => {
-    document.documentElement.style.setProperty('--glass-tint', state.glassTint);
-    document.documentElement.style.setProperty('--sky-light', state.light.color);
-    atmosphere.style.backgroundImage = state.gradient;
-    atmosphere.style.opacity = String(1 - state.night * 0.92);
-    sky.style.setProperty('--overcast', String(state.gloom * 0.55));
-    sky.style.setProperty('--sky-clarity', String(state.clarity));
-    sky.dataset.phase = state.phase;
-    stars.hidden = state.night === 0;
-    stars.style.opacity = String(state.night * state.clarity);
-    updateGlow(glow, state.light);
+  const stars = starfield(), open = view('sky-open'), well = view('sky-well');
+  open.append(stars);
+  sky.append(open, well);
+  // A window no wider than the well shows nothing of the open sky, so none of it is drawn.
+  const sides = new ResizeObserver(() => { open.hidden = well.offsetWidth >= sky.offsetWidth; });
+  sides.observe(sky); sides.observe(well);
+  return {
+    open, well,
+    update(state) {
+      document.documentElement.style.setProperty('--glass-tint', state.glassTint);
+      document.documentElement.style.setProperty('--sky-light', state.light.color);
+      const properties = {
+        '--sky-gradient': state.gradient, '--sky-day': 1 - state.night * 0.92,
+        '--overcast': state.gloom * 0.55, '--sky-clarity': state.clarity,
+        '--light-x': `${state.light.x}%`, '--light-y': `${state.light.y}%`,
+        '--light-color': state.light.color, '--light-strength': state.light.strength,
+      };
+      for (const [name, value] of Object.entries(properties)) sky.style.setProperty(name, String(value));
+      sky.dataset.phase = state.phase;
+      stars.hidden = state.night === 0;
+      stars.style.opacity = String(state.night * state.clarity);
+    },
   };
 }
