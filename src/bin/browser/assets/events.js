@@ -105,7 +105,7 @@ function openStream() {
     for (const client of clients) {
       if (client.profile !== event.profile || !client.visible) continue;
       if (client.list) {
-        if (['refresh', 'snapshot', 'meta'].includes(update.change.kind)) listChanged(client);
+        if (['refresh', 'meta'].includes(update.change.kind)) listChanged(client);
       } else if (client.pending) {
         if (client.requested && update.session_id.startsWith(client.id || client.requested)) client.pending.push(update);
       } else if (client.id === update.session_id) {

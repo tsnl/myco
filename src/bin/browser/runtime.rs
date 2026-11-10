@@ -68,6 +68,15 @@ impl std::fmt::Display for Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
+/// Run blocking work off the async runtime.
+pub(super) async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))
+}
+
 #[derive(Clone, Serialize)]
 struct Snapshot {
     #[serde(skip)]
@@ -165,8 +174,7 @@ impl App {
                 *background_id = None;
                 *status = "backgrounding".into();
             }
-            let change = json!({"kind":"block", "index":index, "block":live.snapshot.blocks[index]});
-            self.publish(&mut live.snapshot, change);
+            self.publish_block(&mut live.snapshot, index);
         }
         Ok(())
     }
@@ -185,6 +193,23 @@ impl App {
             revision: snapshot.revision,
             change,
         }));
+    }
+
+    /// Publish a block that changed in place.
+    fn publish_block(&self, snapshot: &mut Snapshot, index: usize) {
+        let change = json!({"kind":"block", "index":index, "block":snapshot.blocks[index]});
+        self.publish(snapshot, change);
+    }
+
+    /// Add a block to the end of the transcript.
+    fn push_block(&self, snapshot: &mut Snapshot, block: Block) {
+        snapshot.blocks.push(block);
+        self.publish_block(snapshot, snapshot.blocks.len() - 1);
+    }
+
+    fn publish_metadata(&self, snapshot: &mut Snapshot) {
+        let change = json!({"kind":"meta", "meta":snapshot.metadata()});
+        self.publish(snapshot, change);
     }
 
     pub(super) fn snapshot(&self) -> Update {
@@ -232,37 +257,24 @@ impl App {
         let mut live = self.live.lock().unwrap();
         if live.snapshot.status != "Cancelling" && live.snapshot.status != status {
             live.snapshot.status = status.into();
-            let change = json!({"kind":"meta", "meta":live.snapshot.metadata()});
-            self.publish(&mut live.snapshot, change);
+            self.publish_metadata(&mut live.snapshot);
         }
     }
 
     fn append_block(&self, block: Block) {
-        let mut live = self.live.lock().unwrap();
-        let index = live.snapshot.blocks.len();
-        live.snapshot.blocks.push(block.clone());
-        self.publish(
-            &mut live.snapshot,
-            json!({"kind":"block", "index":index, "block":block}),
-        );
+        self.push_block(&mut self.live.lock().unwrap().snapshot, block);
     }
 
     fn retry_notice(&self, text: String) {
         let mut live = self.live.lock().unwrap();
         let block = Block::Notice { text };
-        let index = if let Some(index) = live.retry_notice {
-            live.snapshot.blocks[index] = block.clone();
-            index
+        if let Some(index) = live.retry_notice {
+            live.snapshot.blocks[index] = block;
+            self.publish_block(&mut live.snapshot, index);
         } else {
-            let index = live.snapshot.blocks.len();
-            live.snapshot.blocks.push(block.clone());
-            live.retry_notice = Some(index);
-            index
-        };
-        self.publish(
-            &mut live.snapshot,
-            json!({"kind":"block", "index":index, "block":block}),
-        );
+            live.retry_notice = Some(live.snapshot.blocks.len());
+            self.push_block(&mut live.snapshot, block);
+        }
     }
 
     fn discard_generation(&self) {
@@ -293,10 +305,6 @@ impl App {
         }
         let change = json!({"kind":"snapshot", "snapshot":live.snapshot});
         self.publish(&mut live.snapshot, change);
-    }
-
-    fn sync(&self, boot: &Boot, status: &str) {
-        self.sync_with(boot, status, |_| {});
     }
 
     fn sync_with(&self, boot: &Boot, status: &str, finish: impl FnOnce(&mut service::Receipts)) {
@@ -361,8 +369,7 @@ impl App {
             live.snapshot.archived = archived;
             live.snapshot.auto_continue = auto_continue;
             live.snapshot.usage = usage;
-            let change = json!({"kind":"meta", "meta":live.snapshot.metadata()});
-            self.publish(&mut live.snapshot, change);
+            self.publish_metadata(&mut live.snapshot);
         }
         if listing_changed {
             self.generation.fetch_add(1, Ordering::Relaxed);
@@ -374,13 +381,10 @@ impl App {
         let changed = view::refresh_processes(&mut live.snapshot.blocks, &resources);
         if !changed.is_empty() {
             // Catalog subscribers do not consume transcript blocks.
-            let change = json!({"kind":"meta", "meta":live.snapshot.metadata()});
-            self.publish(&mut live.snapshot, change);
+            self.publish_metadata(&mut live.snapshot);
         }
         for index in changed {
-            let change =
-                json!({"kind":"block", "index":index, "block":live.snapshot.blocks[index]});
-            self.publish(&mut live.snapshot, change);
+            self.publish_block(&mut live.snapshot, index);
         }
     }
 
@@ -418,12 +422,7 @@ impl App {
                 images: vec![],
                 time,
             };
-            let index = snapshot.blocks.len();
-            snapshot.blocks.push(block.clone());
-            self.publish(
-                snapshot,
-                json!({"kind":"block", "index":index, "block":block}),
-            );
+            self.push_block(snapshot, block);
         }
     }
 }
@@ -463,14 +462,8 @@ impl EventSink for App {
             } if context.depth == 0 => {
                 let mut live = self.live.lock().unwrap();
                 if let Some(heading) = view::assistant_heading(&live.snapshot.blocks) {
-                    let index = live.snapshot.blocks.len();
-                    live.snapshot.blocks.push(heading.clone());
-                    self.publish(
-                        &mut live.snapshot,
-                        json!({"kind":"block", "index":index, "block":heading}),
-                    );
+                    self.push_block(&mut live.snapshot, heading);
                 }
-                let index = live.snapshot.blocks.len();
                 let can_background = tool_use.name == "bash"
                     && matches!(
                         tool_use.input.get("action").and_then(Value::as_str),
@@ -489,11 +482,7 @@ impl EventSink for App {
                         live.background.insert(call_id, background);
                     }
                 }
-                live.snapshot.blocks.push(block.clone());
-                self.publish(
-                    &mut live.snapshot,
-                    json!({"kind":"block", "index":index, "block":block}),
-                );
+                self.push_block(&mut live.snapshot, block);
                 self.preempt_for_events(&mut live);
             }
             AgentEvent::ToolFinished {
@@ -508,8 +497,7 @@ impl EventSink for App {
                 if let Some(index) = snapshot.blocks.iter().position(|block| matches!(block, Block::Tool { call_id: id, running: true, .. } if *id == call_id)) {
                     snapshot.blocks[index].finish(&result);
                     snapshot.blocks[index].continue_process();
-                    let change = json!({"kind":"block", "index":index, "block":snapshot.blocks[index]});
-                    self.publish(snapshot, change);
+                    self.publish_block(snapshot, index);
                 }
                 self.preempt_for_events(&mut live);
             }
@@ -682,9 +670,7 @@ impl Sessions {
             return Ok(id);
         }
         let model = self.config.model.clone();
-        let session = tokio::task::spawn_blocking(move || request.session(&model))
-            .await
-            .map_err(|e| Error::Internal(e.to_string()))??;
+        let session = blocking(move || request.session(&model)).await??;
         self.start_locked(&mut sessions, session).await?;
         Ok(id)
     }
@@ -700,9 +686,8 @@ impl Sessions {
             return Ok(session.app.clone());
         }
         let id = id.to_owned();
-        let session = tokio::task::spawn_blocking(move || Session::load_by_id_or_prefix(&id))
-            .await
-            .map_err(|e| Error::Internal(e.to_string()))?
+        let session = blocking(move || Session::load_by_id_or_prefix(&id))
+            .await?
             .map_err(Error::NotFound)?;
         self.start_locked(&mut sessions, session).await
     }
@@ -839,7 +824,7 @@ impl Sessions {
                 None,
             )
             .map_err(Error::Internal)?;
-        app.sync(&boot, "Ready");
+        app.sync_with(&boot, "Ready", |_| {});
         app.fire_timers();
         if let Some(notice) = model_fallback {
             app.notice(notice);
@@ -898,42 +883,43 @@ impl Sessions {
         Ok(())
     }
 
-    /// The saved document behind a session, for reads outside its live projection.
-    pub(super) async fn session(&self, id: &str) -> Result<ActiveSession> {
+    /// An open session's live projection and the saved document behind it.
+    async fn opened(&self, id: &str) -> Result<(Arc<App>, ActiveSession)> {
         let app = self.open(id).await?;
         let id = app.live.lock().unwrap().snapshot.session_id.clone();
         let running = self.running.lock().await;
         let session = running
             .get(&id)
             .ok_or_else(|| Error::NotFound("Session closed".into()))?;
-        Ok(session.session.clone())
+        Ok((app, session.session.clone()))
+    }
+
+    /// The saved document behind a session, for reads outside its live projection.
+    pub(super) async fn session(&self, id: &str) -> Result<ActiveSession> {
+        Ok(self.opened(id).await?.1)
     }
 
     pub(super) async fn set_auto_continue(&self, id: String, enabled: bool) -> Result<()> {
-        let app = self.open(&id).await?;
-        let id = app.live.lock().unwrap().snapshot.session_id.clone();
-        let running = self.running.lock().await;
-        let session = running
-            .get(&id)
-            .ok_or_else(|| Error::NotFound("Session closed".into()))?
-            .session
-            .clone();
+        let (app, session) = self.opened(&id).await?;
         let saved = session.clone();
-        tokio::task::spawn_blocking(move || saved.set_auto_continue(enabled))
-            .await
-            .map_err(|error| Error::Internal(error.to_string()))?
+        blocking(move || saved.set_auto_continue(enabled))
+            .await?
             .map_err(Error::Internal)?;
         app.refresh_metadata(&session);
         Ok(())
     }
 
-    pub(super) async fn rename(&self, id: String, title: String) -> Result<()> {
-        let title = myco::session::normalize_title(&title).map_err(Error::Invalid)?;
+    /// Change what is saved about a session, whether or not it is open.
+    async fn update_saved(
+        &self,
+        id: String,
+        change: impl FnOnce(&ActiveSession) -> std::result::Result<(), String> + Send + 'static,
+    ) -> Result<()> {
         // Hold the registry gate so opening a saved session cannot race its save.
         let running = self.running.lock().await;
         let entry = running.get(&id);
         let active = entry.map(|s| s.session.clone());
-        let session = tokio::task::spawn_blocking(move || {
+        blocking(move || {
             let (_lock, active) = if let Some(active) = active {
                 (None, active)
             } else {
@@ -943,42 +929,25 @@ impl Sessions {
                 let session = Session::load_by_id_or_prefix(&id).map_err(Error::NotFound)?;
                 (Some(lock), ActiveSession::new(session))
             };
-            active.rename(title).map_err(Error::Internal)?;
-            Ok::<_, Error>(active)
+            change(&active).map_err(Error::Internal)
         })
-        .await
-        .map_err(|e| Error::Internal(e.to_string()))??;
-        self.generation.fetch_add(1, Ordering::Relaxed);
-        if let Some(entry) = entry {
-            entry.app.refresh_metadata(&session);
-        }
-        Ok(())
-    }
-
-    pub(super) async fn set_archived(&self, id: String, archived: bool) -> Result<()> {
-        let running = self.running.lock().await;
-        let entry = running.get(&id);
-        let active = entry.map(|s| s.session.clone());
-        tokio::task::spawn_blocking(move || {
-            if let Some(active) = active {
-                active.set_archived(archived).map_err(Error::Internal)
-            } else {
-                let id = myco::session::resolve_session_id(&id).map_err(Error::NotFound)?;
-                let _lock =
-                    SessionWriteLock::acquire(&id).map_err(|e| Error::Conflict(e.to_string()))?;
-                let session = Session::load_by_id_or_prefix(&id).map_err(Error::NotFound)?;
-                ActiveSession::new(session)
-                    .set_archived(archived)
-                    .map_err(Error::Internal)
-            }
-        })
-        .await
-        .map_err(|e| Error::Internal(e.to_string()))??;
+        .await??;
         self.generation.fetch_add(1, Ordering::Relaxed);
         if let Some(entry) = entry {
             entry.app.refresh_metadata(&entry.session);
         }
         Ok(())
+    }
+
+    pub(super) async fn rename(&self, id: String, title: String) -> Result<()> {
+        let title = myco::session::normalize_title(&title).map_err(Error::Invalid)?;
+        self.update_saved(id, move |session| session.rename(title))
+            .await
+    }
+
+    pub(super) async fn set_archived(&self, id: String, archived: bool) -> Result<()> {
+        self.update_saved(id, move |session| session.set_archived(archived))
+            .await
     }
 
     pub(super) async fn list(&self, archived: bool) -> Result<Value> {
@@ -1265,15 +1234,9 @@ impl App {
             let block = Block::Notice {
                 text: error.to_string(),
             };
-            let index = live.snapshot.blocks.len();
-            live.snapshot.blocks.push(block.clone());
-            self.publish(
-                &mut live.snapshot,
-                json!({"kind":"block", "index":index, "block":block}),
-            );
+            self.push_block(&mut live.snapshot, block);
         }
-        let change = json!({"kind":"meta", "meta":live.snapshot.metadata()});
-        self.publish(&mut live.snapshot, change);
+        self.publish_metadata(&mut live.snapshot);
         Ok(())
     }
 
@@ -1313,8 +1276,7 @@ impl App {
             cancel.cancel();
             live.snapshot.status = "Cancelling".into();
         }
-        let change = json!({"kind":"meta", "meta":live.snapshot.metadata()});
-        self.publish(&mut live.snapshot, change);
+        self.publish_metadata(&mut live.snapshot);
     }
 }
 

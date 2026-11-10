@@ -2443,11 +2443,6 @@ context_window = 100000
     def cloud_drift(self, page):
         return [float(value) for value in page.locator('#sky-clouds').get_attribute('data-drift').split()]
 
-    def open_settings(self, page):
-        if page.locator('#menu-toggle').count():
-            page.click('#menu-toggle')
-        page.click('#settings-toggle')
-
     def test_conversation_width_follows_saved_columns_and_shrinks_in_narrow_windows(self):
         page = self.session(self.page)
         page.set_viewport_size({'width': 2600, 'height': 900})
@@ -2463,7 +2458,7 @@ context_window = 100000
         columns = lambda target=page, selector='#transcript': target.evaluate(measure, selector)
         width = lambda selector: page.locator(selector).bounding_box()['width']
         self.assertAlmostEqual(columns(), 100, delta=0.05)
-        self.open_settings(page)
+        self.menu(page, '#settings-toggle').click()
         expect(page.locator('#well-width')).to_have_value('100')
         expect(page.locator('#well-width option')).to_have_text(
             ['80 columns', '100 columns (default)', '120 columns', '150 columns', '200 columns', 'Unbounded', 'Custom…'])
@@ -2496,7 +2491,7 @@ context_window = 100000
         expect(page.locator('#model')).to_be_enabled()
         self.assertEqual(page.evaluate('window.widthAtFirstContent'), '132')
         self.assertAlmostEqual(columns(), 132, delta=0.05)
-        self.open_settings(page)
+        self.menu(page, '#settings-toggle').click()
         expect(page.locator('#well-width')).to_have_value('custom')
         expect(page.locator('#well-width-custom')).to_have_value('132')
         home = self.context.new_page()
@@ -2731,7 +2726,7 @@ context_window = 100000
         self.assertGreater(self.cloud_pixels(page)["alpha"], 0)
         self.assertTrue(moving(10))
         # An unbounded conversation covers a window of any width.
-        self.open_settings(page)
+        self.menu(page, '#settings-toggle').click()
         page.select_option("#well-width", "unbounded")
         expect(clouds).to_be_hidden()
         page.select_option("#well-width", "100")

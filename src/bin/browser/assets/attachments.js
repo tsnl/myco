@@ -5,7 +5,7 @@ const supported = file => /^image\/(png|jpeg|gif|webp)$/.test(file.type) || /\.(
 const encodedSize = file => Math.ceil(file.size / 3) * 4;
 const mib = bytes => `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
 
-export function imageAttachments(limits, changed, imageSource = source => source) {
+export function imageAttachments(limits, changed, imageSource) {
   let items = [], locked = false;
   const composer = $('composer'), picker = $('attachment-picker');
 

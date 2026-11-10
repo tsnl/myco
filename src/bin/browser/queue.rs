@@ -4,10 +4,9 @@
 use chrono::{DateTime, Utc};
 use myco::session::inbox::{Priority, Source};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use uuid::Uuid;
 
-use super::{Action, ActionRequest, App, Block, Error, Live, Result, Snapshot, attachments};
+use super::{Action, ActionRequest, App, Block, Error, Live, Result, attachments};
 
 pub(super) const MAX_QUEUED_MESSAGES: usize = 20;
 
@@ -195,10 +194,9 @@ impl App {
         Ok(())
     }
 
-    pub(super) fn drain_queue(&self, live: &mut Live) -> Result<()> {
-        live.inbox
-            .expire(self.clock.now())
-            .map_err(Error::Internal)?;
+    /// Expire overdue events, and unqueue those that are no longer awaiting delivery.
+    pub(super) fn expire_events(&self, live: &mut Live, now: DateTime<Utc>) -> Result<()> {
+        live.inbox.expire(now).map_err(Error::Internal)?;
         live.snapshot.queued.retain(|message| {
             message.timer.is_none()
                 || live
@@ -206,6 +204,11 @@ impl App {
                     .get(message.request_id)
                     .is_some_and(|entry| entry.state.active())
         });
+        Ok(())
+    }
+
+    pub(super) fn drain_queue(&self, live: &mut Live) -> Result<()> {
+        self.expire_events(live, self.clock.now())?;
         self.refresh_inbox(live);
         if live.snapshot.busy || self.shutdown.is_cancelled() {
             return Ok(());
@@ -252,19 +255,7 @@ impl App {
         if self.shutdown.is_cancelled() || live.snapshot.status == "Cancelling" {
             return Ok(None);
         }
-        live.inbox
-            .expire(self.clock.now())
-            .map_err(Error::Internal)?;
-        let active: std::collections::HashSet<_> = live
-            .inbox
-            .entries()
-            .iter()
-            .filter(|entry| entry.state.active())
-            .map(|entry| entry.request.event_id)
-            .collect();
-        live.snapshot
-            .queued
-            .retain(|message| message.timer.is_none() || active.contains(&message.request_id));
+        self.expire_events(&mut live, self.clock.now())?;
         let next = live
             .snapshot
             .queued
@@ -279,7 +270,7 @@ impl App {
         }
         next.state = QueueState::Sending;
         *live.snapshot.queued.front_mut().expect("claimed entry") = next.clone();
-        self.publish_queue(&mut live.snapshot);
+        self.publish_metadata(&mut live.snapshot);
         Ok(Some(next))
     }
 
@@ -295,7 +286,7 @@ impl App {
             .expect("claimed queue entry");
         assert_eq!(next.request_id, id);
         next.state = QueueState::Ready;
-        self.publish_queue(&mut live.snapshot);
+        self.publish_metadata(&mut live.snapshot);
         Ok(())
     }
 
@@ -311,17 +302,8 @@ impl App {
         let next = snapshot.queued.pop_front().expect("claimed queue entry");
         assert_eq!(next.request_id, id);
         if let Some(block) = block {
-            let index = snapshot.blocks.len();
-            snapshot.blocks.push(block.clone());
-            self.publish(
-                snapshot,
-                json!({"kind":"block", "index":index, "block":block}),
-            );
+            self.push_block(snapshot, block);
         }
-        self.publish_queue(snapshot);
-    }
-
-    pub(super) fn publish_queue(&self, snapshot: &mut Snapshot) {
-        self.publish(snapshot, json!({"kind":"meta", "meta":snapshot.metadata()}));
+        self.publish_metadata(snapshot);
     }
 }

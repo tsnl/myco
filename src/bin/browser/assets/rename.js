@@ -5,7 +5,7 @@ export function sessionRenamer(onSaved = () => {}) {
   const dialog = document.createElement('dialog');
   dialog.id = 'rename-session'; dialog.setAttribute('aria-labelledby', 'rename-heading');
   dialog.innerHTML = `
-    <form id="rename-form">
+    <form>
       <h2 id="rename-heading">Rename session</h2>
       <label for="rename-name">Session name</label>
       <input id="rename-name" name="title" type="text" required maxlength="120" autocomplete="off" aria-describedby="rename-error">

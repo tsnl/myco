@@ -18,15 +18,13 @@ use tokio::sync::broadcast;
 use super::{
     files::Files,
     markdown, origin,
-    runtime::{ActionRequest, CreateSession, Error, Sessions, Update},
+    runtime::{ActionRequest, CreateSession, Error, Sessions, Update, blocking},
     view,
     weather::{Coordinates, Weather},
 };
 
 #[path = "service_http.rs"]
 mod service;
-
-type ApiResult<T> = Result<T, (StatusCode, String)>;
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
@@ -263,20 +261,24 @@ async fn session_thread(
     .map_err(|error| Error::Internal(format!("Cannot render thread: {error}")))?
 }
 
+/// A page acts on the session it shows, so its request names the session in its URL.
+fn same_session(request: &str, path: &str) -> Result<(), Error> {
+    if request == path {
+        return Ok(());
+    }
+    Err(Error::Conflict(
+        "The request belongs to a different session.".into(),
+    ))
+}
+
 pub(super) async fn session_action(
     State(server): State<Arc<Server>>,
     Path(id): Path<String>,
     Json(request): Json<ActionRequest>,
 ) -> Result<StatusCode, Error> {
-    if request.session_id != id {
-        return Err(Error::Conflict(
-            "The request belongs to a different session.".into(),
-        ));
-    }
+    same_session(&request.session_id, &id)?;
     let app = server.sessions.open(&id).await?;
-    tokio::task::spawn_blocking(move || app.accept(request))
-        .await
-        .map_err(|e| Error::Internal(e.to_string()))??;
+    blocking(move || app.accept(request)).await??;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -285,11 +287,7 @@ pub(super) async fn session_cancel(
     Path(id): Path<String>,
     Json(request): Json<SessionRequest>,
 ) -> Result<StatusCode, Error> {
-    if request.session_id != id {
-        return Err(Error::Conflict(
-            "The request belongs to a different session.".into(),
-        ));
-    }
+    same_session(&request.session_id, &id)?;
     server
         .sessions
         .open(&id)
@@ -319,11 +317,8 @@ pub(super) async fn post_session_event(
     Json(request): Json<myco::session::inbox::EventRequest>,
 ) -> Result<(StatusCode, Json<Value>), Error> {
     let app = server.sessions.open(&id).await?;
-    let entry = tokio::task::spawn_blocking(move || {
-        app.post_event(request, myco::session::inbox::Source::Trigger)
-    })
-    .await
-    .map_err(|e| Error::Internal(e.to_string()))??;
+    let entry =
+        blocking(move || app.post_event(request, myco::session::inbox::Source::Trigger)).await??;
     Ok((StatusCode::ACCEPTED, Json(json!(entry))))
 }
 
@@ -332,9 +327,7 @@ pub(super) async fn cancel_session_event(
     Path((id, event)): Path<(String, uuid::Uuid)>,
 ) -> Result<StatusCode, Error> {
     let app = server.sessions.open(&id).await?;
-    tokio::task::spawn_blocking(move || app.cancel_timer(event))
-        .await
-        .map_err(|e| Error::Internal(e.to_string()))??;
+    blocking(move || app.cancel_timer(event)).await??;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -350,11 +343,7 @@ async fn session_background(
     Path(id): Path<String>,
     Json(request): Json<BackgroundRequest>,
 ) -> Result<StatusCode, Error> {
-    if request.session_id != id {
-        return Err(Error::Conflict(
-            "The request belongs to a different session.".into(),
-        ));
-    }
+    same_session(&request.session_id, &id)?;
     server
         .sessions
         .open(&id)
@@ -380,11 +369,7 @@ async fn session_archive(
     Path(id): Path<String>,
     Json(request): Json<ArchiveRequest>,
 ) -> Result<StatusCode, Error> {
-    if request.session_id != id {
-        return Err(Error::Conflict(
-            "The request belongs to a different session.".into(),
-        ));
-    }
+    same_session(&request.session_id, &id)?;
     server.sessions.set_archived(id, request.archived).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -408,11 +393,7 @@ async fn session_auto_continue(
     Path(id): Path<String>,
     Json(request): Json<AutoContinueRequest>,
 ) -> Result<StatusCode, Error> {
-    if request.session_id != id {
-        return Err(Error::Conflict(
-            "The request belongs to a different session.".into(),
-        ));
-    }
+    same_session(&request.session_id, &id)?;
     server
         .sessions
         .set_auto_continue(id, request.enabled)
@@ -425,11 +406,7 @@ async fn session_rename(
     Path(id): Path<String>,
     Json(request): Json<RenameRequest>,
 ) -> Result<StatusCode, Error> {
-    if request.session_id != id {
-        return Err(Error::Conflict(
-            "The request belongs to a different session.".into(),
-        ));
-    }
+    same_session(&request.session_id, &id)?;
     server.sessions.rename(id, request.title).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -478,7 +455,9 @@ async fn workspace_index(
     server.files.serve(String::new(), method, headers).await
 }
 
-async fn image(Query(query): Query<HashMap<String, String>>) -> ApiResult<Response> {
+async fn image(
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Response, (StatusCode, String)> {
     let source = query
         .get("source")
         .cloned()
