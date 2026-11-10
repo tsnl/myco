@@ -73,8 +73,17 @@ impl Server {
         serde_json::from_str(&body).unwrap()
     }
 
+    /// Stop as Ctrl-C does. The launcher then waits for its profile workers,
+    /// which hold the session locks, so nothing stays locked once this
+    /// returns. A killed launcher leaves them to exit in their own time.
     async fn stop(&mut self) {
-        self.child.kill().await.unwrap();
+        let pid = self.child.id().expect("server is running") as libc::pid_t;
+        // SAFETY: signals a child this test spawned and has not yet reaped.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+        tokio::time::timeout(Duration::from_secs(20), self.child.wait())
+            .await
+            .expect("browser shutdown must finish")
+            .unwrap();
     }
 }
 
