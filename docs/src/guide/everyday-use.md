@@ -31,9 +31,9 @@ remain notes the agent can read as needed.
 | Cancel a scheduled follow-up | Activity → Timers → Cancel timer |
 | Let a running shell call continue while the assistant moves on | Background on the tool or in Activity |
 | Switch configured models | Model selector between turns |
-| Compact context | Compact or `/compact` |
+| Compact context | Menu (**⋯**) → Compact, or `/compact` |
 | Open another session | New or a session link on the home page |
-| Rename a session | Pencil beside its title, or Rename on its session-list row |
+| Rename a session | Menu (**⋯**) → Rename session, or Rename on its session-list row |
 
 Set reasoning effort with `--effort` when launching the server. A tab can be
 closed or refreshed while work continues. Open the session URL again to observe

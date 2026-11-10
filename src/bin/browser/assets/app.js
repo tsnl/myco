@@ -344,6 +344,7 @@ function metadata() {
   $('auto-continue').disabled = !connected || !state.session_id || updatingAutoContinue;
   $('auto-continue').textContent = `Auto-continue: ${state.auto_continue ? 'on' : 'off'}`;
   $('auto-continue').setAttribute('aria-pressed', String(!!state.auto_continue));
+  $('auto-continue-status').hidden = !state.auto_continue;
   $('archive').disabled = !connected || !state.session_id || archiving;
   $('archive').textContent = state.archived ? 'Restore' : 'Archive';
   $('archived-status').hidden = !state.archived;
@@ -453,7 +454,7 @@ $('auto-continue').onclick = async () => {
   } catch (e) { error(e.message); }
   finally { updatingAutoContinue = false; metadata(); }
 };
-$('rename').onclick = () => renameSession({ id: state.session_id, title: state.title }, $('rename'));
+$('rename').onclick = () => renameSession({ id: state.session_id, title: state.title }, $('menu-toggle'));
 $('archive').onclick = async () => {
   if (archiving || !state.session_id) return;
   archiving = true; metadata(); error();

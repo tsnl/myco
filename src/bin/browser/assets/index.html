@@ -19,18 +19,22 @@
         <a class="brand" href="/" aria-label="myco home">myco<span aria-hidden="true">_</span></a>
         <select id="profile-switcher" aria-label="Profile"><option>__MYCO_PROFILE__</option></select>
         <h1 id="session-title">Session</h1>
-        <button id="rename" type="button" aria-label="Rename session" title="Rename session" aria-haspopup="dialog" aria-controls="rename-session" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5 4 4M4 20l5-1L20 8a2.8 2.8 0 0 0-4-4L5 15z"/></svg></button>
       </div>
       <div class="session-state">
         <span id="archived-status" class="archive-indicator" role="status" hidden>Archived</span>
+        <span id="auto-continue-status" class="archive-indicator" role="status" title="Auto-continue is on" hidden>Auto<span>-continue</span></span>
         <span id="connection" class="activity-indicator" role="status" data-state="attention">Connecting…</span>
       </div>
       <div class="toolbar-actions" role="group" aria-label="Session controls">
         <div class="toolbar-tools">
-          <button id="compact" type="button">Compact</button>
-          <button id="auto-continue" type="button" aria-pressed="false" title="Continue until the assistant disables the mode when finished or blocked" disabled>Auto-continue: off</button>
           <button id="activity-toggle" type="button" aria-haspopup="dialog" aria-controls="activity" aria-expanded="false">Activity <span id="activity-count" hidden>0</span></button>
-          <button id="archive" type="button" disabled>Archive</button>
+          <button id="menu-toggle" type="button" popovertarget="menu" aria-label="Menu" title="Menu"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h.01M12 12h.01M19 12h.01"/></svg></button>
+          <div id="menu" popover>
+            <button id="rename" type="button" aria-haspopup="dialog" aria-controls="rename-session" disabled>Rename session</button>
+            <button id="compact" type="button">Compact</button>
+            <button id="auto-continue" type="button" aria-pressed="false" title="Continue until the assistant disables the mode when finished or blocked" disabled>Auto-continue: off</button>
+            <button id="archive" type="button" disabled>Archive</button>
+          </div>
         </div>
         <a id="new-session" class="button" href="/new" target="_blank" rel="noopener" aria-label="New session (opens in a new tab)" title="New session (opens in a new tab)"><span aria-hidden="true">+</span> New</a>
       </div>
