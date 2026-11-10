@@ -2283,6 +2283,8 @@ context_window = 100000
                     expect(dialog.get_by_role("heading", name="Sky", exact=True)).to_be_visible()
                     expect(page.get_by_role("button", name="Close settings")).to_be_focused()
                     page.keyboard.press("Tab")
+                    expect(page.locator("#well-width")).to_be_focused()
+                    page.keyboard.press("Tab")
                     expect(page.locator("#sky-city")).to_be_focused()
                     if dismiss == "close":
                         page.get_by_role("button", name="Close settings").click()
@@ -2294,6 +2296,76 @@ context_window = 100000
                     expect(dialog).to_be_hidden()
                     expect(toggle).to_have_attribute("aria-expanded", "false")
                     expect(toggle).to_be_focused()
+
+    def open_settings(self, page):
+        if page.locator('#menu-toggle').count():
+            page.click('#menu-toggle')
+        page.click('#settings-toggle')
+
+    def test_conversation_width_follows_saved_columns_and_shrinks_in_narrow_windows(self):
+        page = self.session(self.page)
+        page.set_viewport_size({'width': 2600, 'height': 900})
+        # Text columns inside the well, measured with the page's own font.
+        measure = """selector => {
+            const probe = document.createElement('span');
+            probe.textContent = '0'.repeat(100); probe.style.position = 'absolute';
+            document.body.append(probe);
+            const column = probe.getBoundingClientRect().width / 100; probe.remove();
+            const style = getComputedStyle(document.querySelector(selector));
+            return (parseFloat(style.width) - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight) - 2) / column;
+        }"""
+        columns = lambda target=page, selector='#transcript': target.evaluate(measure, selector)
+        width = lambda selector: page.locator(selector).bounding_box()['width']
+        self.assertAlmostEqual(columns(), 100, delta=0.05)
+        self.open_settings(page)
+        expect(page.locator('#well-width')).to_have_value('100')
+        expect(page.locator('#well-width option')).to_have_text(
+            ['80 columns', '100 columns (default)', '120 columns', '150 columns', '200 columns', 'Unbounded', 'Custom…'])
+        for choice in ['80', '120', '150', '200']:
+            page.select_option('#well-width', choice)
+            self.assertAlmostEqual(columns(), int(choice), delta=0.05)
+            self.assertAlmostEqual(width('.toolbar-inner'), width('#transcript'), delta=0.5)
+            self.assertAlmostEqual(width('#composer-frame'), width('#transcript') - 66, delta=0.5)
+            glass = page.evaluate("parseFloat(getComputedStyle(document.body, '::before').width)")
+            self.assertAlmostEqual(glass, width('#transcript'), delta=0.5)
+        page.select_option('#well-width', 'unbounded')
+        self.assertAlmostEqual(width('#transcript'), page.evaluate('document.documentElement.clientWidth'), delta=0.5)
+        page.select_option('#well-width', 'custom')
+        expect(page.locator('#well-width-custom')).to_be_focused()
+        self.assertAlmostEqual(width('#transcript'), page.evaluate('document.documentElement.clientWidth'), delta=0.5)
+        page.fill('#well-width-custom', '132')
+        self.assertAlmostEqual(columns(), 132, delta=0.05)
+        for invalid in ['12', '5000', '90.5', '']:
+            page.fill('#well-width-custom', invalid)
+            self.assertAlmostEqual(columns(), 132, delta=0.05, msg=f'{invalid!r} must not change the width')
+        page.fill('#well-width-custom', '132')
+        self.assertEqual(page.evaluate("localStorage.getItem('myco.well-width.v1')"), '132')
+        # A saved width is in place before any page content exists to flash.
+        page.add_init_script("""new MutationObserver((_, observer) => {
+            if (!document.body) return;
+            window.widthAtFirstContent = document.documentElement.style.getPropertyValue('--well-columns');
+            observer.disconnect();
+        }).observe(document, { childList: true, subtree: true });""")
+        page.reload()
+        expect(page.locator('#model')).to_be_enabled()
+        self.assertEqual(page.evaluate('window.widthAtFirstContent'), '132')
+        self.assertAlmostEqual(columns(), 132, delta=0.05)
+        self.open_settings(page)
+        expect(page.locator('#well-width')).to_have_value('custom')
+        expect(page.locator('#well-width-custom')).to_have_value('132')
+        home = self.context.new_page()
+        home.set_viewport_size({'width': 2600, 'height': 900})
+        home.goto(self.origin)
+        self.assertAlmostEqual(columns(home, '#session-browser'), 132, delta=0.05)
+        for narrow in [900, 390]:
+            page.set_viewport_size({'width': narrow, 'height': 850})
+            self.assertAlmostEqual(width('#transcript'), narrow, delta=0.5)
+            self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), narrow)
+        page.set_viewport_size({'width': 2600, 'height': 900})
+        page.select_option('#well-width', '100')
+        self.assertIsNone(page.evaluate("localStorage.getItem('myco.well-width.v1')"))
+        home.wait_for_function(f"({measure})('#session-browser') < 101")
+        self.assertAlmostEqual(columns(home, '#session-browser'), 100, delta=0.05)
 
     def test_sky_city_drives_altitude_layers_and_persists_across_navigation(self):
         page = self.page
