@@ -175,6 +175,8 @@ html.viewing-image { overflow: hidden; }
 .tool pre { color: #b8b8b8; }
 .tool .output { color: #d9d9d9; max-height: 65vh; overflow: auto; }
 .thinking { color: #b5b5b5; font-style: italic; margin-bottom: 20px; padding-left: 16px; border-left: 2px solid var(--dim); cursor: pointer; }
+.thinking > .body { cursor: auto; }
+.thinking:hover:not(:has(> :hover)) { border-left-color: #e6e6e6; }
 .thinking em { font-style: inherit; }
 .thinking :is(a, code, blockquote) { color: inherit; }
 .thinking .body { margin-top: 10px; }

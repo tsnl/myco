@@ -274,8 +274,9 @@ its value. Strings retain their newlines without JSON quoting; nested objects an
 arrays retain JSON structure. There is no browser verbose mode.
 
 Thinking traces appear in muted italic text with a vertical bar on the left.
-Expand **Thinking** to read a trace; click anywhere in the expanded trace to
-collapse it. Its heading also supports Enter and Space for keyboard control.
+Expand **Thinking** to read a trace. Its text selects and copies like the rest
+of the conversation. Click the heading or the bar to collapse it; the heading
+also supports Enter and Space for keyboard control.
 
 Tool calls show elapsed execution time to tenths of a second in their headers
 and in the Activity drawer. Running timers update every 0.1 seconds and survive
