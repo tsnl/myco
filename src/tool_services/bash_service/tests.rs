@@ -375,7 +375,7 @@ async fn background_exec_retains_output_owner_and_process_after_turn_cancellatio
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert_eq!(service.resources(owner)[0].details["process_exited"], false);
     ctx.cancel.cancel();
-    assert_eq!(service.running_tool_summaries(owner).len(), 1);
+    assert_eq!(service.resources(owner)[0].details["output_closed"], false);
     let foreign = dispatch_json_as(
         &service,
         Uuid::new_v4(),
@@ -1006,77 +1006,6 @@ async fn session_returns_while_process_still_running() {
     let _ = close(&harness, &id).await;
 }
 
-/// Prompt-time summaries list only the caller's live sessions, one line
-/// each; completed and foreign-owned sessions are excluded.
-#[tokio::test]
-async fn running_tool_summaries_list_live_sessions_for_owner_only() {
-    let service = Arc::new(BashService::new());
-    let owner = uuid::Uuid::new_v4();
-    let id = unique_id("summary");
-
-    let start = dispatch_json_as(
-        &service,
-        owner,
-        json!({
-            "action": "start",
-            "session_id": id,
-            "command": "bash -c 'sleep 30'",
-            "timeout_ms": 500,
-            "idle_ms": 100,
-        }),
-    )
-    .await;
-    assert!(!start.is_error, "start: {}", result_text(&start));
-
-    let lines = service.running_tool_summaries(owner);
-    assert_eq!(lines.len(), 1, "{lines:?}");
-    assert!(lines[0].contains(&id), "{lines:?}");
-    assert!(lines[0].contains("sleep 30"), "{lines:?}");
-    assert!(!lines[0].contains('\n'), "must be one line: {lines:?}");
-    assert!(
-        service
-            .running_tool_summaries(uuid::Uuid::new_v4())
-            .is_empty(),
-        "other agents must not see this session"
-    );
-
-    let closed = dispatch_json_as(
-        &service,
-        owner,
-        json!({"action": "close", "session_id": id}),
-    )
-    .await;
-    assert!(!closed.is_error, "close: {}", result_text(&closed));
-    assert!(
-        service.running_tool_summaries(owner).is_empty(),
-        "closed sessions must not be listed"
-    );
-
-    // An exited-but-unclosed session is not running. Exit is observed by
-    // an async waiter, so poll briefly instead of asserting immediately.
-    let id2 = unique_id("exited");
-    let start = dispatch_json_as(
-        &service,
-        owner,
-        json!({
-            "action": "start",
-            "session_id": id2,
-            "command": "true",
-        }),
-    )
-    .await;
-    assert!(!start.is_error, "start: {}", result_text(&start));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !service.running_tool_summaries(owner).is_empty() {
-        assert!(
-            Instant::now() < deadline,
-            "exited session still listed: {:?}",
-            service.running_tool_summaries(owner)
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
 #[tokio::test]
 async fn background_output_keeps_a_session_visible_after_its_shell_exits() {
     let service = Arc::new(BashService::new());
@@ -1114,7 +1043,7 @@ async fn background_output_keeps_a_session_visible_after_its_shell_exits() {
     .await
     .expect("shell did not exit and close stdout");
 
-    let running = service.running_tool_summaries(owner);
+    let running = service.resources(owner);
     let listed = result_text(&service.session_list(owner));
     let snapshot = {
         let read = dispatch_json_as(
@@ -1147,20 +1076,21 @@ async fn background_output_keeps_a_session_visible_after_its_shell_exits() {
     })
     .await
     .expect("background output remained open after killing the process group");
-    let finished = service.running_tool_summaries(owner);
+    let finished = service.resources(owner);
     let final_snapshot =
         dispatch_json_as(&service, owner, json!({"action": "read", "session_id": id})).await;
     service.reap_owner(owner);
 
     assert_eq!(running.len(), 1, "{running:?}");
-    assert!(running[0].contains("output still open"), "{running:?}");
+    assert_eq!(running[0].details["process_exited"], true, "{running:?}");
+    assert_eq!(running[0].details["output_closed"], false, "{running:?}");
     assert!(listed.contains("output still open"), "{listed}");
     let snapshot = result_text(&snapshot);
     assert!(snapshot.contains("status: running"), "{snapshot}");
     assert!(snapshot.contains("descendant output"), "{snapshot}");
     assert!(snapshot.contains("exit_code: Some(0)"), "{snapshot}");
     assert!(snapshot.contains("output still open"), "{snapshot}");
-    assert!(finished.is_empty(), "{finished:?}");
+    assert_eq!(finished[0].details["output_closed"], true, "{finished:?}");
     let final_snapshot = result_text(&final_snapshot);
     assert!(
         final_snapshot.contains("status: exited"),
@@ -1170,22 +1100,6 @@ async fn background_output_keeps_a_session_visible_after_its_shell_exits() {
         !final_snapshot.contains("output still open"),
         "{final_snapshot}"
     );
-}
-
-/// Summary lines stay compact: cmdlines are first-line-only and capped,
-/// ages render as s/m/h.
-#[test]
-fn summary_cmdline_and_age_stay_compact() {
-    assert_eq!(summary_cmdline("npm run dev"), "npm run dev");
-    assert_eq!(summary_cmdline("line one\nline two"), "line one");
-    let long = "x".repeat(100);
-    let capped = summary_cmdline(&long);
-    assert!(capped.chars().count() <= 61, "{capped}");
-    assert!(capped.ends_with('…'), "{capped}");
-
-    assert_eq!(brief_age(Duration::from_secs(42)), "42s");
-    assert_eq!(brief_age(Duration::from_secs(420)), "7m");
-    assert_eq!(brief_age(Duration::from_secs(2 * 3600 + 5 * 60)), "2h05m");
 }
 
 /// One-shot exec waits for exit but must not hang forever on a long sleep.

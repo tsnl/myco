@@ -1908,7 +1908,8 @@ mod tests {
             assert_eq!(model.remaining(), 0);
             assert_eq!(outcome.usage.unwrap().output_tokens, 28);
             assert_eq!(outcome.reason, TurnEndReason::EndTurn);
-            assert_eq!(runner.runtime().running_tool_summaries().len(), 1);
+            let hosts = runner.runtime().resources().await;
+            assert_eq!(hosts.iter().flat_map(|host| host.resources.iter().flatten()).count(), 1);
             let saved = Session::load(&runner.runtime().session().snapshot().json_path()).unwrap();
             assert_eq!(saved.threads().len(), 3);
             assert_eq!(saved.active_thread().user_turn_timestamps.len(), 1);

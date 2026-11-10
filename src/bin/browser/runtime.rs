@@ -85,7 +85,6 @@ struct Snapshot {
     context_window_tokens: u64,
     busy: bool,
     status: String,
-    tasks: Vec<String>,
     queued: VecDeque<QueuedMessage>,
     timers: Vec<timers::Timer>,
     inbox: Vec<InboxEntry>,
@@ -302,7 +301,6 @@ impl App {
 
     fn sync_with(&self, boot: &Boot, status: &str, finish: impl FnOnce(&mut service::Receipts)) {
         let session = boot.session.snapshot();
-        let tasks = boot.runner.runtime().running_tool_summaries();
         let mut live = self.live.lock().unwrap();
         // The receipt and snapshot settle under one lock. A completed native
         // command cannot expose stale settings or cancel a subsequent turn.
@@ -331,7 +329,6 @@ impl App {
         snapshot.context_window_tokens = boot.catalog_model.spec.context_window_tokens;
         snapshot.blocks = blocks;
         snapshot.status = status.into();
-        snapshot.tasks = tasks;
         if let Err(error) = self.start_next(&mut live) {
             live.snapshot.blocks.push(Block::Notice {
                 text: error.to_string(),
@@ -340,11 +337,6 @@ impl App {
         let change = json!({"kind":"snapshot", "snapshot":live.snapshot});
         self.publish(&mut live.snapshot, change);
         self.generation.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn refresh(&self, session: &ActiveSession, tasks: Vec<String>) {
-        self.tasks(tasks);
-        self.refresh_metadata(session);
     }
 
     fn refresh_metadata(&self, session: &ActiveSession) {
@@ -374,15 +366,6 @@ impl App {
         }
         if listing_changed {
             self.generation.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    fn tasks(&self, tasks: Vec<String>) {
-        let mut live = self.live.lock().unwrap();
-        if live.snapshot.tasks != tasks {
-            live.snapshot.tasks = tasks;
-            let change = json!({"kind":"tasks", "tasks":live.snapshot.tasks});
-            self.publish(&mut live.snapshot, change);
         }
     }
 
@@ -827,7 +810,6 @@ impl Sessions {
                             context_window_tokens,
                             busy: false,
                             status: "Ready".into(),
-                            tasks: vec![],
                             queued: VecDeque::new(),
                             timers: vec![],
                             inbox: vec![],
@@ -1058,7 +1040,7 @@ async fn worker(
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            app.refresh(runtime.session(), runtime.running_tool_summaries());
+            app.refresh_metadata(runtime.session());
             app.resources(runtime.resources().await);
         }
     };

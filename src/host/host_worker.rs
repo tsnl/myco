@@ -122,15 +122,6 @@ impl HostWorker {
         }
     }
 
-    /// One-line summaries of tool work still running for `agent_id` across
-    /// all services (e.g. live bash sessions).
-    pub fn running_tool_summaries(&self, agent_id: uuid::Uuid) -> Vec<String> {
-        self.services
-            .iter()
-            .flat_map(|service| service.running_tool_summaries(agent_id))
-            .collect()
-    }
-
     pub fn resources(&self, agent_id: uuid::Uuid) -> Vec<ToolResource> {
         let mut resources: Vec<_> = self
             .services

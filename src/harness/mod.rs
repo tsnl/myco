@@ -389,18 +389,6 @@ impl Harness {
         })
     }
 
-    /// One-line summaries of tool work still running for `agent_id` (e.g.
-    /// live bash sessions), for prompt-time display between turns. Local
-    /// (in-process) hosts only — remotes are never queried here (see
-    /// [`HostController::running_tool_summaries`]).
-    pub fn running_tool_summaries(&self, agent_id: uuid::Uuid) -> Vec<String> {
-        self.host_names()
-            .into_iter()
-            .filter_map(|name| self.hosts.get(&name))
-            .flat_map(|client| client.running_tool_summaries(agent_id))
-            .collect()
-    }
-
     /// Connected hosts are observed concurrently; disconnected remotes stay lazy.
     pub async fn resources(&self, agent_id: uuid::Uuid) -> Vec<crate::core::HostResources> {
         futures::future::join_all(self.host_names().into_iter().map(|host| async move {
@@ -863,49 +851,5 @@ mod tests {
         // Local still fine.
         let local = status.iter().find(|s| s.name == "local").unwrap();
         assert!(local.connected && local.in_process);
-    }
-
-    /// Prompt-time running-tool summaries surface the caller's in-process
-    /// bash sessions and disappear once the session is closed.
-    #[tokio::test]
-    async fn running_tool_summaries_surface_local_bash_sessions() {
-        let harness = Harness::attach_local_for_tests().await.expect("attach");
-        let agent_id = uuid::Uuid::new_v4();
-        assert!(harness.running_tool_summaries(agent_id).is_empty());
-
-        let r = call_on(
-            &harness,
-            agent_id,
-            "bash",
-            json!({
-                "action": "start",
-                "session_id": "summary-probe",
-                "command": "bash -c 'sleep 30'",
-                "timeout_ms": 500,
-                "idle_ms": 100,
-            }),
-        )
-        .await;
-        assert!(!r.is_error, "{r:?}");
-
-        let lines = harness.running_tool_summaries(agent_id);
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(lines[0].contains("summary-probe"), "{lines:?}");
-        assert!(
-            harness
-                .running_tool_summaries(uuid::Uuid::new_v4())
-                .is_empty(),
-            "other agents must not see this session"
-        );
-
-        let r = call_on(
-            &harness,
-            agent_id,
-            "bash",
-            json!({"action": "close", "session_id": "summary-probe"}),
-        )
-        .await;
-        assert!(!r.is_error, "{r:?}");
-        assert!(harness.running_tool_summaries(agent_id).is_empty());
     }
 }

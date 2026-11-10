@@ -264,19 +264,6 @@ impl HostController {
         }
     }
 
-    /// One-line summaries of tool work still running for `agent_id` on this
-    /// host (e.g. live bash sessions).
-    ///
-    /// In-process hosts only: the NDJSON protocol has no query message, and
-    /// prompt-time display must never block on a lazy/dead remote connection,
-    /// so subprocess hosts report none.
-    pub fn running_tool_summaries(&self, agent_id: uuid::Uuid) -> Vec<String> {
-        match &self.backend {
-            Backend::InProcess { worker } => worker.running_tool_summaries(agent_id),
-            Backend::Subprocess { .. } => Vec::new(),
-        }
-    }
-
     /// Query only an existing connection. An unavailable inventory is not empty
     /// and must never cause a lazy remote to connect or restart.
     pub async fn resources(&self, agent_id: uuid::Uuid) -> Result<Vec<ToolResource>, String> {

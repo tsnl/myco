@@ -184,10 +184,6 @@ impl SessionRuntime {
         Ok(())
     }
 
-    pub fn running_tool_summaries(&self) -> Vec<String> {
-        self.harness.running_tool_summaries(self.owner_id)
-    }
-
     /// Current resource observations; unavailable hosts remain explicitly unknown.
     pub async fn resources(&self) -> Vec<crate::core::HostResources> {
         self.harness.resources(self.owner_id).await
@@ -619,7 +615,10 @@ mod tests {
             let first_agent_id = first.context().agent_id;
             drop(first);
             session.set_archived(true).unwrap();
-            assert_eq!(live.running_tool_summaries().len(), 1);
+            let shells = |hosts: Vec<crate::core::HostResources>| {
+                hosts.into_iter().flat_map(|host| host.resources.unwrap_or_default()).count()
+            };
+            assert_eq!(shells(live.resources().await), 1);
 
             let (thread, _) = compact_thread(&session.snapshot(), "A shell holds marker=first").unwrap();
             session.writer().await.commit_thread(thread).unwrap();
@@ -650,10 +649,10 @@ mod tests {
             let output = serde_json::to_string(outsider.history()).unwrap();
             assert!(output.contains("owned by another myco session"), "{output}");
             drop(outsider);
-            assert_eq!(live.running_tool_summaries().len(), 1);
+            assert_eq!(shells(live.resources().await), 1);
             drop(live);
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                while !harness.running_tool_summaries(owner).is_empty() {
+                while shells(harness.resources(owner).await) != 0 {
                     tokio::task::yield_now().await;
                 }
             }).await.expect("session runtime releases its tools");
