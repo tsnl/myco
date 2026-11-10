@@ -450,7 +450,7 @@ context_window = 100000
         default.reload()
         expect(default.locator('#sky')).to_have_attribute('data-weather', 'live')
         expect(other.locator('#sky')).to_have_attribute('data-weather', 'illustrated')
-        default.click('#settings-toggle')
+        self.menu(default, '#settings-toggle').click()
         expect(default.locator('#sky-status')).to_contain_text('Legacy city')
         default.click('#sky-reset')
         default.reload()
@@ -458,7 +458,7 @@ context_window = 100000
         other.evaluate("localStorage.setItem('myco.sky.location.v1:/profiles/research', JSON.stringify({name: 'Research city', latitude: 51, longitude: 1}))")
         other.reload()
         expect(other.locator('#sky')).to_have_attribute('data-weather', 'live')
-        other.click('#settings-toggle')
+        self.menu(other, '#settings-toggle').click()
         expect(other.locator('#sky-status')).to_contain_text('Research city')
         expect(default.locator('#sky')).to_have_attribute('data-weather', 'illustrated')
 
@@ -572,6 +572,12 @@ context_window = 100000
         expect(page.locator("#model")).to_be_enabled()
         return page
 
+    def menu(self, page, entry):
+        """Open the toolbar menu when needed and return one of its entries."""
+        if not page.locator('#menu').is_visible():
+            page.click('#menu-toggle')
+        return page.locator(entry) if isinstance(entry, str) else entry
+
     def submit(self, page, text):
         page.fill("#prompt", text)
         page.press("#prompt", "Enter")
@@ -682,7 +688,7 @@ context_window = 100000
         expect(page.locator('#connection')).to_have_text('Waiting')
         old = self.context.request.get(page.url.replace('/sessions/', '/api/sessions/')).json()['change']['snapshot']['thread_id']
         self.compaction_release.clear()
-        page.click('#compact')
+        self.menu(page, '#compact').click()
         expect(page.locator('#connection')).to_have_text('Compacting')
         expect(page.locator('#queued-list .queued-content')).to_have_text('Timer · Alpha timer after compaction')
         expect(page.locator('.system')).to_have_count(0)
@@ -835,7 +841,7 @@ context_window = 100000
         self.submit(page, 'Alpha timer')
         expect(page.locator('#connection')).to_have_text('Waiting')
         url = page.url
-        page.click('#archive')
+        self.menu(page, '#archive').click()
         expect(page.locator('#archive-notice')).to_contain_text('Session Archived.')
         page.select_option('#archive-filter', 'archived')
         expect(page.locator('.session-status')).to_have_text('Waiting')
@@ -983,7 +989,7 @@ context_window = 100000
         expect(selected).to_contain_text('Earlier message')
         prompt.press('ArrowDown')
         expect(selected).to_contain_text('Alpha wait')
-        page.click('#compact')
+        self.menu(page, '#compact').click()
         expect(page.locator('#model')).to_be_enabled()
         expect(selected).to_have_count(0)
         prompt.press('ArrowUp')
@@ -1123,7 +1129,7 @@ context_window = 100000
                 self.submit(page, 'Alpha images')
                 if not automatic:
                     expect(page.locator('#model')).to_be_enabled()
-                    page.click('#compact')
+                    self.menu(page, '#compact').click()
                 expect(page.locator('#connection')).to_have_text('Compacting')
                 expect(page.locator('.compaction')).to_have_count(0)
                 expect(page.locator('.user .body')).to_have_text('Alpha images')
@@ -1240,7 +1246,7 @@ context_window = 100000
         state_url = self.origin + '/api/sessions/' + page.url.rsplit('/', 1)[1]
         thread = self.context.request.get(state_url).json()['change']['snapshot']['thread_id']
         self.compaction_release.clear()
-        page.click('#compact')
+        self.menu(page, '#compact').click()
         expect(page.locator('#connection')).to_have_text('Compacting')
         page.fill('#prompt', 'Beta images')
         page.press('#prompt', 'Enter')
@@ -1283,7 +1289,7 @@ context_window = 100000
         self.submit(page, 'Alpha images')
         expect(page.locator('#context-usage')).to_have_text('Context 80K / 100K · 80%')
         expect(page.locator('#model')).to_be_enabled()
-        page.click('#compact')
+        self.menu(page, '#compact').click()
         expect(page.locator('#model')).to_be_enabled()
         expect(page.locator('#context-usage')).to_have_text('Context — / 100K')
         expect(page.locator('#output-tokens')).to_have_text('Output —')
@@ -1835,7 +1841,7 @@ context_window = 100000
         expect(page.locator('#model')).to_be_enabled()
         self.assertEqual((self.home / 'Alpha-marker').read_text(), 'Alpha')
         expect(page.locator('.tool.running')).to_have_count(1)
-        page.click('#compact')
+        self.menu(page, '#compact').click()
         expect(page.locator('#model')).to_be_enabled()
         expect(page.locator('.tool.running')).to_have_count(1)
         page.reload()
@@ -2271,15 +2277,15 @@ context_window = 100000
             if view == "session":
                 self.session(page)
             with self.subTest(view=view):
-                toggle = page.get_by_role("button", name="Settings", exact=True)
+                toggle = page.get_by_role("button", name="Menu", exact=True)
                 dialog = page.get_by_role("dialog", name="Settings", exact=True)
-                expect(toggle).to_be_visible()
                 expect(page.locator(".toolbar").get_by_role("button", name="Sky", exact=True)).to_have_count(0)
                 expect(page.locator("#sky-city")).to_be_hidden()
                 for dismiss in ["close", "escape", "outside"]:
                     toggle.click()
+                    page.get_by_role("button", name="Settings", exact=True).click()
                     expect(dialog).to_be_visible()
-                    expect(toggle).to_have_attribute("aria-expanded", "true")
+                    expect(page.locator("#menu")).to_be_hidden()
                     expect(dialog.get_by_role("heading", name="Sky", exact=True)).to_be_visible()
                     expect(page.get_by_role("button", name="Close settings")).to_be_focused()
                     page.keyboard.press("Tab")
@@ -2292,7 +2298,6 @@ context_window = 100000
                     else:
                         page.mouse.click(4, 4)
                     expect(dialog).to_be_hidden()
-                    expect(toggle).to_have_attribute("aria-expanded", "false")
                     expect(toggle).to_be_focused()
 
     def test_sky_city_drives_altitude_layers_and_persists_across_navigation(self):
@@ -2311,7 +2316,7 @@ context_window = 100000
         expect(page.locator("#sky")).to_have_attribute("data-clouds", "ready", timeout=30000)
         self.assertEqual(calls, [], "Illustrated skies must not request a location or weather")
         page.emulate_media(reduced_motion="reduce")
-        page.click("#settings-toggle")
+        self.menu(page, '#settings-toggle').click()
         page.fill("#sky-city", "London")
         page.press("#sky-city", "Enter")
         page.get_by_role("button", name="London, England, United Kingdom", exact=True).click()
@@ -2325,7 +2330,7 @@ context_window = 100000
         page.press("#sky-city", "Escape")
         self.session(page)
         expect(page.locator("#sky")).to_have_attribute("data-weather", "live")
-        page.click("#settings-toggle")
+        self.menu(page, '#settings-toggle').click()
         expect(page.locator("#sky-status")).to_contain_text("London")
         page.click("#sky-reset")
         expect(page.locator("#sky")).to_have_attribute("data-weather", "illustrated")
@@ -2348,7 +2353,7 @@ context_window = 100000
         page.clock.fast_forward(15 * 60 * 1000)
         expect(page.locator("#sky")).to_have_attribute("data-weather", "stale")
         expect(page.locator("#sky-rain")).to_be_visible()
-        page.click("#settings-toggle")
+        self.menu(page, '#settings-toggle').click()
         expect(page.locator("#sky-status")).to_contain_text("last available")
         expect(page.locator("#sky-error")).to_contain_text("Weather unavailable")
         page.clock.fast_forward(2 * 60 * 60 * 1000)
@@ -2370,7 +2375,7 @@ context_window = 100000
         page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: true}); document.dispatchEvent(new Event('visibilitychange'))")
         self.assertEqual(page.locator(".cloud-track").first.evaluate("n => getComputedStyle(n).animationPlayState"), "paused")
         page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: false}); document.dispatchEvent(new Event('visibilitychange'))")
-        page.click("#settings-toggle")
+        self.menu(page, '#settings-toggle').click()
         page.evaluate("() => { navigator.geolocation.getCurrentPosition = (_ok, fail) => fail({code: 1}); }")
         page.click("#sky-locate")
         expect(page.locator("#sky-error")).to_contain_text("Location unavailable")
@@ -2405,7 +2410,7 @@ context_window = 100000
         page.reload()
         rain = page.locator("#sky-rain")
         expect(rain).to_be_visible()
-        page.click("#settings-toggle")
+        self.menu(page, '#settings-toggle').click()
         expect(page.locator("#sky-conditions")).to_have_text("Rain")
         sheet = rain.locator(".rain-sheet").first
         opacity = sheet.evaluate("n => getComputedStyle(n).opacity")
@@ -2448,7 +2453,7 @@ context_window = 100000
         page.emulate_media(reduced_motion="reduce")
         expect(rain).to_be_hidden()
         expect(page.locator("#sky")).to_have_attribute("data-weather", "live")
-        page.click("#settings-toggle")
+        self.menu(page, '#settings-toggle').click()
         expect(page.locator("#sky-conditions")).to_have_text("Heavy rain")
         page.click("#settings-close")
         page.emulate_media(reduced_motion="no-preference")
@@ -3023,10 +3028,41 @@ context_window = 100000
         (self.home / "Alpha-rename-release").touch()
         expect(page.locator("#model")).to_be_enabled()
 
+    def test_toolbar_keeps_the_session_title_readable_and_folds_commands_into_a_menu(self):
+        page = self.session(self.page)
+        title = 'Investigate the flaky compaction retry path in the session runner'
+        session_id = page.url.rsplit('/', 1)[1]
+        response = self.context.request.post(page.url.replace('/sessions/', '/api/sessions/') + '/rename',
+                                             data={'session_id': session_id, 'title': title})
+        self.assertEqual(response.status, 204)
+        heading = page.locator('#session-title')
+        expect(heading).to_have_text(title)
+        expect(page.locator('#auto-continue-status')).to_be_hidden()
+        self.menu(page, '#auto-continue').click()
+        expect(page.locator('#auto-continue-status')).to_be_visible()
+        for width, room in [(1200, 240), (820, 150), (390, 150)]:
+            page.set_viewport_size({'width': width, 'height': 850})
+            self.assertGreaterEqual(heading.bounding_box()['width'], room, f'The title is squeezed at {width}px')
+            self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), width)
+            page.screenshot(path=str(self.artifacts / f'toolbar-{width}.png'))
+        page.set_viewport_size({'width': 1200, 'height': 850})
+        expect(page.locator('.toolbar-tools > button')).to_have_count(2)
+        toggle = page.get_by_role('button', name='Menu', exact=True)
+        toggle.click()
+        expect(page.locator('#menu button')).to_have_text(
+            ['Rename session', 'Compact', 'Auto-continue: on', 'Archive', 'Settings'])
+        page.keyboard.press('Escape')
+        expect(page.locator('#menu')).to_be_hidden()
+        expect(toggle).to_be_focused()
+        self.menu(page, '#auto-continue').click()
+        expect(page.locator('#menu')).to_be_hidden()
+        expect(toggle).to_be_focused()
+        expect(page.locator('#auto-continue-status')).to_be_hidden()
+
     def test_auto_continue_finishes_only_after_the_agent_disables_it(self):
         page = self.session(self.page)
         expect(page.locator('#auto-continue')).to_have_text('Auto-continue: off')
-        page.click('#auto-continue')
+        self.menu(page, '#auto-continue').click()
         expect(page.locator('#auto-continue')).to_have_attribute('aria-pressed', 'true')
         self.assertEqual(len(self.requests), 0, 'Enabling does not start a task')
         self.submit(page, 'Alpha autonomy')
@@ -3040,7 +3076,7 @@ context_window = 100000
 
     def test_auto_continue_persists_and_can_be_disabled_during_live_work(self):
         page = self.session(self.page)
-        page.click('#auto-continue')
+        self.menu(page, '#auto-continue').click()
         expect(page.locator('#auto-continue')).to_have_text('Auto-continue: on')
         self.stop(self.process)
         self.process, _ = self.launch(urlsplit(self.origin).port)
@@ -3049,7 +3085,7 @@ context_window = 100000
         self.assertEqual(len(self.requests), 0, 'Restart must not start the saved mode')
         self.submit(page, 'Alpha wait')
         expect(page.locator('.tool.running')).to_have_count(1)
-        page.click('#auto-continue')
+        self.menu(page, '#auto-continue').click()
         expect(page.locator('#auto-continue')).to_have_text('Auto-continue: off')
         expect(page.locator('.tool.running')).to_have_count(1)
         (self.home / 'Alpha-release').touch()
@@ -3064,7 +3100,7 @@ context_window = 100000
     def test_auto_continue_retries_transient_and_terminal_errors_without_reaccepting_input(self):
         self.autonomy_failures = [503, 400]
         page = self.session(self.page)
-        page.click('#auto-continue')
+        self.menu(page, '#auto-continue').click()
         self.submit(page, 'Alpha autonomy')
         expect(page.locator('#connection')).to_have_text('Retrying')
         expect(page.locator('#connection')).to_have_attribute('data-busy', 'true')
@@ -3086,11 +3122,11 @@ context_window = 100000
     def stop_automatic_retry(self, control):
         self.autonomy_failures = [400] * 20
         page = self.session(self.page)
-        page.click('#auto-continue')
+        self.menu(page, '#auto-continue').click()
         self.submit(page, 'Alpha autonomy')
         expect(page.locator('#connection')).to_have_text('Retrying')
         times = self.saved_session(page)['threads'][-1]['user_turn_timestamps']
-        page.click(control)
+        (self.menu(page, control) if control == '#auto-continue' else page.locator(control)).click()
         expect(page.locator('#connection')).to_have_text('Stopped')
         expect(page.locator('#connection')).to_have_attribute('data-busy', 'false')
         attempts = len(self.requests)
@@ -3120,7 +3156,7 @@ context_window = 100000
         answer = [{'choices': [{'delta': {'content': 'Valid recovery.'}, 'finish_reason': 'stop'}]}]
         self.completion_replies = [malformed, malformed, disable, answer]
         page = self.session(self.page)
-        page.click('#auto-continue')
+        self.menu(page, '#auto-continue').click()
         self.submit(page, 'Finish the task')
         expect(page.locator('#connection')).to_have_text('Retrying')
         expect(page.locator('#transcript')).not_to_contain_text('Abandoned invalid tool turn')
@@ -3144,7 +3180,7 @@ context_window = 100000
 
     def test_auto_continue_stream_retry_discards_drafts_and_keeps_completed_tools(self):
         page = self.session(self.page)
-        page.click('#auto-continue')
+        self.menu(page, '#auto-continue').click()
         self.submit(page, 'Alpha wait')
         expect(page.locator('.tool.running')).to_have_count(1)
         self.stream_interruption_release = threading.Event()
@@ -3163,7 +3199,7 @@ context_window = 100000
             expect(tab.locator('#transcript')).not_to_contain_text('Abandoned automatic answer')
             expect(tab.locator('.tool')).to_have_count(1)
         expect(page.locator('#connection')).to_have_text('Running')
-        page.click('#auto-continue')
+        self.menu(page, '#auto-continue').click()
         self.event_gates[0].set()
         for tab in [page, other]:
             expect(tab.locator('#connection')).to_have_text('Ready')
@@ -3184,7 +3220,7 @@ context_window = 100000
         other.goto(page.url)
         home = self.context.new_page()
         home.goto(self.origin)
-        page.get_by_role('button', name='Rename session', exact=True).click()
+        self.menu(page, page.get_by_role('button', name='Rename session', exact=True)).click()
         expect(page.get_by_label('Session name', exact=True)).to_have_value('Alpha wait')
         name = 'Review <Myco> — 雨'
         page.get_by_label('Session name', exact=True).fill('  ' + name + '  ')
@@ -3197,11 +3233,11 @@ context_window = 100000
         expect(home.locator('.session-name')).to_have_text(name)
         self.assertTrue(card.evaluate('node => node.isConnected'))
         expect(page.locator('#prompt')).to_have_value('Keep this draft')
-        page.get_by_role('button', name='Rename session', exact=True).click()
+        self.menu(page, page.get_by_role('button', name='Rename session', exact=True)).click()
         page.get_by_label('Session name', exact=True).fill('Discard me')
         page.get_by_label('Session name', exact=True).press('Escape')
         expect(page.locator('#session-title')).to_have_text(name)
-        expect(page.get_by_role('button', name='Rename session', exact=True)).to_be_focused()
+        expect(page.locator('#menu-toggle')).to_be_focused()
         (self.home / 'Alpha-release').touch()
         expect(page.locator('#connection')).to_have_text('Ready')
         page.reload()
@@ -3211,7 +3247,7 @@ context_window = 100000
     def test_rename_saved_and_archived_sessions_survives_restart_without_starting_them(self):
         page = self.session(self.page)
         session_id = page.url.rsplit('/', 1)[1]
-        page.click('#archive')
+        self.menu(page, '#archive').click()
         expect(page).to_have_url(self.origin + '/profiles/default/')
         expect(page.locator('#archive-notice')).to_be_visible()
         expect(page.locator('#session-list a')).to_have_count(0)
@@ -3244,7 +3280,7 @@ context_window = 100000
                                   ({'session_id': 'wrong', 'title': 'Wrong session'}, 409)]:
             response = self.context.request.post(endpoint, data=payload)
             self.assertEqual(response.status, expected, response.text())
-        page.get_by_role('button', name='Rename session', exact=True).click()
+        self.menu(page, page.get_by_role('button', name='Rename session', exact=True)).click()
         page.get_by_label('Session name', exact=True).fill('Keep this rename')
         store = self.home / 'profiles/default/session'
         moved = store.with_name('saved-session')
@@ -3809,8 +3845,12 @@ context_window = 100000
             page.set_viewport_size({"width": width, "height": 844})
             self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"), width)
             expect(page.locator("#composer")).to_be_in_viewport()
-            for control in page.locator('.toolbar-actions button, #new-session').all():
+            for control in page.locator('.toolbar-tools > button, #new-session').all():
                 expect(control).to_be_in_viewport(ratio=1)
+            page.click('#menu-toggle')
+            for entry in page.locator('#menu button').all():
+                expect(entry).to_be_in_viewport(ratio=1)
+            page.keyboard.press('Escape')
 
     def test_session_archive_redirects_and_undo_survives_reload_within_its_profile(self):
         self.add_profile()
@@ -3832,17 +3872,17 @@ context_window = 100000
         expect(observer.locator('#archived-status')).to_be_hidden()
         for width in [320, 390, 1200]:
             page.set_viewport_size({'width': width, 'height': 850})
-            expect(page.get_by_role('button', name='Archive', exact=True)).to_be_visible()
+            expect(self.menu(page, page.get_by_role('button', name='Archive', exact=True))).to_be_visible()
             self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), width)
             page.screenshot(path=str(self.artifacts / f'session-{width}.png'))
-        page.get_by_role('button', name='Archive', exact=True).click()
+        self.menu(page, page.get_by_role('button', name='Archive', exact=True)).click()
         expect(page).to_have_url(prefix + '/')
         notice = page.locator('#archive-notice')
         expect(notice).to_contain_text('Session Archived.')
         expect(page.locator('#session-list li')).to_have_count(0)
         expect(default.locator('#archived-status')).to_be_hidden()
         expect(observer.locator('#archived-status')).to_have_text('Archived')
-        expect(observer.get_by_role('button', name='Restore', exact=True)).to_be_visible()
+        expect(self.menu(observer, observer.get_by_role('button', name='Restore', exact=True))).to_be_visible()
         for width in [320, 390, 1200]:
             observer.set_viewport_size({'width': width, 'height': 850})
             expect(observer.locator('#archived-status')).to_be_in_viewport()
@@ -3857,7 +3897,7 @@ context_window = 100000
         notice.get_by_role('button', name='Undo', exact=True).click()
         expect(notice).to_be_hidden()
         expect(observer.locator('#archived-status')).to_be_hidden()
-        expect(observer.get_by_role('button', name='Archive', exact=True)).to_be_visible()
+        expect(self.menu(observer, observer.get_by_role('button', name='Archive', exact=True))).to_be_visible()
         expect(page.locator('#session-list a')).to_have_attribute('href', f'/profiles/research/sessions/{session_id}')
         expect(page.locator('#session-list a')).to_be_focused()
         page.reload()
@@ -3870,12 +3910,12 @@ context_window = 100000
         url = page.url
         page.fill('#prompt', 'Preserve this draft if archiving fails.')
         page.route('**/archive', lambda route: route.fulfill(status=500, body='Archive unavailable'), times=1)
-        page.get_by_role('button', name='Archive', exact=True).click()
+        self.menu(page, page.get_by_role('button', name='Archive', exact=True)).click()
         expect(page.locator('#error')).to_have_text('Archive unavailable')
         expect(page).to_have_url(url)
         expect(page.locator('#prompt')).to_have_value('Preserve this draft if archiving fails.')
         expect(page.locator('#archive')).to_be_enabled()
-        page.click('#archive')
+        self.menu(page, '#archive').click()
         expect(page.locator('#archive-notice')).to_be_visible()
         page.route('**/archive', lambda route: route.fulfill(status=500, body='Restore unavailable'), times=1)
         page.click('#undo-archive')
@@ -3893,19 +3933,19 @@ context_window = 100000
     def test_restoring_from_the_session_keeps_its_draft_and_reports_failures(self):
         page = self.session(self.page)
         url = page.url
-        page.click('#archive')
+        self.menu(page, '#archive').click()
         expect(page.locator('#archive-notice')).to_be_visible()
         page.goto(url)
         expect(page.locator('#archived-status')).to_be_visible()
         page.fill('#prompt', 'Keep this draft when restoring.')
         page.route('**/archive', lambda route: route.fulfill(status=500, body='Restore unavailable'), times=1)
-        page.get_by_role('button', name='Restore', exact=True).click()
+        self.menu(page, page.get_by_role('button', name='Restore', exact=True)).click()
         expect(page.locator('#error')).to_have_text('Restore unavailable')
         expect(page.locator('#archived-status')).to_be_visible()
-        expect(page.get_by_role('button', name='Restore', exact=True)).to_be_enabled()
-        page.get_by_role('button', name='Restore', exact=True).click()
+        expect(self.menu(page, page.get_by_role('button', name='Restore', exact=True))).to_be_enabled()
+        self.menu(page, page.get_by_role('button', name='Restore', exact=True)).click()
         expect(page.locator('#archived-status')).to_be_hidden()
-        expect(page.get_by_role('button', name='Archive', exact=True)).to_be_enabled()
+        expect(self.menu(page, page.get_by_role('button', name='Archive', exact=True))).to_be_enabled()
         expect(page).to_have_url(url)
         expect(page.locator('#prompt')).to_have_value('Keep this draft when restoring.')
         page.reload()
@@ -3920,7 +3960,7 @@ context_window = 100000
         page.fill('#prompt', 'Beta images')
         page.press('#prompt', 'Enter')
         expect(page.locator('#queued-list .queued-content')).to_have_text('Beta images')
-        page.click('#archive')
+        self.menu(page, '#archive').click()
         expect(page.locator('#archive-notice')).to_be_visible()
         page.click('#undo-archive')
         expect(page.locator('#session-list .session-status')).to_have_text('Running')

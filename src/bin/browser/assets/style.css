@@ -49,8 +49,6 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .brand span { color: var(--dim); }
 #profile-switcher { min-width: 0; max-width: 140px; padding: 4px 6px; font-size: 12px; }
 #session-title { flex: 1; min-width: 0; margin: 0; padding-left: 16px; border-left: 1px solid var(--line); font: inherit; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.toolbar #rename { flex: none; display: inline-flex; padding: 6px; color: var(--dim); }
-#rename svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.5; }
 .toolbar-actions, .toolbar-tools { display: flex; align-items: center; gap: 8px; }
 .toolbar-tools { flex-wrap: wrap; justify-content: flex-end; }
 .toolbar-actions { flex: none; flex-wrap: wrap; gap: 12px; }
@@ -77,7 +75,8 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 #session-list a:focus-visible { outline: 2px solid var(--cyan); outline-offset: 4px; }
 .session-name, .session-meta, .session-id { display: block; }
 .session-name { color: var(--green); font-weight: 700; margin-bottom: 5px; }
-.session-state { display: flex; flex: none; flex-direction: column; align-items: flex-start; gap: 4px; }
+.session-state { display: flex; flex: none; align-items: center; gap: 8px; }
+#auto-continue-status { color: var(--cyan); }
 .archive-indicator { display: inline-block; padding: 0 6px; border: 1px solid var(--glass-border); color: var(--dim); font-size: 12px; white-space: nowrap; }
 .activity-indicator { display: inline-flex; align-items: center; gap: 8px; color: var(--dim); white-space: nowrap; }
 .activity-indicator::before { content: ''; flex: none; width: 7px; height: 7px; background: currentColor; }
@@ -245,9 +244,15 @@ html.viewing-image { overflow: hidden; }
 .inbox-event button { margin-top: 6px; }
 .active-call { position: relative; --rim-color: #fff; display: block; width: 100%; text-align: left; border: 2px solid var(--rim-color); background: var(--glass-control); color: var(--rim-color); padding: 10px 12px; white-space: normal; overflow-wrap: anywhere; }
 .active-call:hover { border-color: var(--rim-color); text-decoration: underline; }
+/* Toolbar menu */
+.toolbar #menu-toggle { display: inline-flex; align-items: center; justify-content: center; width: 36px; padding: 8px; }
+#menu-toggle svg { display: block; width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2.5; stroke-linecap: round; }
+#menu { inset: auto; margin: 0; min-width: 210px; padding: 6px; border: 1px solid var(--glass-border); background: var(--glass-panel); backdrop-filter: blur(32px); color: inherit; box-shadow: var(--glass-shadow); }
+#menu:popover-open { display: grid; gap: 2px; }
+#menu button { width: 100%; padding: 6px 10px; border-color: transparent; background: transparent; color: #e6e6e6; text-align: left; }
+#menu button:hover:not(:disabled), #menu button:focus-visible { border-color: var(--glass-border); background: rgb(var(--glass-tint) / .6); }
+#menu button[aria-pressed="true"] { color: var(--cyan); }
 /* Settings modal */
-.toolbar #settings-toggle { display: inline-flex; align-items: center; justify-content: center; width: 36px; padding: 8px; }
-#settings-toggle svg { display: block; width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.5; }
 #settings, #rename-session { position: fixed; inset: 0; margin: auto; width: 520px; max-width: calc(100% - 32px); max-height: calc(100dvh - 32px); overflow: auto; padding: 24px; border: 1px solid var(--glass-border); border-radius: 0; background: var(--glass-panel); backdrop-filter: blur(32px); color: inherit; box-shadow: var(--glass-shadow); }
 #settings::backdrop, #rename-session::backdrop { background: #00000040; }
 .settings-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--line); }
@@ -299,10 +304,11 @@ html.viewing-image { overflow: hidden; }
 @media (max-width: 760px) {
   :root { --toolbar-height: 89px; }
   .toolbar-inner { flex-wrap: wrap; gap: 8px 12px; min-height: 88px; padding: 10px 16px; }
-  .toolbar-heading { gap: 12px; }
+  .toolbar-heading { flex-basis: 100%; gap: 12px; }
+  #auto-continue-status span { display: none; }
   #session-title { padding-left: 12px; }
   .session-actions { flex-direction: column; }
-  .toolbar-actions { flex-basis: 100%; justify-content: flex-end; gap: 10px; }
+  .toolbar-actions { flex: 1; justify-content: flex-end; gap: 10px; }
   .toolbar button { font-size: 12px; padding-inline: 6px; }
 }
 @media (max-width: 650px) {
