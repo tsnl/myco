@@ -54,10 +54,7 @@ Actions (`action` is required):
   memory use or open files — without guessing which `myco` is you (nested agents
   are separate `myco` processes with their own pids).
 
-Use this tool (not bash/editor) for session files. Titles appear in `/sessions`: as soon as
-the real task is clear (usually first turn), set_title a short scannable label — replace a
-default auto-title from the first user line. When the session focus shifts, update the
-title; do not leave a stale first-line title for long work. When you create a worktree or
+Use this tool (not bash/editor) for session files. When you create a worktree or
 open/receive a PR, add_link it (absolute path + host for worktrees).
 "#;
 
