@@ -14,8 +14,17 @@ function anchorMenu(toggle, menu) {
   window.addEventListener('resize', () => { if (menu.matches(':popover-open')) place(); });
   // An entry's own handler runs first; the menu then closes behind it.
   menu.addEventListener('click', event => {
-    if (event.target.closest('button') && menu.matches(':popover-open')) menu.hidePopover();
+    if (event.target.closest('button, a') && menu.matches(':popover-open')) menu.hidePopover();
   });
+}
+
+// The issue form opens in another tab; nothing is sent until it is submitted.
+function feedbackEntry() {
+  const link = document.createElement('a');
+  link.id = 'feedback'; link.textContent = 'Feedback';
+  link.href = 'https://github.com/tsnl/myco/issues/new';
+  link.target = '_blank'; link.rel = 'noopener noreferrer';
+  return link;
 }
 
 //
@@ -59,7 +68,7 @@ export function createSettings() {
       <button id="settings-close" type="button" aria-label="Close settings" autofocus>×</button></header>
     <div id="settings-content"></div>`;
   anchorMenu(toggle, menu);
-  menu.append(button);
+  menu.append(button, feedbackEntry());
   document.body.append(dialog);
   bindModal(button, dialog, toggle);
   return dialog.querySelector('#settings-content');
