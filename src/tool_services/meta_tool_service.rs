@@ -54,10 +54,7 @@ Actions (`action` is required):
   memory use or open files — without guessing which `myco` is you (nested agents
   are separate `myco` processes with their own pids).
 
-Use this tool (not bash/editor) for session files. Titles appear in `/sessions`: as soon as
-the real task is clear (usually first turn), set_title a short scannable label — replace a
-default auto-title from the first user line. When the session focus shifts, update the
-title; do not leave a stale first-line title for long work. When you create a worktree or
+Use this tool (not bash/editor) for session files. When you create a worktree or
 open/receive a PR, add_link it (absolute path + host for worktrees).
 "#;
 
@@ -414,6 +411,18 @@ mod tests {
     fn tool_with_session(session: Session) -> (SessionMetaTool, ActiveSession) {
         let active = ActiveSession::new(session);
         (SessionMetaTool::new(active.clone()), active)
+    }
+
+    /// Titles change when the user asks: the tool offers `set_title` without
+    /// telling the agent when to call it.
+    #[test]
+    fn the_description_offers_set_title_without_asking_the_agent_to_use_it() {
+        let mentions: Vec<_> = TOOL_DESCRIPTION
+            .lines()
+            .filter(|line| line.contains("set_title"))
+            .collect();
+        assert_eq!(mentions.len(), 1, "{mentions:?}");
+        assert!(mentions[0].starts_with("- set_title:"), "{mentions:?}");
     }
 
     #[tokio::test]
