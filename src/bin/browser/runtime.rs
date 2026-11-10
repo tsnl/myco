@@ -965,7 +965,7 @@ impl Sessions {
                     } else {
                         ArchiveFilter::Active
                     };
-                    myco::session::list_sessions_with_filter(0, false, filter)
+                    myco::session::list_sessions_with_filter(false, filter)
                 })
                 .await
                 .map_err(|e| Error::Internal(e.to_string()))?

@@ -77,10 +77,6 @@ impl HostWorker {
         .collect()
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
     pub fn tool_specs(&self) -> Vec<generative_model::ToolSpec> {
         self.services
             .iter()

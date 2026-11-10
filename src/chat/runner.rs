@@ -202,24 +202,6 @@ impl SessionRunner {
         Ok(())
     }
 
-    pub async fn bind_runtime(
-        &mut self,
-        runtime: Arc<SessionRuntime>,
-    ) -> Result<(), AgentInteractionError> {
-        let session = runtime.session().clone();
-        let _writer = session.writer().await;
-        runtime.bind_agent(&mut self.agent)?;
-        wire_checkpoint(&mut self.agent, runtime.session());
-        self.runtime = runtime;
-        self.workflow.auto_ineffective = false;
-        self.workflow.resume_notice = true;
-        self.forked = false;
-        self.workflow
-            .record_runtime(&mut self.agent, &self.runtime)
-            .await?;
-        Ok(())
-    }
-
     pub async fn submit(
         &mut self,
         input: Vec<Content>,

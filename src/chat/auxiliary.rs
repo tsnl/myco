@@ -367,11 +367,12 @@ mod tests {
     }
 
     fn child_of(parent: &Session) -> Session {
-        let children: Vec<_> = crate::session::list_all_sessions_including_hidden()
-            .unwrap()
-            .into_iter()
-            .filter(|session| session.parent_session_id.as_deref() == Some(&parent.id))
-            .collect();
+        let children: Vec<_> =
+            crate::session::list_sessions_with_filter(true, crate::session::ArchiveFilter::All)
+                .unwrap()
+                .into_iter()
+                .filter(|session| session.parent_session_id.as_deref() == Some(&parent.id))
+                .collect();
         assert_eq!(children.len(), 1);
         Session::load_by_id_or_prefix(&children[0].id).unwrap()
     }
@@ -425,7 +426,7 @@ mod tests {
             );
             assert!(child.active_thread().pending_operation.is_none());
             assert_eq!(std::fs::read(parent.json_path()).unwrap(), original);
-            assert_eq!(crate::session::list_all_sessions().unwrap().len(), 1);
+            assert_eq!(crate::session::list_sessions().unwrap().len(), 1);
             assert_eq!(model.remaining(), 0);
             assert!(SessionWriteLock::acquire(&child.id).is_ok());
         });

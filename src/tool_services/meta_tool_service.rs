@@ -159,8 +159,7 @@ impl SessionMetaTool {
         archive_filter: crate::session::ArchiveFilter,
     ) -> Result<String, String> {
         let limit = limit.unwrap_or(20);
-        let mut list =
-            crate::session::list_sessions_with_filter(0, include_hidden, archive_filter)?;
+        let mut list = crate::session::list_sessions_with_filter(include_hidden, archive_filter)?;
         let mut header = String::new();
         match query {
             None => {
