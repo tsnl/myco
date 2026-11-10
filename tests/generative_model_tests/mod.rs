@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use futures::StreamExt;
 use myco::generative_model::{Content, GenerateOutput, GenerativeModel, Message, TurnEndReason};
 
 mod anthropic;
@@ -58,23 +57,4 @@ pub async fn test_generative_model_messaging(model: Arc<dyn GenerativeModel>) {
             turn_end_reason: Some(output.turn_end_reason),
         });
     }
-}
-
-/// Collect a full stream without going through GenerateOutput (sanity).
-#[allow(dead_code)]
-pub async fn drain_turn_end_reason(
-    model: &dyn GenerativeModel,
-    history: &[Message],
-) -> TurnEndReason {
-    let mut stream = model.generate(history);
-    let mut reason = None;
-    while let Some(part) = stream.next().await {
-        if let myco::generative_model::GenerationEvent::Part(
-            myco::generative_model::MessagePart::TurnEndReason(r),
-        ) = part
-        {
-            reason = Some(r);
-        }
-    }
-    reason.expect("stream should end with TurnEndReason")
 }

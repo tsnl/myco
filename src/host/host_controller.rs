@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::Instant;
@@ -22,7 +22,7 @@ use tokio::time::Instant;
 use crate::core::{CancelToken, ToolResource};
 use crate::generative_model::{ToolResult, ToolSpec, ToolUse};
 use crate::host::HostWorker;
-use crate::host::protocol::{HOST_PROTOCOL_VERSION, Request, Response};
+use crate::host::protocol::{HOST_PROTOCOL_VERSION, Request, Response, read_line};
 use crate::tool_services::HostDispatchContext;
 
 /// A remote tool gets its requested timeout plus this much time to return its
@@ -959,25 +959,6 @@ async fn write_all(w: &mut ChildStdin, bytes: &[u8]) -> Result<(), String> {
         .map_err(|e| format!("write: {e}"))?;
     w.flush().await.map_err(|e| format!("flush: {e}"))?;
     Ok(())
-}
-
-async fn read_line(r: &mut BufReader<ChildStdout>) -> Result<String, String> {
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = r
-            .read_line(&mut line)
-            .await
-            .map_err(|e| format!("read: {e}"))?;
-        if n == 0 {
-            return Err("peer closed".into());
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        return Ok(trimmed.to_string());
-    }
 }
 
 async fn run_writer(

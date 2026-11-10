@@ -25,7 +25,8 @@ pub fn mib(bytes: u64) -> String {
 
 /// Media types the model APIs accept. `infer` recognizes far more formats
 /// than this, so detection is filtered down to what we can actually send.
-const SUPPORTED_MEDIA_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+pub(super) const SUPPORTED_MEDIA_TYPES: [&str; 4] =
+    ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
 /// Whether a path *looks* like an image by extension.
 ///

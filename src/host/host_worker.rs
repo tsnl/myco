@@ -7,12 +7,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 use crate::core::{CancelToken, ToolResource};
 use crate::generative_model::{self, ToolUse};
-use crate::host::protocol::{HOST_PROTOCOL_VERSION, Request, Response};
+use crate::host::protocol::{HOST_PROTOCOL_VERSION, Request, Response, read_line};
 use crate::tool_services::{
     BashService, HostDispatchContext, SkillsService, TextEditorService, ToolService,
     ViewImageService,
@@ -330,25 +330,6 @@ fn build_tool_to_service_map(
     map
 }
 
-async fn read_line(r: &mut (impl AsyncBufReadExt + Unpin)) -> Result<String, String> {
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = r
-            .read_line(&mut line)
-            .await
-            .map_err(|e| format!("read: {e}"))?;
-        if n == 0 {
-            return Err("peer closed".into());
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        return Ok(trimmed.to_string());
-    }
-}
-
 /// Lock the shared writer and send one response (concurrent tasks serialize here).
 async fn write_locked<W>(writer: &Arc<Mutex<W>>, msg: &Response) -> Result<(), String>
 where
@@ -361,6 +342,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncBufReadExt;
 
     #[tokio::test]
     async fn completed_requests_are_reaped_before_peer_disconnects() {

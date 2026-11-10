@@ -108,6 +108,28 @@ impl Response {
     }
 }
 
+/// The next message from a peer: one non-empty line, without its newline.
+pub(super) async fn read_line(
+    r: &mut (impl tokio::io::AsyncBufReadExt + Unpin),
+) -> Result<String, String> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = r
+            .read_line(&mut line)
+            .await
+            .map_err(|e| format!("read: {e}"))?;
+        if n == 0 {
+            return Err("peer closed".into());
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        return Ok(trimmed.to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

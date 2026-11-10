@@ -14,7 +14,6 @@ use crate::generative_model::{
 };
 
 const PREFIX: &str = "myco-image:sha256:";
-const MEDIA_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
 #[derive(Clone)]
 pub struct ImageStore {
@@ -59,7 +58,7 @@ impl ImageStore {
         } else {
             ("image/png", source)
         };
-        if !MEDIA_TYPES.contains(&mime) {
+        if !super::image::SUPPORTED_MEDIA_TYPES.contains(&mime) {
             return Err(format!("unsupported image media type {mime:?}"));
         }
         let bytes = base64::engine::general_purpose::STANDARD
@@ -181,7 +180,7 @@ fn parse_reference(source: &str) -> Result<(&str, &str), String> {
         || !hash
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        || !MEDIA_TYPES.contains(&mime)
+        || !super::image::SUPPORTED_MEDIA_TYPES.contains(&mime)
     {
         return Err("invalid image sidecar hash or media type".into());
     }
