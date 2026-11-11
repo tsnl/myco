@@ -157,7 +157,6 @@ fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc:
                 context_window_tokens: 100_000,
                 busy: false,
                 status: "Ready".into(),
-                tasks: vec![],
                 queued: VecDeque::new(),
                 timers: vec![],
                 inbox: vec![],
@@ -515,12 +514,12 @@ fn title_changes_reach_live_metadata_and_invalidate_session_listings() {
     });
     app.live.lock().unwrap().snapshot.busy = true;
     let mut updates = app.events.subscribe();
-    app.refresh(&active, vec![]);
+    app.refresh_metadata(&active);
     let update = updates.try_recv().unwrap();
     assert_eq!(update.change["meta"]["title"], "Renamed while running");
     assert_eq!(update.change["meta"]["busy"], true);
     assert_eq!(app.generation.load(Ordering::Relaxed), 1);
-    app.refresh(&active, vec![]);
+    app.refresh_metadata(&active);
     assert!(updates.try_recv().is_err());
     assert_eq!(
         app.snapshot().change["snapshot"]["title"],
@@ -566,13 +565,13 @@ fn recorded_usage_reaches_live_and_reconnect_metadata_without_inventing_unknown_
         None,
     ] {
         active.with_mut(|session| session.replace_context(vec![], usage));
-        app.refresh(&active, vec![]);
+        app.refresh_metadata(&active);
         let update = updates.try_recv().unwrap();
         assert_eq!(update.change["meta"]["usage"], json!(usage));
         assert_eq!(update.change["meta"]["context_window_tokens"], 100_000);
         assert_eq!(update.change["meta"]["busy"], true);
         assert_eq!(app.snapshot().change["snapshot"]["usage"], json!(usage));
-        app.refresh(&active, vec![]);
+        app.refresh_metadata(&active);
         assert!(updates.try_recv().is_err());
     }
     assert_eq!(app.generation.load(Ordering::Relaxed), 0);
@@ -847,29 +846,6 @@ fn resource_observations_distinguish_hosts_reused_handles_and_unknown_connection
     assert_eq!(blocks[0]["status"], "not running");
     assert_eq!(blocks[1]["running"], true);
     assert_eq!(blocks[2]["running"], true);
-}
-
-#[tokio::test]
-async fn background_tasks_update_idle_clients_and_survive_reconnect() {
-    let (app, _) = app();
-    let server = server(std::slice::from_ref(&app));
-    let response = events(State(server.clone())).await.into_response();
-    let mut stream = response.into_body().into_data_stream();
-    let _ = stream.next().await.unwrap().unwrap();
-    let tasks = vec!["bash session build: cargo build (up 1s, idle 1s)".into()];
-    app.tasks(tasks.clone());
-    let updated = event_data(&stream.next().await.unwrap().unwrap());
-    assert_eq!(updated["change"], json!({"kind":"tasks", "tasks":tasks}));
-    assert_eq!(app.snapshot().change["snapshot"]["busy"], false);
-    app.tasks(tasks.clone());
-    assert_eq!(app.snapshot().revision, updated["revision"]);
-    let response = events(State(server)).await.into_response();
-    let mut reconnect = response.into_body().into_data_stream();
-    let snapshot = event_data(&reconnect.next().await.unwrap().unwrap());
-    assert_eq!(snapshot["change"]["snapshot"]["tasks"], json!(tasks));
-    app.tasks(vec![]);
-    let cleared = event_data(&stream.next().await.unwrap().unwrap());
-    assert_eq!(cleared["change"], json!({"kind":"tasks", "tasks":[]}));
 }
 
 #[test]

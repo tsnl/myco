@@ -136,10 +136,11 @@ impl App {
                 let at = if existing {
                     input.at.as_deref().map(parse_time).transpose()?
                 } else if timer || input.after_seconds.is_some() || input.at.is_some() {
-                    Some(
-                        timer_deadline(input.after_seconds, input.at.as_deref(), self.clock.now())?
-                            .1,
-                    )
+                    Some(timer_deadline(
+                        input.after_seconds,
+                        input.at.as_deref(),
+                        self.clock.now(),
+                    )?)
                 } else {
                     None
                 };
@@ -211,7 +212,7 @@ impl App {
         at: Option<&str>,
         message: String,
     ) -> Result<Timer> {
-        let (_, due_at) = timer_deadline(after, at, self.clock.now())?;
+        let due_at = timer_deadline(after, at, self.clock.now())?;
         let entry = self.post_event(
             EventRequest {
                 event_id: Uuid::new_v4(),
@@ -247,7 +248,7 @@ impl App {
             .create(request, source, self.clock.now())
             .map_err(Error::Invalid)?;
         self.refresh_inbox(&mut live);
-        self.publish_queue(&mut live.snapshot);
+        self.publish_metadata(&mut live.snapshot);
         drop(live);
         self.fire_timers();
         Ok(entry)
@@ -261,7 +262,7 @@ impl App {
         let mut live = self.live.lock().unwrap();
         self.remove_timer(&mut live, id)?;
         self.drain_queue(&mut live)?;
-        self.publish_queue(&mut live.snapshot);
+        self.publish_metadata(&mut live.snapshot);
         Ok(())
     }
 
@@ -322,20 +323,13 @@ impl App {
         }
         self.refresh_inbox(&mut live);
         if live.snapshot.metadata() != previous {
-            self.publish_queue(&mut live.snapshot);
+            self.publish_metadata(&mut live.snapshot);
         }
     }
 
     fn queue_events(&self, live: &mut Live) -> Result<()> {
         let now = self.clock.now();
-        live.inbox.expire(now).map_err(Error::Internal)?;
-        live.snapshot.queued.retain(|message| {
-            message.timer.is_none()
-                || live
-                    .inbox
-                    .get(message.request_id)
-                    .is_some_and(|entry| entry.state.active())
-        });
+        self.expire_events(live, now)?;
         if live.snapshot.status == "Cancelling" {
             return Ok(());
         }
@@ -473,13 +467,7 @@ impl App {
         {
             return;
         }
-        let index = live.snapshot.blocks.len();
-        let block = Block::Notice { text };
-        live.snapshot.blocks.push(block.clone());
-        self.publish(
-            &mut live.snapshot,
-            serde_json::json!({"kind":"block", "index":index, "block":block}),
-        );
+        self.push_block(&mut live.snapshot, Block::Notice { text });
     }
 
     pub(super) async fn tick_timers(&self) {
@@ -526,7 +514,7 @@ fn timer_deadline(
     after: Option<f64>,
     at: Option<&str>,
     now: DateTime<Utc>,
-) -> Result<(Duration, DateTime<Utc>)> {
+) -> Result<DateTime<Utc>> {
     let (seconds, absolute) = match (after, at) {
         (Some(seconds), None) => (seconds, None),
         (None, Some(at)) => {
@@ -545,11 +533,8 @@ fn timer_deadline(
             "Timer must be between 0.1 seconds and 30 days in the future.".into(),
         ));
     }
-    let delay = Duration::from_secs_f64(seconds);
-    Ok((
-        delay,
-        absolute.unwrap_or_else(|| {
-            now + chrono::Duration::from_std(delay).expect("bounded timer duration")
-        }),
-    ))
+    Ok(absolute.unwrap_or_else(|| {
+        let delay = Duration::from_secs_f64(seconds);
+        now + chrono::Duration::from_std(delay).expect("bounded timer duration")
+    }))
 }

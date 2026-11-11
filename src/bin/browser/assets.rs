@@ -35,7 +35,6 @@ const ASSETS: &[(&str, &str)] = &[
     ("/common.js", include_str!("assets/common.js")),
     ("/scope.js", include_str!("assets/scope.js")),
     ("/profiles.js", include_str!("assets/profiles.js")),
-    ("/events.js", include_str!("assets/events.js")),
     ("/style.css", include_str!("assets/style.css")),
     ("/well-width.js", include_str!("assets/well-width.js")),
     ("/settings.js", include_str!("assets/settings.js")),

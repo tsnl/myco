@@ -197,36 +197,6 @@ impl ToolService for BashService {
         self.reap_owner(agent_id);
     }
 
-    fn running_tool_summaries(&self, agent_id: Uuid) -> Vec<String> {
-        let sessions = self.sessions();
-        let mut lines: Vec<String> = sessions
-            .iter()
-            .filter_map(|(id, s)| {
-                if s.owner != agent_id {
-                    return None;
-                }
-                let buffer = lock_unpoisoned(&s.shared.buffer);
-                if buffer.is_finished() {
-                    return None;
-                }
-                let state = if buffer.exited {
-                    "; process exited, output still open"
-                } else {
-                    ""
-                };
-                let idle = s.last_used.lock().map(|t| t.elapsed()).unwrap_or_default();
-                Some(format!(
-                    "bash session {id}: {} (up {}, idle {}{state})",
-                    summary_cmdline(&s.cmdline),
-                    brief_age(s.created_at.elapsed()),
-                    brief_age(idle),
-                ))
-            })
-            .collect();
-        lines.sort();
-        lines
-    }
-
     fn resources(&self, agent_id: Uuid) -> Vec<crate::core::ToolResource> {
         self.sessions()
             .iter()
@@ -248,26 +218,6 @@ impl ToolService for BashService {
                 }
             })
             .collect()
-    }
-}
-
-/// Cmdline for a one-line session summary: first line only, capped.
-fn summary_cmdline(cmdline: &str) -> String {
-    const MAX_CHARS: usize = 60;
-    let first_line = cmdline.lines().next().unwrap_or_default();
-    match first_line.char_indices().nth(MAX_CHARS) {
-        Some((byte, _)) => format!("{}…", &first_line[..byte]),
-        None => first_line.to_string(),
-    }
-}
-
-/// Compact human age for one-line summaries: `42s`, `7m`, `2h05m`.
-fn brief_age(d: Duration) -> String {
-    let s = d.as_secs();
-    match s {
-        0..=59 => format!("{s}s"),
-        60..=3599 => format!("{}m", s / 60),
-        _ => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
     }
 }
 

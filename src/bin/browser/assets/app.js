@@ -15,7 +15,7 @@ import { showUsage } from './usage.js';
 import { profileName, profilePath, eventsWorker } from './scope.js';
 bindNewSessionLink($('new-session'));
 const transcript = $('transcript'), blocks = $('blocks');
-let state = { blocks: [], tasks: [], busy: false };
+let state = { blocks: [], busy: false };
 let connected = false;
 let revision = -1;
 let follow = true;
@@ -424,7 +424,6 @@ function updateSession(update) {
   if (change.kind === 'snapshot') snapshot(change.snapshot);
   else if (change.kind === 'meta') { Object.assign(state, change.meta); metadata(); }
   else if (change.kind === 'block') { replaceBlock(change.index, change.block, state.blocks[change.index]); state.blocks[change.index] = change.block; navigation.refresh(); activity(); }
-  else if (change.kind === 'tasks') state.tasks = change.tasks;
   else if (change.kind === 'append') {
     const block = state.blocks[change.index]; block.text += change.text;
     // The cached HTML describes the snapshot, not subsequent streamed text.

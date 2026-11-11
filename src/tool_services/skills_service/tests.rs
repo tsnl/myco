@@ -163,7 +163,6 @@ async fn new_owner_and_new_thread_receive_the_catalog_and_cleanup_releases_cache
             .is_some()
     );
     assert!(service.resources(ctx.agent_id).is_empty());
-    assert!(service.running_tool_summaries(ctx.agent_id).is_empty());
     service.on_agent_finished(ctx.agent_id);
     assert!(!service.owners.lock().unwrap().contains_key(&ctx.agent_id));
     assert!(service.observe_successful_call(call, ctx).await.is_some());

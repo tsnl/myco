@@ -233,9 +233,8 @@ Muscle-memory gaps vs Claude Code / Codex / OpenCode.
   - Still rejected as a *user-facing* feature. The narrow automatic case ships:
     a request over the provider's size cap is unretryable (every later turn
     resends it), so `AgentInteractionError::recovery()` reports
-    `Recovery::OmitLastMessage` and the runner calls
-    `Agent::rewind_last_user_turn()` to unwedge the session. No `/rewind`
-    command, no branching.
+    `Recovery::OmitLastMessage` and the runner drops the rejected input to
+    unwedge the session. No `/rewind` command, no branching.
 
 ---
 

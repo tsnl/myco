@@ -1,7 +1,7 @@
 //! Single source of truth for external programs myco spawns.
 //!
 //! Every executable myco launches by name is declared here as an
-//! [`ExternalCommand`]: how it resolves (env override → PATH → well-known
+//! [`ExternalCommand`]: how it resolves (PATH → well-known
 //! dirs), why myco needs it, and when the startup preflight expects it
 //! ([`crate::harness::StartupPreflight`]). Call sites spawn through
 //! [`ExternalCommand::command`] / [`ExternalCommand::tokio_command`], never
@@ -32,8 +32,6 @@ pub struct ExternalCommand {
     /// Short install pointer for the WARNING line.
     pub install_hint: &'static str,
     pub startup_check: StartupCheck,
-    /// Env var consulted before PATH; must point at an existing file.
-    env_override: Option<&'static str>,
     /// Install dirs probed after PATH (GUI-launched processes on macOS often
     /// miss /opt/homebrew/bin in PATH).
     fallback_dirs: &'static [&'static str],
@@ -44,7 +42,6 @@ pub static BASH: ExternalCommand = ExternalCommand {
     purpose: "the bash tool cannot run commands",
     install_hint: "install bash",
     startup_check: StartupCheck::Always,
-    env_override: None,
     fallback_dirs: &[],
 };
 
@@ -53,7 +50,6 @@ pub static GIT: ExternalCommand = ExternalCommand {
     purpose: "eval workspaces cannot be prepared",
     install_hint: "install git",
     startup_check: StartupCheck::Never,
-    env_override: None,
     fallback_dirs: &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"],
 };
 
@@ -62,7 +58,6 @@ pub static SSH: ExternalCommand = ExternalCommand {
     purpose: "remote hosts cannot connect",
     install_hint: "install the OpenSSH client",
     startup_check: StartupCheck::WithSshRemotes,
-    env_override: None,
     fallback_dirs: &[],
 };
 
@@ -71,7 +66,6 @@ pub static SSH_ADD: ExternalCommand = ExternalCommand {
     purpose: "ssh-agent preflight and key unlock cannot run",
     install_hint: "install the OpenSSH client",
     startup_check: StartupCheck::WithSshRemotes,
-    env_override: None,
     fallback_dirs: &[],
 };
 
@@ -80,7 +74,6 @@ pub static SSH_KEYGEN: ExternalCommand = ExternalCommand {
     purpose: "identity fingerprinting for the agent preflight cannot run",
     install_hint: "install the OpenSSH client",
     startup_check: StartupCheck::WithSshRemotes,
-    env_override: None,
     fallback_dirs: &[],
 };
 
@@ -90,7 +83,6 @@ pub static PS: ExternalCommand = ExternalCommand {
     purpose: "process diagnostics in tests",
     install_hint: "install procps",
     startup_check: StartupCheck::Never,
-    env_override: None,
     fallback_dirs: &[],
 };
 
@@ -109,16 +101,9 @@ pub fn expected_at_startup(
 }
 
 impl ExternalCommand {
-    /// Resolve the program: env override → PATH → fallback dirs. `None` means
+    /// Resolve the program: PATH → fallback dirs. `None` means
     /// not installed. Existence check is `is_file` (no executable-bit probe).
     pub fn resolve(&self) -> Option<PathBuf> {
-        if let Some(var) = self.env_override
-            && let Ok(p) = std::env::var(var)
-            && !p.is_empty()
-            && Path::new(&p).is_file()
-        {
-            return Some(PathBuf::from(p));
-        }
         if let Some(hit) = std::env::var_os("PATH").and_then(|path| find_in(self.name, &path)) {
             return Some(hit);
         }

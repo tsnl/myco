@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use super::{Error, Server};
+use super::{Error, Server, blocking};
 use crate::service_protocol::{Identity, Output, Submit};
 
 #[derive(Deserialize)]
@@ -42,9 +42,7 @@ pub(super) async fn submit(
 ) -> Result<StatusCode, Error> {
     validate(&server, &id, input.instance)?;
     let app = server.sessions.open(&id).await?;
-    tokio::task::spawn_blocking(move || app.accept_service(input, id))
-        .await
-        .map_err(|error| Error::Internal(error.to_string()))??;
+    blocking(move || app.accept_service(input, id)).await??;
     Ok(StatusCode::ACCEPTED)
 }
 

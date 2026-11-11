@@ -196,13 +196,6 @@ pub trait ToolService: Send + Sync + 'static {
     /// Default: no-op.
     fn on_agent_finished(&self, _agent_id: uuid::Uuid) {}
 
-    /// One-line summaries of work this service still has running for
-    /// `agent_id` (e.g. live bash sessions), for prompt-time display between
-    /// turns. Must not block. Default: none.
-    fn running_tool_summaries(&self, _agent_id: uuid::Uuid) -> Vec<String> {
-        Vec::new()
-    }
-
     /// Stable inventory of retained state owned by one session runtime.
     /// Implementations must not perform IO or consume buffered output.
     fn resources(&self, _agent_id: uuid::Uuid) -> Vec<ToolResource> {

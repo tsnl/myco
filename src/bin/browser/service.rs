@@ -197,8 +197,7 @@ impl App {
         live.service
             .accepted
             .insert(request.request_id, fingerprint);
-        let change = serde_json::json!({"kind":"meta", "meta":live.snapshot.metadata()});
-        self.publish(&mut live.snapshot, change);
+        self.publish_metadata(&mut live.snapshot);
         Ok(())
     }
 

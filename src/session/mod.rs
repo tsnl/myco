@@ -39,7 +39,6 @@ use crate::generative_model::{Message, TokenUsage};
 
 /// Written schema version; versions 2 through 5 are upgraded on read.
 pub const SESSION_FILE_VERSION: u32 = 6;
-pub const RECENT_SESSION_LIMIT: usize = 10;
 pub const SESSION_LIST_SNIPPET: usize = 48;
 pub const MAX_TITLE_CHARS: usize = 120;
 pub const MAX_SCRATCHPAD_BYTES: usize = 64 * 1024;
@@ -233,12 +232,6 @@ impl ActiveSession {
         }
     }
 
-    pub fn replace(&self, session: Session) {
-        self.begin_checkpoints();
-        let mut guard = self.lock();
-        *guard = session;
-    }
-
     pub(crate) fn begin_checkpoints(&self) -> u64 {
         self.checkpoint_epoch.fetch_add(1, Ordering::SeqCst) + 1
     }
@@ -268,11 +261,7 @@ impl ActiveSession {
         let mut current = self.lock();
         let mut updated = current.clone();
         updated.auto_continue = enabled;
-        updated.touch();
-        updated.externalize_images()?;
-        updated.save()?;
-        *current = updated;
-        Ok(())
+        store(&mut current, updated)
     }
 
     /// Save a title without replacing concurrent conversation or tool updates.
@@ -281,11 +270,7 @@ impl ActiveSession {
         let mut current = self.lock();
         let mut updated = current.clone();
         updated.set_title(Some(title))?;
-        updated.touch();
-        updated.externalize_images()?;
-        updated.save()?;
-        *current = updated;
-        Ok(())
+        store(&mut current, updated)
     }
 
     /// Archive only this session, preserving threads, lineage and live tools.
@@ -409,10 +394,7 @@ impl ActiveSession {
                     None
                 };
             updated.active_thread_mut().last_usage = last_usage;
-            updated.touch();
-            updated.externalize_images()?;
-            updated.save()?;
-            *session = updated;
+            store(&mut session, updated)?;
         }
         Ok(())
     }
@@ -426,10 +408,7 @@ impl ActiveSession {
         if let Some(title) = auto_title_from_text(text) {
             let mut updated = session.clone();
             updated.title = Some(title);
-            updated.touch();
-            updated.externalize_images()?;
-            updated.save()?;
-            *session = updated;
+            store(&mut session, updated)?;
             return Ok(true);
         }
         Ok(false)
@@ -438,6 +417,16 @@ impl ActiveSession {
     fn lock(&self) -> std::sync::MutexGuard<'_, Session> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
+}
+
+/// Save a changed copy before it replaces the live session, so a failed save
+/// leaves the session as it was.
+fn store(current: &mut Session, mut updated: Session) -> Result<(), String> {
+    updated.touch();
+    updated.externalize_images()?;
+    updated.save()?;
+    *current = updated;
+    Ok(())
 }
 
 pub struct SessionWriter {
@@ -458,11 +447,7 @@ impl SessionWriter {
         let mut successor = session.clone();
         successor.threads.push(thread);
         thread::validate_threads(&successor.threads)?;
-        successor.touch();
-        successor.externalize_images()?;
-        successor.save()?;
-        *session = successor;
-        Ok(())
+        store(&mut session, successor)
     }
 }
 
@@ -783,27 +768,20 @@ pub fn session_file_path(id: &str, ext: &str) -> PathBuf {
     }
 }
 
-pub fn list_sessions(limit: usize) -> Result<Vec<SessionListEntry>, String> {
-    list_sessions_filtered(limit, /*include_hidden*/ false)
+/// Active sessions a person started, newest first.
+pub fn list_sessions() -> Result<Vec<SessionListEntry>, String> {
+    list_sessions_with_filter(false, ArchiveFilter::Active)
 }
 
-/// List sessions. When `include_hidden` is false, subagent/compact sessions are omitted.
+/// List sessions, newest first. When `include_hidden` is false, subagent/compact
+/// sessions are omitted.
 ///
 /// Unreadable files (corrupt JSON, wrong [`SESSION_FILE_VERSION`]) are skipped
 /// rather than failing the listing, but never silently: they are reported once
 /// per process. A session that vanishes from
 /// `/sessions` without a word is indistinguishable from one that was never
-/// there, and bare `--resume` would quietly open an *older* session instead of
-/// the newest one.
-pub fn list_sessions_filtered(
-    limit: usize,
-    include_hidden: bool,
-) -> Result<Vec<SessionListEntry>, String> {
-    list_sessions_with_filter(limit, include_hidden, ArchiveFilter::Active)
-}
-
+/// there.
 pub fn list_sessions_with_filter(
-    limit: usize,
     include_hidden: bool,
     archive: ArchiveFilter,
 ) -> Result<Vec<SessionListEntry>, String> {
@@ -816,9 +794,6 @@ pub fn list_sessions_with_filter(
     warn_about_skipped_sessions(&skipped);
 
     metas.sort_by_key(|m| std::cmp::Reverse(m.updated_at));
-    if limit > 0 {
-        metas.truncate(limit);
-    }
     Ok(metas)
 }
 
@@ -855,7 +830,7 @@ fn collect_session_entries(
 
 /// Report unreadable session files on stderr, once per process.
 ///
-/// Listings run several times a session (`/sessions`, bare `/resume`, the
+/// Listings run several times a session (`/sessions`, the
 /// `session_meta` and `list_recent` tools); repeating the same warning each
 /// time would train the reader to ignore it.
 fn warn_about_skipped_sessions(skipped: &[(PathBuf, String)]) {
@@ -878,16 +853,6 @@ fn warn_about_skipped_sessions(skipped: &[(PathBuf, String)]) {
     if skipped.len() > 3 {
         eprintln!("  … and {} more", skipped.len() - 3);
     }
-}
-
-/// List every readable **visible** session (no limit). Wrong-version files are omitted.
-pub fn list_all_sessions() -> Result<Vec<SessionListEntry>, String> {
-    list_sessions(0)
-}
-
-/// List every readable session including hidden (no limit).
-pub fn list_all_sessions_including_hidden() -> Result<Vec<SessionListEntry>, String> {
-    list_sessions_with_filter(0, true, ArchiveFilter::All)
 }
 
 fn session_list_entry_from_path(path: &Path) -> Result<SessionListEntry, String> {
@@ -913,44 +878,6 @@ fn session_list_entry_from_path(path: &Path) -> Result<SessionListEntry, String>
         kind: session.kind,
         parent_session_id: session.parent_session_id,
     })
-}
-
-/// Load a session by id/prefix, or the most recent when `id_or_prefix` is `None`.
-pub fn resolve_and_load_session(id_or_prefix: Option<&str>) -> Result<Session, String> {
-    match id_or_prefix {
-        Some(id) => Session::load_by_id_or_prefix(id),
-        None => load_most_recent_session(),
-    }
-}
-
-/// Most recent visible session without parsing every file: every `touch()` is
-/// followed by an atomic `save()`, so file mtime tracks `updated_at`. Candidates
-/// are parsed newest-first until one is readable, current-version, and visible —
-/// hidden/corrupt/stale files cost a `stat` instead of a full-history parse.
-fn load_most_recent_session() -> Result<Session, String> {
-    let root = session_root()?;
-    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    if root.exists() {
-        for path in iter_sharded_session_files(&root)? {
-            let mtime = fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            candidates.push((mtime, path));
-        }
-    }
-    // Path breaks mtime ties for determinism on coarse-mtime filesystems.
-    candidates.sort();
-    for (_, path) in candidates.iter().rev() {
-        // `load` already rejects unreadable and wrong-version files, so this
-        // only has to add the visibility half.
-        if let Ok(session) = Session::load(path)
-            && !session.is_hidden()
-            && !session.archived
-        {
-            return Ok(session);
-        }
-    }
-    Err(format!("no sessions found under {}", root.display()))
 }
 
 pub fn resolve_session_id(id_or_prefix: &str) -> Result<String, String> {
@@ -1417,15 +1344,6 @@ mod tests {
         assert_eq!(loaded.active_thread().messages.len(), 1);
     }
 
-    fn set_mtime(path: &Path, t: std::time::SystemTime) {
-        fs::File::options()
-            .write(true)
-            .open(path)
-            .unwrap()
-            .set_modified(t)
-            .unwrap();
-    }
-
     #[test]
     fn normalize_pr_url_variants() {
         assert_eq!(
@@ -1883,9 +1801,8 @@ mod tests {
         let active = ActiveSession::new(session);
         let _lock = SessionWriteLock::acquire(&id).unwrap();
         active.set_session_archived(None, true).unwrap();
-        assert!(list_sessions(0).unwrap().is_empty());
-        assert!(resolve_and_load_session(None).is_err());
-        let archived = list_sessions_with_filter(0, false, ArchiveFilter::Archived).unwrap();
+        assert!(list_sessions().unwrap().is_empty());
+        let archived = list_sessions_with_filter(false, ArchiveFilter::Archived).unwrap();
         assert_eq!(archived.len(), 1);
         assert_eq!(
             search_sessions(&archived, "needle", 20).unwrap().entries[0].id,
@@ -1898,9 +1815,9 @@ mod tests {
         assert!(!child.archived);
         assert_eq!(child.parent_session_id.as_deref(), Some(id.as_str()));
         active.set_session_archived(None, false).unwrap();
-        assert_eq!(list_sessions(0).unwrap()[0].id, id);
+        assert_eq!(list_sessions().unwrap()[0].id, id);
         assert!(
-            list_sessions_with_filter(0, false, ArchiveFilter::Archived)
+            list_sessions_with_filter(false, ArchiveFilter::Archived)
                 .unwrap()
                 .is_empty()
         );
@@ -1943,7 +1860,7 @@ mod tests {
             .persist_messages(&[user("continued while archived")], None, true)
             .unwrap();
         assert!(!original.exists());
-        let listed = list_sessions_with_filter(0, false, ArchiveFilter::Archived).unwrap();
+        let listed = list_sessions_with_filter(false, ArchiveFilter::Archived).unwrap();
         assert_eq!(
             search_sessions(&listed, "needle", 10).unwrap().entries[0].id,
             id
@@ -1976,13 +1893,13 @@ mod tests {
         session.archived = true;
         session.save().unwrap();
         let old_path = session.json_path();
-        let listed = list_sessions_with_filter(0, false, ArchiveFilter::Archived).unwrap();
+        let listed = list_sessions_with_filter(false, ArchiveFilter::Archived).unwrap();
         assert_eq!(listed[0].id, session.id);
         let active = ActiveSession::new(Session::load_by_id_or_prefix(&session.id).unwrap());
         active.set_archived(true).unwrap();
         assert!(!old_path.exists());
         assert!(active.snapshot().json_path().exists());
-        assert!(list_sessions(0).unwrap().is_empty());
+        assert!(list_sessions().unwrap().is_empty());
     }
 
     #[test]
@@ -2009,7 +1926,7 @@ mod tests {
             "preserve history"
         );
         assert!(active.json_path().exists());
-        assert_eq!(list_sessions(0).unwrap()[0].id, active.id);
+        assert_eq!(list_sessions().unwrap()[0].id, active.id);
     }
 
     #[test]
@@ -2093,7 +2010,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            list_sessions_with_filter(0, false, ArchiveFilter::Archived)
+            list_sessions_with_filter(false, ArchiveFilter::Archived)
                 .unwrap()
                 .len(),
             1
@@ -2110,15 +2027,15 @@ mod tests {
             .apply()
             .unwrap();
         assert!(original.exists());
-        assert!(list_sessions(0).unwrap().is_empty());
+        assert!(list_sessions().unwrap().is_empty());
         assert_eq!(
-            list_sessions_with_filter(0, false, ArchiveFilter::Archived)
+            list_sessions_with_filter(false, ArchiveFilter::Archived)
                 .unwrap()
                 .len(),
             1
         );
         active.set_archived(false).unwrap();
-        assert_eq!(list_sessions(0).unwrap().len(), 1);
+        assert_eq!(list_sessions().unwrap().len(), 1);
     }
 
     #[test]
@@ -2153,7 +2070,7 @@ mod tests {
             .push(user("hidden subagent"));
         hidden.save().unwrap();
 
-        let listed = list_sessions(0).unwrap();
+        let listed = list_sessions().unwrap();
         assert!(
             listed.iter().any(|e| e.id == visible.id),
             "visible missing: {listed:?}"
@@ -2163,12 +2080,8 @@ mod tests {
             "hidden should be filtered: {listed:?}"
         );
 
-        let all = list_sessions_filtered(0, true).unwrap();
+        let all = list_sessions_with_filter(true, ArchiveFilter::Active).unwrap();
         assert!(all.iter().any(|e| e.id == hidden.id && !e.kind.is_user()));
-
-        // Bare resume resolves most recent *visible* session.
-        let resumed = resolve_and_load_session(None).unwrap();
-        assert_eq!(resumed.id, visible.id);
 
         // Explicit id still loads hidden.
         let loaded = Session::load_by_id_or_prefix(&hidden.id).unwrap();
@@ -2178,37 +2091,6 @@ mod tests {
             loaded.parent_session_id.as_deref(),
             Some(visible.id.as_str())
         );
-    }
-
-    #[test]
-    fn bare_resume_picks_newest_mtime_and_skips_corrupt_files() {
-        // Takes the myco-home lock, points MYCO_HOME at a temp dir, and undoes
-        // both on drop — including when the test panics.
-        let _home = temp_home("session-bare-resume");
-
-        let older = Session::new("claude-haiku-4-5");
-        older.save().unwrap();
-        let newer = Session::new("claude-haiku-4-5");
-        newer.save().unwrap();
-
-        // Force distinct mtimes regardless of filesystem timestamp granularity.
-        let base = std::time::SystemTime::now();
-        set_mtime(
-            &older.json_path(),
-            base - std::time::Duration::from_secs(60),
-        );
-        set_mtime(&newer.json_path(), base);
-
-        let resumed = resolve_and_load_session(None).unwrap();
-        assert_eq!(resumed.id, newer.id);
-
-        // A corrupt file with the newest mtime is skipped, not fatal.
-        let corrupt = session_file_path("ffeeddccbbaa00112233445566778899", "json");
-        fs::create_dir_all(corrupt.parent().unwrap()).unwrap();
-        fs::write(&corrupt, b"{not json").unwrap();
-        set_mtime(&corrupt, base + std::time::Duration::from_secs(60));
-        let resumed = resolve_and_load_session(None).unwrap();
-        assert_eq!(resumed.id, newer.id);
     }
 
     /// No kind/parent fields on disk — serde defaults to user (visible).

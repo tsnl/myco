@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Shared fixtures and doubles for unit tests: a scripted [`GenerativeModel`],
 //! message/conversation builders, tool-result text extraction, RAII temp-dir
 //! and `MYCO_HOME` guards.
@@ -8,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use futures::stream;
-use serde_json::json;
 
 use crate::core::AsyncStream;
 use crate::generative_model::{
@@ -171,34 +169,6 @@ pub(crate) fn tool_results(results: &[&str]) -> Message {
     Message::ToolResults {
         tool_use_results: results.iter().map(|text| ToolResult::text(*text)).collect(),
     }
-}
-
-/// A thinking block as session history stores it (plaintext, unsigned).
-pub(crate) fn thinking(text: &str) -> Content {
-    Content::Thinking {
-        text: text.into(),
-        signature: None,
-        redacted: false,
-    }
-}
-
-pub(crate) fn thinking_msg(parts: &[&str]) -> Message {
-    Message::AssistantMessage {
-        content: parts.iter().map(|t| thinking(t)).collect(),
-        tool_uses: vec![],
-        turn_end_reason: Some(TurnEndReason::EndTurn),
-    }
-}
-
-/// Canonical complete tool loop: user → assistant tool call → tool result →
-/// final assistant answer.
-pub(crate) fn tool_loop() -> Vec<Message> {
-    vec![
-        user("hello"),
-        assistant_tool(Some("hi there"), "bash", json!({"command": "echo hi"})),
-        tool_results(&["hi\n"]),
-        assistant("done"),
-    ]
 }
 
 // ---------------------------------------------------------------------------

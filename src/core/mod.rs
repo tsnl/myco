@@ -24,8 +24,6 @@ pub use myco_model::AsyncStream;
 /// [`CancelToken::child_token`] scopes cancellation to one branch of that work.
 pub use myco_agent::CancelToken;
 
-pub use futures::StreamExt;
-
 /// Format a UUID as a 32-char lowercase hex string (no hyphens).
 pub fn uuid_simple_hex(id: uuid::Uuid) -> String {
     id.as_simple().to_string()

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::Instant;
@@ -22,7 +22,7 @@ use tokio::time::Instant;
 use crate::core::{CancelToken, ToolResource};
 use crate::generative_model::{ToolResult, ToolSpec, ToolUse};
 use crate::host::HostWorker;
-use crate::host::protocol::{HOST_PROTOCOL_VERSION, Request, Response};
+use crate::host::protocol::{HOST_PROTOCOL_VERSION, Request, Response, read_line};
 use crate::tool_services::HostDispatchContext;
 
 /// A remote tool gets its requested timeout plus this much time to return its
@@ -261,19 +261,6 @@ impl HostController {
                 .try_lock()
                 .map(|g| g.as_ref().is_some_and(|c| !c.dead.load(Ordering::SeqCst)))
                 .unwrap_or(false),
-        }
-    }
-
-    /// One-line summaries of tool work still running for `agent_id` on this
-    /// host (e.g. live bash sessions).
-    ///
-    /// In-process hosts only: the NDJSON protocol has no query message, and
-    /// prompt-time display must never block on a lazy/dead remote connection,
-    /// so subprocess hosts report none.
-    pub fn running_tool_summaries(&self, agent_id: uuid::Uuid) -> Vec<String> {
-        match &self.backend {
-            Backend::InProcess { worker } => worker.running_tool_summaries(agent_id),
-            Backend::Subprocess { .. } => Vec::new(),
         }
     }
 
@@ -972,25 +959,6 @@ async fn write_all(w: &mut ChildStdin, bytes: &[u8]) -> Result<(), String> {
         .map_err(|e| format!("write: {e}"))?;
     w.flush().await.map_err(|e| format!("flush: {e}"))?;
     Ok(())
-}
-
-async fn read_line(r: &mut BufReader<ChildStdout>) -> Result<String, String> {
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = r
-            .read_line(&mut line)
-            .await
-            .map_err(|e| format!("read: {e}"))?;
-        if n == 0 {
-            return Err("peer closed".into());
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        return Ok(trimmed.to_string());
-    }
 }
 
 async fn run_writer(

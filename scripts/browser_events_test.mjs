@@ -56,7 +56,7 @@ test('bursts across 26 sessions coalesce catalog notifications and stop after un
   const f = fixture(), port = f.subscribe('work');
   const changed = () => port.messages.filter(message => message.kind === 'sessions_changed').length;
   for (let index = 0; index < 26; index++) {
-    for (const kind of ['meta', 'tasks', 'refresh']) f.update('work', `session-${index}`, 1, kind);
+    for (const kind of ['meta', 'refresh']) f.update('work', `session-${index}`, 1, kind);
   }
   assert.equal(changed(), 0);
   f.advance(100);

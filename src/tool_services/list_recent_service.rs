@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use crate::core::Async;
 use crate::generative_model::{self, ToolResult, ToolUse};
-use crate::session::{SessionListEntry, format_session_list_line, list_sessions_filtered};
+use crate::session::{
+    ArchiveFilter, SessionListEntry, format_session_list_line, list_sessions_with_filter,
+};
 
 use super::{HostDispatchContext, ToolService};
 
@@ -45,7 +47,7 @@ impl ListRecentService {
 
         // Rank over the full store, then truncate — otherwise a deep-but-older
         // session could be cut before ranking ever sees it.
-        let entries = list_sessions_filtered(0, include_hidden)?;
+        let entries = list_sessions_with_filter(include_hidden, ArchiveFilter::Active)?;
         if entries.is_empty() {
             return Ok("no sessions found".to_string());
         }
