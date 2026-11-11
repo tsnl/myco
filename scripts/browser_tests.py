@@ -81,7 +81,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
             if not isinstance(content, str):
                 content = " ".join(part.get("text", "") for part in content)
             resuming |= '# Resumption\n\n' in content
-            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links|profile|getlink|view image|timer|autonomy|event)\b", content)
+            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links|profile|getlink|view image|timer|autonomy|event|thinking)\b", content)
             if match:
                 prompts.append(match.group(0))
         prompt = prompts[-1] if prompts else 'Alpha images'
@@ -167,6 +167,11 @@ class Provider(http.server.BaseHTTPRequestHandler):
             events = tool({'command': f'printf "%s" "$MYCO_PROFILE" > profile-tool.txt\nprintf "%s\\n" "$MYCO_PROFILE" "$MYCO_HOME" "$PWD" "$MYCO_SERVER_URL" > {marker}; cat {marker}', 'timeout_ms': 1000})
         elif "generate" in prompt:
             events = reply(f"{name} finished.")
+        elif "thinking" in prompt:
+            events = [{'type': 'response.reasoning_summary_text.delta', 'output_index': 0, 'summary_index': 0,
+                       'delta': 'Weigh the first option carefully.\n\nThen compare the second option.'},
+                      {'type': 'response.output_text.delta', 'output_index': 1, 'content_index': 0,
+                       'delta': f'{name} decided.'}]
         else:
             events = reply("# Heading\n\n**Bold** and _emphasis_.\n\n"
                            "| Name | Value |\n| --- | --- |\n| Tool | Ready |\n\n"
@@ -732,7 +737,7 @@ context_window = 100000
         expect(page.locator('.tool.running')).to_have_count(0)
         self.assertTrue((self.home / 'Alpha-done').exists(), 'The original command must finish after the trigger')
         page.click('#activity-toggle')
-        expect(page.locator('.inbox-event')).to_contain_text('completed · urgent')
+        expect(page.locator('#inbox-read .inbox-event')).to_contain_text('Completed · urgent')
 
     def test_normal_timer_backgrounds_bash_and_delivers_at_its_settled_boundary(self):
         self.timer_wait = True
@@ -794,7 +799,7 @@ context_window = 100000
         expect(page.locator('#model')).to_be_enabled()
         self.assertNotIn('Beta event', self.turns)
         page.click('#activity-toggle')
-        expect(page.locator('.inbox-event')).to_contain_text('expired · normal')
+        expect(page.locator('#inbox-dropped .inbox-state')).to_have_text('Expired')
 
     def test_inbox_cancellation_is_scoped_and_does_not_invoke_a_model(self):
         page = self.session(self.page)
@@ -804,11 +809,53 @@ context_window = 100000
         foreign = other.url.replace('/sessions/', '/api/sessions/') + '/inbox/' + payload['event_id'] + '/cancel'
         self.assertEqual(self.context.request.post(foreign, data={}).status, 409)
         page.click('#activity-toggle')
-        expect(page.locator('.inbox-event')).to_contain_text('Scheduled · normal')
+        expect(page.locator('#inbox-list .inbox-state')).to_have_text('Scheduled')
         page.get_by_role('button', name='Cancel event', exact=True).click()
         self.inbox_state(endpoint, payload['event_id'], 'cancelled')
-        expect(page.locator('.inbox-event')).to_contain_text('cancelled · normal')
+        expect(page.locator('#inbox-dropped .inbox-state')).to_have_text('Cancelled')
         self.assertEqual(len(self.requests), 0)
+
+    def test_inbox_lists_events_awaiting_delivery_and_collapses_read_and_dropped_ones(self):
+        page = self.session(self.page)
+        endpoint, first = self.post_inbox_event(page, message='Beta event: build finished')
+        self.inbox_state(endpoint, first['event_id'], 'completed')
+        expect(page.locator('#model')).to_be_enabled()
+        soon = lambda minutes: (datetime.now().astimezone() + timedelta(minutes=minutes)).isoformat()
+        self.post_inbox_event(page, message='Beta event: later check', at=soon(30))
+        self.post_inbox_event(page, message='Beta event: check the canary', at=soon(5), priority='urgent')
+        _, stale = self.post_inbox_event(page, message='Beta event: stale reminder', at=soon(10))
+        page.click('#activity-toggle')
+        waiting = page.locator('#inbox-list .inbox-event')
+        expect(waiting.locator('.inbox-message')).to_have_text(
+            ['Beta event: check the canary', 'Beta event: stale reminder', 'Beta event: later check'])
+        expect(waiting.locator('.inbox-state')).to_have_text(['Scheduled · urgent', 'Scheduled', 'Scheduled'])
+        expect(page.locator('#activity-count')).to_have_text('3')
+        read, dropped = page.locator('#inbox-read'), page.locator('#inbox-dropped')
+        expect(read.locator('summary')).to_have_text('Read · 1')
+        expect(read).to_have_js_property('open', False)
+        expect(read.locator('.inbox-event')).to_be_hidden()
+        expect(dropped).to_be_hidden()
+        waiting.nth(1).get_by_role('button', name='Cancel event', exact=True).click()
+        self.inbox_state(endpoint, stale['event_id'], 'cancelled')
+        expect(waiting).to_have_count(2)
+        expect(dropped.locator('summary')).to_have_text('Not delivered · 1')
+        expect(dropped.locator('.inbox-event')).to_be_hidden()
+        read.locator('summary').click()
+        expect(read.locator('.inbox-event')).to_be_visible()
+        expect(read.locator('.inbox-state')).to_have_text('Completed')
+        expect(read.locator('.inbox-message')).to_have_text('Beta event: build finished')
+        # An update refreshes an open list in place, newest first.
+        _, second = self.post_inbox_event(page, message='Beta event: tests finished')
+        self.inbox_state(endpoint, second['event_id'], 'completed')
+        expect(read.locator('summary')).to_have_text('Read · 2')
+        expect(read).to_have_js_property('open', True)
+        expect(read.locator('.inbox-message')).to_have_text(['Beta event: tests finished', 'Beta event: build finished'])
+        expect(waiting).to_have_count(2)
+        page.reload()
+        page.click('#activity-toggle')
+        expect(page.locator('#inbox-list .inbox-event')).to_have_count(2)
+        expect(page.locator('#inbox-read')).to_have_js_property('open', False)
+        expect(page.locator('#inbox-read summary')).to_have_text('Read · 2')
 
     def test_timer_restores_and_wakes_after_restart_without_an_open_tab(self):
         self.timer_woke = threading.Event()
@@ -1160,6 +1207,78 @@ context_window = 100000
                 expect(page.locator('.assistant .body')).to_have_text(['Alpha finished.'] * (2 if automatic else 1))
                 expect(page.locator('#transcript')).not_to_contain_text(re.compile('Summary saved|Continue the browser fixture task|Resumption|Prelude changes|SYSTEM'))
                 self.assertEqual(len(self.requests), requests, 'Reloading must not generate another continuation')
+
+    def compact(self, page):
+        page.fill('#prompt', '/compact')
+        page.press('#prompt', 'Enter')
+        expect(page.locator('#connection')).to_have_text('Ready')
+        expect(page.locator('#model')).to_be_enabled()
+
+    def test_messages_before_compaction_load_above_the_conversation_and_keep_the_readers_place(self):
+        self.stream_chunks = 30
+        page = self.session(self.page)
+        turns = ['First', 'Second', 'Third', 'Fourth', 'Fifth']
+        for turn in turns[:4]:
+            self.submit(page, f'{turn} Alpha stream')
+            expect(page.locator('#model')).to_be_enabled()
+        users = page.locator('#transcript .user .body')
+        said = lambda count: [f'{turn} Alpha stream' for turn in turns[:count]]
+        control = page.get_by_role('button', name='Show earlier messages', exact=True)
+        expect(control).to_be_hidden()
+        self.compact(page)
+        # The successor keeps its two copied turns; the rest waits above them.
+        expect(users).to_have_text(said(4)[2:])
+        expect(control).to_be_visible()
+        session = page.url.replace('/sessions/', '/api/sessions/')
+        state = self.context.request.get(session).json()['change']['snapshot']
+        self.assertEqual(len(state['earlier_threads']), 1)
+        for missing in [state['thread_id'], 'unknown']:
+            self.assertEqual(self.context.request.get(f'{session}/threads/{missing}').status, 404)
+        # Scrolling to the top brings the earlier thread in without moving the page.
+        before = page.evaluate("""() => {
+            window.scrollTo(0, 0);
+            return document.querySelector('#blocks .user').getBoundingClientRect().top;
+        }""")
+        expect(users).to_have_text(said(4))
+        expect(control).to_be_hidden()
+        self.assertGreater(page.evaluate('window.scrollY'), 1000)
+        self.assertAlmostEqual(page.locator('#blocks .user').first.bounding_box()['y'], before, delta=1)
+        boundary = page.locator('.thread-boundary')
+        expect(boundary).to_have_text(re.compile('^Compacted · '))
+        self.assertEqual(page.evaluate("""() => [...document.querySelectorAll('#transcript .user, .thread-boundary')]
+            .map(node => node.classList.contains('user') ? 'turn' : 'boundary')"""), ['turn', 'turn', 'boundary', 'turn', 'turn'])
+        expect(page.locator('#earlier .assistant .body').first).to_contain_text('Chunk 29.')
+        expect(page.locator('#transcript')).not_to_contain_text(re.compile('Summary saved|Continue the browser fixture task|Compaction resume'))
+        # Message navigation walks into the earlier thread.
+        page.click('#jump')
+        for _ in range(4):
+            page.press('#prompt', 'ArrowUp')
+        expect(page.locator('.user[aria-current="true"] .body')).to_have_text('First Alpha stream')
+        page.press('#prompt', 'Escape')
+        # A second compaction slots the thread it replaced between what is shown.
+        self.submit(page, 'Fifth Alpha stream')
+        expect(page.locator('#model')).to_be_enabled()
+        self.compact(page)
+        expect(users).to_have_text(said(5))
+        expect(boundary).to_have_count(2)
+        expect(page.locator('#blocks .user .body')).to_have_text(said(5)[3:])
+        self.assertEqual(len(self.context.request.get(session).json()['change']['snapshot']['earlier_threads']), 2)
+        # A reload starts from the live thread again. The button loads one
+        # thread at a time, nearest first.
+        requests = len(self.requests)
+        self.stop(self.process)
+        self.process, _ = self.launch(port=urlsplit(self.origin).port)
+        page.reload()
+        expect(page.locator('#model')).to_be_enabled()
+        expect(users).to_have_text(said(5)[3:])
+        press = "document.getElementById('earlier-load').click()"  # Without scrolling to it.
+        page.evaluate(press)
+        expect(users).to_have_text(said(5)[2:])
+        expect(control).to_be_visible()
+        page.evaluate(press)
+        expect(users).to_have_text(said(5))
+        expect(control).to_be_hidden()
+        self.assertEqual(len(self.requests), requests, 'Reading history must not call the model')
 
     def test_payload_rejection_recovers_after_tools_without_resending_images(self):
         self.reject_payload = lambda body: (any(item.get('type') == 'function_call_output'
@@ -2129,7 +2248,7 @@ context_window = 100000
         page = self.session(self.page)
         self.submit(page, 'Alpha wait')
         expect(page.locator('.tool.running')).to_have_count(1)
-        heading = page.locator('#transcript > .message-header')
+        heading = page.locator('#blocks > .message-header')
         expect(heading.locator('.role')).to_have_text('ASSISTANT')
         self.assertTrue(page.locator('.tool').evaluate("tool => tool.previousElementSibling.querySelector('.role').textContent === 'ASSISTANT'"))
         expect(heading.locator('time')).to_have_text(page.locator('.user time').inner_text())
@@ -2289,6 +2408,8 @@ context_window = 100000
                     expect(dialog.get_by_role("heading", name="Sky", exact=True)).to_be_visible()
                     expect(page.get_by_role("button", name="Close settings")).to_be_focused()
                     page.keyboard.press("Tab")
+                    expect(page.locator("#well-width")).to_be_focused()
+                    page.keyboard.press("Tab")
                     expect(page.locator("#sky-city")).to_be_focused()
                     if dismiss == "close":
                         page.get_by_role("button", name="Close settings").click()
@@ -2299,6 +2420,76 @@ context_window = 100000
                         page.mouse.click(4, 4)
                     expect(dialog).to_be_hidden()
                     expect(toggle).to_be_focused()
+
+    def open_settings(self, page):
+        if page.locator('#menu-toggle').count():
+            page.click('#menu-toggle')
+        page.click('#settings-toggle')
+
+    def test_conversation_width_follows_saved_columns_and_shrinks_in_narrow_windows(self):
+        page = self.session(self.page)
+        page.set_viewport_size({'width': 2600, 'height': 900})
+        # Text columns inside the well, measured with the page's own font.
+        measure = """selector => {
+            const probe = document.createElement('span');
+            probe.textContent = '0'.repeat(100); probe.style.position = 'absolute';
+            document.body.append(probe);
+            const column = probe.getBoundingClientRect().width / 100; probe.remove();
+            const style = getComputedStyle(document.querySelector(selector));
+            return (parseFloat(style.width) - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight) - 2) / column;
+        }"""
+        columns = lambda target=page, selector='#transcript': target.evaluate(measure, selector)
+        width = lambda selector: page.locator(selector).bounding_box()['width']
+        self.assertAlmostEqual(columns(), 100, delta=0.05)
+        self.open_settings(page)
+        expect(page.locator('#well-width')).to_have_value('100')
+        expect(page.locator('#well-width option')).to_have_text(
+            ['80 columns', '100 columns (default)', '120 columns', '150 columns', '200 columns', 'Unbounded', 'Custom…'])
+        for choice in ['80', '120', '150', '200']:
+            page.select_option('#well-width', choice)
+            self.assertAlmostEqual(columns(), int(choice), delta=0.05)
+            self.assertAlmostEqual(width('.toolbar-inner'), width('#transcript'), delta=0.5)
+            self.assertAlmostEqual(width('#composer-frame'), width('#transcript') - 66, delta=0.5)
+            glass = page.evaluate("parseFloat(getComputedStyle(document.body, '::before').width)")
+            self.assertAlmostEqual(glass, width('#transcript'), delta=0.5)
+        page.select_option('#well-width', 'unbounded')
+        self.assertAlmostEqual(width('#transcript'), page.evaluate('document.documentElement.clientWidth'), delta=0.5)
+        page.select_option('#well-width', 'custom')
+        expect(page.locator('#well-width-custom')).to_be_focused()
+        self.assertAlmostEqual(width('#transcript'), page.evaluate('document.documentElement.clientWidth'), delta=0.5)
+        page.fill('#well-width-custom', '132')
+        self.assertAlmostEqual(columns(), 132, delta=0.05)
+        for invalid in ['12', '5000', '90.5', '']:
+            page.fill('#well-width-custom', invalid)
+            self.assertAlmostEqual(columns(), 132, delta=0.05, msg=f'{invalid!r} must not change the width')
+        page.fill('#well-width-custom', '132')
+        self.assertEqual(page.evaluate("localStorage.getItem('myco.well-width.v1')"), '132')
+        # A saved width is in place before any page content exists to flash.
+        page.add_init_script("""new MutationObserver((_, observer) => {
+            if (!document.body) return;
+            window.widthAtFirstContent = document.documentElement.style.getPropertyValue('--well-columns');
+            observer.disconnect();
+        }).observe(document, { childList: true, subtree: true });""")
+        page.reload()
+        expect(page.locator('#model')).to_be_enabled()
+        self.assertEqual(page.evaluate('window.widthAtFirstContent'), '132')
+        self.assertAlmostEqual(columns(), 132, delta=0.05)
+        self.open_settings(page)
+        expect(page.locator('#well-width')).to_have_value('custom')
+        expect(page.locator('#well-width-custom')).to_have_value('132')
+        home = self.context.new_page()
+        home.set_viewport_size({'width': 2600, 'height': 900})
+        home.goto(self.origin)
+        self.assertAlmostEqual(columns(home, '#session-browser'), 132, delta=0.05)
+        for narrow in [900, 390]:
+            page.set_viewport_size({'width': narrow, 'height': 850})
+            self.assertAlmostEqual(width('#transcript'), narrow, delta=0.5)
+            self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), narrow)
+        page.set_viewport_size({'width': 2600, 'height': 900})
+        page.select_option('#well-width', '100')
+        self.assertIsNone(page.evaluate("localStorage.getItem('myco.well-width.v1')"))
+        home.wait_for_function(f"({measure})('#session-browser') < 101")
+        self.assertAlmostEqual(columns(home, '#session-browser'), 100, delta=0.05)
 
     def test_sky_city_drives_altitude_layers_and_persists_across_navigation(self):
         page = self.page
@@ -2912,6 +3103,47 @@ context_window = 100000
         self.assertEqual(attempts[0], attempts[1])
         self.assertEqual(len(self.requests), 3)
         expect(page.locator('.user .body')).to_have_text(['Alpha wait', 'Beta markdown'])
+
+    def test_thinking_text_selects_without_collapsing_and_its_rail_toggles(self):
+        page = self.session(self.page)
+        self.submit(page, 'Alpha thinking')
+        expect(page.locator('.assistant .body')).to_have_text('Alpha decided.')
+        trace = page.locator('.thinking')
+        trace.locator('summary').click()
+        expect(trace).to_have_js_property('open', True)
+        first, second = trace.locator('.body p').first, trace.locator('.body p').last
+        expect(first).to_have_text('Weigh the first option carefully.')
+        selected = lambda: page.evaluate('getSelection().toString()')
+        line = first.bounding_box()
+        middle = line['y'] + line['height'] / 2
+        page.mouse.move(line['x'] + 2, middle)
+        page.mouse.down()
+        page.mouse.move(line['x'] + 150, middle, steps=6)
+        page.mouse.up()
+        self.assertIn('Weigh the first', selected())
+        expect(trace).to_have_js_property('open', True)
+        first.dblclick(position={'x': 20, 'y': line['height'] / 2})
+        self.assertEqual(selected().strip(), 'Weigh')
+        expect(trace).to_have_js_property('open', True)
+        second.click(position={'x': 60, 'y': 8}, modifiers=['Shift'])
+        self.assertIn('Then', selected())
+        expect(trace).to_have_js_property('open', True)
+        # Dragging down the rail selects lines; it must not count as a rail click.
+        rail = trace.bounding_box()
+        page.mouse.move(rail['x'] + 6, line['y'] + 2)
+        page.mouse.down()
+        page.mouse.move(rail['x'] + 6, rail['y'] + rail['height'] - 2, steps=6)
+        page.mouse.up()
+        self.assertTrue(selected().strip())
+        expect(trace).to_have_js_property('open', True)
+        first.click(position={'x': 20, 'y': line['height'] / 2})
+        self.assertEqual(selected(), '')
+        expect(trace).to_have_js_property('open', True)
+        page.mouse.click(rail['x'] + 6, middle)
+        expect(trace).to_have_js_property('open', False)
+        expect(trace.locator('summary')).to_be_focused()
+        page.keyboard.press('Enter')
+        expect(trace).to_have_js_property('open', True)
 
     def test_tool_timers_tick_every_tenth_and_keep_independent_durations_across_refresh(self):
         page = self.page

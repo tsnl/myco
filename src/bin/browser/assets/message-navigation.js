@@ -22,7 +22,7 @@ export function messageNavigation({ onNavigate, onLatest }) {
   }
 
   function move(step) {
-    const messages = Array.from(transcript.querySelectorAll(':scope > .message.user'));
+    const messages = Array.from(transcript.querySelectorAll('.message.user'));
     if (!messages.length || (!selected && step > 0)) return;
     const index = selected ? messages.indexOf(selected) : messages.length;
     const next = Math.max(0, index + step);

@@ -144,6 +144,7 @@ fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc:
                 revision: 0,
                 session_id: id.into(),
                 thread_id: "thread".into(),
+                earlier_threads: vec![],
                 title: "Test".into(),
                 archived: false,
                 auto_continue: false,
@@ -1280,6 +1281,174 @@ fn legacy_compaction_hides_internal_context_without_guessing_a_boundary() {
         let blocks = serde_json::to_value(view::history(&thread)).unwrap();
         assert_eq!(blocks.as_array().unwrap().len(), 1);
         assert_eq!(blocks[0]["text"], "retained task");
+    }
+}
+
+fn user_turn(text: &str) -> Message {
+    Message::UserMessage {
+        content: vec![Content::Text { text: text.into() }],
+    }
+}
+
+fn answer(text: &str) -> Message {
+    Message::AssistantMessage {
+        content: vec![Content::Text { text: text.into() }],
+        tool_uses: vec![],
+        turn_end_reason: None,
+    }
+}
+
+// Appends a successor without writing the session store.
+fn succeeded_by(session: &Session, thread: myco::session::Thread) -> Session {
+    let mut document = serde_json::to_value(session).unwrap();
+    document["threads"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::to_value(thread).unwrap());
+    Session::from_json(&serde_json::to_vec(&document).unwrap()).unwrap()
+}
+
+fn compacted(session: &Session, new_messages: Vec<Message>) -> Session {
+    let (mut thread, _) = myco::session::compact_thread(session, "internal summary").unwrap();
+    thread.messages.extend(new_messages);
+    succeeded_by(session, thread)
+}
+
+// What a reader sees after loading every earlier thread above the live one.
+fn whole_transcript(session: &Session) -> Vec<String> {
+    let mut blocks = Vec::new();
+    for id in view::earlier_threads(session) {
+        blocks.push(json!(view::earlier(session, &id).unwrap())["blocks"].clone());
+    }
+    blocks.push(json!(view::history(session.active_thread())));
+    blocks
+        .iter()
+        .flat_map(|blocks| blocks.as_array().unwrap())
+        .filter(|block| block["kind"] == "message")
+        .map(|block| block["text"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn earlier_history_ends_where_its_successor_takes_over_so_each_turn_appears_once() {
+    let mut session = Session::new("test");
+    let mut expected = Vec::new();
+    for turn in 1..=4 {
+        expected.extend([format!("task {turn}"), format!("answer {turn}")]);
+    }
+    session.replace_context(
+        expected
+            .chunks(2)
+            .flat_map(|turn| [user_turn(&turn[0]), answer(&turn[1])])
+            .collect(),
+        None,
+    );
+    let original = session.active_thread().id.clone();
+    assert!(view::earlier_threads(&session).is_empty());
+    assert!(view::earlier(&session, &original).is_none());
+
+    let session = compacted(&session, vec![user_turn("task 5"), answer("answer 5")]);
+    expected.extend(["task 5".to_owned(), "answer 5".to_owned()]);
+    assert_eq!(view::earlier_threads(&session), [original.as_str()]);
+    let earlier = json!(view::earlier(&session, &original).unwrap());
+    let texts: Vec<_> = earlier["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|block| block["text"].as_str().unwrap())
+        .collect();
+    // The successor copied the last two turns; they stay with it.
+    assert_eq!(texts, ["task 1", "answer 1", "task 2", "answer 2"]);
+    assert_eq!(
+        earlier["replaced_at"],
+        view::timestamp(&session.active_thread().created_at)
+    );
+    assert!(!earlier.to_string().contains("internal summary"));
+    assert_eq!(whole_transcript(&session), expected);
+    assert!(view::earlier(&session, &session.active_thread().id).is_none());
+    assert!(view::earlier(&session, "missing").is_none());
+
+    // A second compaction reaches back into context the middle thread only
+    // copied. Its own cut and its predecessor's still partition the session.
+    let session = compacted(&session, vec![answer("answer 6")]);
+    assert_eq!(view::earlier_threads(&session).len(), 2);
+    expected.push("answer 6".into());
+    assert_eq!(whole_transcript(&session), expected);
+}
+
+#[test]
+fn a_restart_after_a_rejected_submission_repeats_its_thread_instead_of_adding_history() {
+    let stamp = |thread: &str| Content::System {
+        kind: "session".into(),
+        text: format!("# Session\n\nthread {thread}"),
+        data: json!({"thread_id": thread}),
+    };
+    let mut session = Session::new("test");
+    let original = session.active_thread().id.clone();
+    session.replace_context(
+        vec![
+            Message::UserMessage {
+                content: vec![
+                    stamp(&original),
+                    Content::Text {
+                        text: "task 1".into(),
+                    },
+                ],
+            },
+            answer("answer 1"),
+            user_turn("task 2"),
+            answer("answer 2"),
+            user_turn("rejected submission"),
+        ],
+        None,
+    );
+    // The restart keeps everything before the rejected turn under a new stamp.
+    let mut restart = session.active_thread().clone();
+    restart.id = "restart".into();
+    restart.predecessor_id = Some(original.clone());
+    restart.messages.truncate(4);
+    if let Message::UserMessage { content } = &mut restart.messages[0] {
+        content[0] = stamp("restart");
+    }
+    restart.messages.push(user_turn("task 3"));
+    let session = succeeded_by(&session, restart);
+    assert!(view::earlier_threads(&session).is_empty());
+    assert_eq!(
+        json!(view::earlier(&session, &original).unwrap())["blocks"],
+        json!([])
+    );
+    assert_eq!(
+        whole_transcript(&session),
+        ["task 1", "answer 1", "task 2", "answer 2", "task 3"]
+    );
+
+    // History before the restart still ends at the compaction that follows it.
+    let session = compacted(&session, vec![answer("answer 3")]);
+    assert_eq!(view::earlier_threads(&session), ["restart"]);
+    assert_eq!(
+        whole_transcript(&session),
+        [
+            "task 1", "answer 1", "task 2", "answer 2", "task 3", "answer 3"
+        ]
+    );
+}
+
+#[test]
+fn a_successor_without_a_known_boundary_keeps_its_whole_predecessor_visible() {
+    let mut session = Session::new("test");
+    session.replace_context(vec![user_turn("task 1"), answer("answer 1")], None);
+    let original = session.active_thread().id.clone();
+    for metadata in [json!({"legacy":true}), json!({"predecessor_id":"another"})] {
+        let (mut thread, _) = myco::session::compact_thread(&session, "summary").unwrap();
+        if let Message::UserMessage { content } = &mut thread.messages[0]
+            && let Content::System { data, .. } = &mut content[1]
+        {
+            *data = metadata;
+        }
+        let session = succeeded_by(&session, thread);
+        let earlier = json!(view::earlier(&session, &original).unwrap());
+        // Repeating a turn is safe; omitting one would hide history.
+        assert_eq!(earlier["blocks"].as_array().unwrap().len(), 2);
     }
 }
 

@@ -95,6 +95,11 @@ sky. Their tint follows the same light: cool blue in daylight, warm rose and amb
 around dawn and dusk, and deeper blue at night. Overcast weather softens the tint.
 The conversation stays in a central well, with the sky visible on both sides;
 its glass background continues below the viewport during native scroll bounce.
+**Settings → Layout** sets the well's width in columns of conversation text: 80,
+100 (the default), 120, 150, 200, unbounded, or a custom count from 40 to 1000.
+The top bar and input bar follow it. The choice is saved in this browser and
+applies to every page and profile; a window narrower than the chosen width uses
+its full width.
 The top bar stays fixed, with its glass extending above the viewport to keep
 both scroll limits covered. Native conversation scrolling and bounce remain
 enabled.
@@ -280,8 +285,9 @@ its value. Strings retain their newlines without JSON quoting; nested objects an
 arrays retain JSON structure. There is no browser verbose mode.
 
 Thinking traces appear in muted italic text with a vertical bar on the left.
-Expand **Thinking** to read a trace; click anywhere in the expanded trace to
-collapse it. Its heading also supports Enter and Space for keyboard control.
+Expand **Thinking** to read a trace. Its text selects and copies like the rest
+of the conversation. Click the heading or the bar to collapse it; the heading
+also supports Enter and Space for keyboard control.
 
 Tool calls show elapsed execution time to tenths of a second in their headers
 and in the Activity drawer. Running timers update every 0.1 seconds and survive
@@ -390,9 +396,12 @@ processes remain owned by the same session. Cancellation already requested by th
 user settles before any event starts.
 
 Expiry applies only before delivery starts; it never kills a running turn or
-process. The **Activity → Event inbox** section shows event text, priority, due
-time, expiry, status, and cancellation. Scheduled timers keep their countdowns in
-**Timers**. Event text remains ordinary input; priority does not grant approval or
+process. The **Activity → Event inbox** section lists events awaiting delivery
+with their text, status, priority, due time, expiry, and cancellation, soonest
+first. Delivered events move under **Read**; cancelled and expired events move
+under **Not delivered**. Both lists start collapsed and show the newest first.
+A delivered event's full text stays in the conversation. Scheduled timers keep
+their countdowns in **Timers**. Event text remains ordinary input; priority does not grant approval or
 additional tool authority.
 
 Each session accepts up to 100 active events in total and retains its last 100
@@ -537,6 +546,16 @@ terminal errors stop the run; a later message can try again.
 An ineffective summary disables further automatic compaction until manual
 compaction or a session change. Cancellation preserves the source thread.
 
+After compaction the conversation opens at the successor thread, which begins
+with the recent turns it carried over. Scroll to the top, or use **Show earlier
+messages**, to load the thread before it above them; keep scrolling for older
+ones. Each loads once and keeps your place. A **Compacted** rule marks where the
+assistant continued from a summary, and each turn appears once, in its original
+thread or as carried over. Up-arrow message navigation reaches loaded messages.
+Earlier threads show their recorded results, not live process state. A reload
+starts from the successor again. A submission removed after a size rejection is
+kept in its saved thread for `session_history` but is not shown again.
+
 ## Running and resuming
 
 One server can run several sessions concurrently. Each has its own runner, model
@@ -593,6 +612,7 @@ Fetch Metadata. Access to this API includes session tools and shell execution.
 | `POST /api/sessions` | `{"request_id":"UUID"}` → `{"id":"SESSION_ID"}` |
 | `GET /api/sessions` | Visible sessions with `busy` and `status`; add `?archived=true` for archives |
 | `GET /api/sessions/ID` | Snapshot at `change.snapshot`, including `archived`, `busy`, `status`, `blocks`, `queued`, `timers`, `usage`, and `context_window_tokens` |
+| `GET /api/sessions/ID/threads/THREAD` | A replaced thread from the snapshot's `earlier_threads`: `replaced_at` and the `blocks` its successor did not carry over |
 | `POST /api/sessions/ID/action` | `{"request_id":"UUID","session_id":"ID","action":{"kind":"submit","text":"PROMPT"}}` → 202 accepted |
 | `POST /api/sessions/ID/action` | The same envelope with `{"kind":"compact"}` or `{"kind":"select_model","key":"KEY"}` |
 | `POST /api/sessions/ID/action` | The same envelope with `{"kind":"update_queued","message_id":"UUID","revision":0,"update":{"kind":"edit"}}` |

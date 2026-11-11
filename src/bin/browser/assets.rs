@@ -17,6 +17,7 @@ const ASSETS: &[(&str, &str)] = &[
         "/message-navigation.js",
         include_str!("assets/message-navigation.js"),
     ),
+    ("/history.js", include_str!("assets/history.js")),
     ("/links.js", include_str!("assets/links.js")),
     (
         "/markdown-content.js",
@@ -32,6 +33,7 @@ const ASSETS: &[(&str, &str)] = &[
     ("/profiles.js", include_str!("assets/profiles.js")),
     ("/events.js", include_str!("assets/events.js")),
     ("/style.css", include_str!("assets/style.css")),
+    ("/well-width.js", include_str!("assets/well-width.js")),
     ("/settings.js", include_str!("assets/settings.js")),
     ("/sky.js", include_str!("assets/sky.js")),
     ("/aircraft.js", include_str!("assets/aircraft.js")),

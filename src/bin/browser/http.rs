@@ -19,6 +19,7 @@ use super::{
     files::Files,
     markdown, origin,
     runtime::{ActionRequest, CreateSession, Error, Sessions, Update},
+    view,
     weather::{Coordinates, Weather},
 };
 
@@ -91,6 +92,7 @@ pub(super) fn router(server: Arc<Server>) -> Router {
         .route("/api/live-events", get(live_events))
         .route("/api/sessions", get(sessions).post(create_session))
         .route("/api/sessions/{id}", get(session_snapshot))
+        .route("/api/sessions/{id}/threads/{thread}", get(session_thread))
         .route(
             "/api/sessions/{id}/action",
             post(session_action)
@@ -240,6 +242,25 @@ async fn session_snapshot(
     })
     .await
     .map_err(|error| Error::Internal(format!("Cannot render session: {error}")))
+}
+
+async fn session_thread(
+    State(server): State<Arc<Server>>,
+    Path((id, thread)): Path<(String, String)>,
+) -> Result<Json<Value>, Error> {
+    let session = server.sessions.session(&id).await?;
+    // Replaced threads never change. Project and render one off the reactor,
+    // apart from the live snapshot.
+    tokio::task::spawn_blocking(move || {
+        let earlier = session
+            .with(|session| view::earlier(session, &thread))
+            .ok_or_else(|| Error::NotFound("This session has no such earlier thread.".into()))?;
+        let mut earlier = json!(earlier);
+        markdown::render_snapshot(&mut earlier, &server.files);
+        Ok(Json(earlier))
+    })
+    .await
+    .map_err(|error| Error::Internal(format!("Cannot render thread: {error}")))?
 }
 
 pub(super) async fn session_action(

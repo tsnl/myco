@@ -4,6 +4,7 @@ import { sessionTimers } from './timers.js';
 import { activeEvents, renderInbox } from './inbox.js';
 import { messageComposer } from './composer.js';
 import { messageNavigation } from './message-navigation.js';
+import { earlierHistory } from './history.js';
 import { sessionRenamer } from './rename.js';
 import { imagePreview } from './image-viewer.js';
 import { linkify, setLinkedText } from './links.js';
@@ -12,7 +13,7 @@ import { messageTimestamp } from './timestamps.js';
 import { showUsage } from './usage.js';
 import { profileName, profilePath, eventsWorker } from './scope.js';
 bindNewSessionLink($('new-session'));
-const transcript = $('transcript');
+const transcript = $('transcript'), blocks = $('blocks');
 let state = { blocks: [], tasks: [], busy: false };
 let connected = false;
 let revision = -1;
@@ -33,6 +34,7 @@ const navigation = messageNavigation({
   onNavigate() { follow = false; $('jump').hidden = false; },
   onLatest: jumpToLatest,
 });
+const earlier = earlierHistory(blockNode);
 
 function updateToolDuration(node, now = performance.now()) {
   const elapsed = Number(node.dataset.elapsed) + (node.dataset.running === 'true' ? now - Number(node.dataset.observed) : 0);
@@ -241,8 +243,11 @@ function blockNode(block) {
   if (thinking) {
     const summary = element('summary', '', 'Thinking');
     article.append(summary);
+    // The trace is ordinary selectable text. A toggle on the text itself would
+    // also swallow the first click of a double-click or Shift-click selection,
+    // so only the rail beside it (the article's own box) toggles.
     article.onclick = event => {
-      if (event.target.closest('summary')) return;
+      if (event.target !== article || !getSelection().isCollapsed) return;
       article.open = !article.open;
       summary.focus({ preventScroll: true });
     };
@@ -284,8 +289,8 @@ function replaceBlock(index, block, previous) {
     if (node.tagName === 'DETAILS' && nodes[index].tagName === 'DETAILS') node.open = nodes[index].open;
     nodes[index].replaceWith(node);
   } else {
-    if (!nodes.length) transcript.querySelector('.welcome')?.remove();
-    transcript.append(node);
+    if (!nodes.length) blocks.querySelector('.welcome')?.remove();
+    blocks.append(node);
   }
   nodes[index] = node;
   scrollLatest();
@@ -312,15 +317,16 @@ function snapshot(next) {
     const previous = reusable.get(blockKey(block))?.shift();
     if (previous) nodes[index] = previous.node;
     replaceBlock(index, block, previous?.block);
-    if (transcript.children[index] !== nodes[index]) transcript.insertBefore(nodes[index], transcript.children[index] || null);
+    if (blocks.children[index] !== nodes[index]) blocks.insertBefore(nodes[index], blocks.children[index] || null);
   }
   const retained = new Set(nodes);
-  for (const node of Array.from(transcript.children)) if (!retained.has(node)) node.remove();
-  if (!nodes.length && !transcript.querySelector('.welcome')) {
+  for (const node of Array.from(blocks.children)) if (!retained.has(node)) node.remove();
+  if (!nodes.length && !blocks.querySelector('.welcome')) {
     const welcome = element('section', 'welcome');
     welcome.append(element('h1', '', 'MYCO'), element('p', '', 'Write a prompt to begin. Tool inputs and output expand in place.'));
-    transcript.append(welcome);
+    blocks.append(welcome);
   }
+  earlier.sync(state.session_id, state.earlier_threads || []);
   navigation.refresh();
   metadata();
 }

@@ -8,6 +8,9 @@
   --line: #e5e5e526; --composer-height: 180px; --toolbar-height: 65px;
   --composer-bottom: max(16px, env(safe-area-inset-bottom));
   --content-gutter: 32px;
+  /* Columns of conversation text; the gutters and borders sit outside them. */
+  --well-columns: 100;
+  --well-width: calc(var(--well-columns) * 1ch + 2 * var(--content-gutter) + 2px);
   --glass-tint: 12 20 35;
   --glass-control: rgb(var(--glass-tint) / .36);
   --glass-well: rgb(var(--glass-tint) / .58);
@@ -25,7 +28,7 @@ body:has(> .toolbar) { padding-top: var(--toolbar-height); }
    separate the toolbar from the well. Extra glass never adds scrollable space. */
 body::before {
   content: ''; position: fixed; inset: -100lvh 0 -100lvh; z-index: -1;
-  max-width: 980px; margin-inline: auto; box-sizing: border-box;
+  max-width: var(--well-width); margin-inline: auto; box-sizing: border-box;
   border-inline: 1px solid #e5e5e51c; background: var(--glass-well);
   backdrop-filter: blur(18px); pointer-events: none;
 }
@@ -43,7 +46,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .toolbar { position: fixed; inset: 0 0 auto; z-index: 2; border-bottom: 1px solid var(--line); }
 /* One continuous surface fills the area above the bar without stacking tint. */
 .toolbar::before { content: ''; position: absolute; inset: -100lvh 0 0; z-index: -1; background: var(--glass-raised); backdrop-filter: var(--glass-filter); pointer-events: none; }
-.toolbar-inner { display: flex; align-items: center; gap: 16px; max-width: 980px; min-height: 64px; padding: 12px 32px; margin: 0 auto; }
+.toolbar-inner { display: flex; align-items: center; gap: 16px; max-width: var(--well-width); min-height: 64px; padding: 12px 32px; margin: 0 auto; }
 .toolbar-heading { display: flex; align-items: center; gap: 16px; flex: 1; min-width: 0; min-height: 24px; }
 .brand { flex: none; color: var(--green); text-decoration: none; font-weight: 800; }
 .brand span { color: var(--dim); }
@@ -57,7 +60,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .toolbar-tools button:hover:not(:disabled), .toolbar-tools button[aria-expanded="true"] { color: #e6e6e6; border-color: var(--dim); background: rgb(var(--glass-tint) / .6); }
 .toolbar #new-session { --rim-color: var(--green); color: var(--green); border: 2px solid var(--rim-color); background: #a6da950b; }
 .toolbar #new-session:hover { background: #a6da9517; }
-#session-browser { max-width: 980px; margin: 0 auto; padding: 40px 32px; }
+#session-browser { max-width: var(--well-width); margin: 0 auto; padding: 40px 32px; }
 #session-browser label { display: block; font-weight: 700; color: var(--cyan); margin-bottom: 8px; }
 #search { width: 100%; border: 1px solid var(--line); border-radius: 0; background: var(--glass-control); padding: 10px 12px; }
 #search:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
@@ -87,10 +90,13 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 @keyframes activity-pulse { 50% { opacity: .35; } }
 @media (prefers-reduced-motion: reduce) { .activity-indicator[data-active="true"]::before { animation: none; } }
 #connection { flex: none; font-size: 12px; }
-#transcript { max-width: 980px; margin: 0 auto; padding: 40px var(--content-gutter) calc(var(--composer-height) + 65px); overflow-wrap: anywhere; }
+#transcript { max-width: var(--well-width); margin: 0 auto; padding: 40px var(--content-gutter) calc(var(--composer-height) + 65px); overflow-wrap: anywhere; }
 .welcome { color: var(--dim); padding: 25px 0; }
 .welcome h1 { color: var(--green); font: inherit; font-weight: 700; }
 .message { margin: 0 0 30px; }
+#earlier-load { display: block; margin: 0 auto 30px; color: var(--dim); }
+.thread-boundary { display: flex; align-items: center; gap: 12px; margin-bottom: 30px; color: var(--dim); font-size: 12px; }
+.thread-boundary::before, .thread-boundary::after { content: ''; flex: 1; border-top: 1px solid var(--line); }
 .message.user { scroll-margin-top: calc(var(--toolbar-height) + 16px); }
 .message.user[aria-current="true"] { outline: 2px solid var(--cyan); outline-offset: 8px; background: rgb(var(--sky-light, 139 213 220) / .08); box-shadow: 0 0 0 8px rgb(var(--sky-light, 139 213 220) / .08), 0 0 16px color-mix(in srgb, var(--cyan) 35%, transparent); }
 .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
@@ -174,11 +180,13 @@ html.viewing-image { overflow: hidden; }
 .tool pre { color: #b8b8b8; }
 .tool .output { color: #d9d9d9; max-height: 65vh; overflow: auto; }
 .thinking { color: #b5b5b5; font-style: italic; margin-bottom: 20px; padding-left: 16px; border-left: 2px solid var(--dim); cursor: pointer; }
+.thinking > .body { cursor: auto; }
+.thinking:hover:not(:has(> :hover)) { border-left-color: #e6e6e6; }
 .thinking em { font-style: inherit; }
 .thinking :is(a, code, blockquote) { color: inherit; }
 .thinking .body { margin-top: 10px; }
 .notice { color: var(--red); padding: 10px 0; white-space: pre-wrap; }
-.composer-frame { position: fixed; z-index: 3; bottom: var(--composer-bottom); left: 50%; transform: translateX(-50%); width: calc(min(980px, 100%) - 2 * var(--content-gutter) - 2px); --composer-color: var(--cyan); --composer-emission: rgb(var(--sky-light, 139 213 220)); }
+.composer-frame { position: fixed; z-index: 3; bottom: var(--composer-bottom); left: 50%; transform: translateX(-50%); width: calc(min(var(--well-width), 100%) - 2 * var(--content-gutter) - 2px); --composer-color: var(--cyan); --composer-emission: rgb(var(--sky-light, 139 213 220)); }
 .composer { position: relative; max-height: calc(100dvh - var(--toolbar-height) - 24px); overflow-y: auto; padding: 16px 20px 14px; border: 2px solid var(--glass-border); border-radius: 0; background: var(--glass-composer); box-shadow: var(--glass-shadow), inset 0 1px #ffffff08; backdrop-filter: var(--glass-filter); }
 .composer:focus-within { border-color: #8a8a8a; }
 /* Keep emitted light outside the scrolling glass. Filtering the glass itself
@@ -236,12 +244,22 @@ html.viewing-image { overflow: hidden; }
 #activity-empty { color: var(--dim); }
 .activity-section ul { margin: 12px 0 0; padding-left: 1.5em; color: var(--cyan); }
 .activity-section li { overflow-wrap: anywhere; margin-bottom: 10px; }
-.inbox-event { border-left: 2px solid var(--dim); padding: 0 0 0 12px; list-style: none; }
-.inbox-event[data-state="pending"], .inbox-event[data-state="running"] { border-color: var(--cyan); }
-.inbox-event p { color: #e6e6e6; margin: 0 0 6px; white-space: pre-wrap; }
-.inbox-state, .inbox-due, .inbox-expiry { display: block; color: var(--dim); font-size: .85em; }
-.inbox-state { text-transform: capitalize; }
+.activity-section :is(#inbox-list, .inbox-history ul) { padding-left: 0; list-style: none; }
+.inbox-event { --event-color: var(--dim); border-left: 2px solid var(--event-color); padding-left: 12px; }
+.inbox-event:is([data-state="pending"], [data-state="delivering"], [data-state="running"]) { --event-color: var(--cyan); }
+.inbox-event[data-state="completed"] { --event-color: var(--green); }
+.inbox-event[data-state="failed"] { --event-color: var(--red); }
+.inbox-event:is([data-state="interrupted"], [data-state="expired"]) { --event-color: var(--amber); }
+.inbox-event p { color: #e6e6e6; margin: 2px 0 4px; white-space: pre-wrap; }
+.inbox-state, .inbox-times { display: block; font-size: .85em; }
+.inbox-state { color: var(--event-color); font-weight: 600; }
+.inbox-times { color: var(--dim); font-variant-numeric: tabular-nums; }
 .inbox-event button { margin-top: 6px; }
+.inbox-history { margin-top: 14px; }
+.inbox-history summary { color: var(--dim); cursor: pointer; }
+.inbox-history summary:hover, .inbox-history[open] summary { color: #e6e6e6; }
+/* A delivered event is in the transcript in full; this is its index entry. */
+#inbox-read p { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
 .active-call { position: relative; --rim-color: #fff; display: block; width: 100%; text-align: left; border: 2px solid var(--rim-color); background: var(--glass-control); color: var(--rim-color); padding: 10px 12px; white-space: normal; overflow-wrap: anywhere; }
 .active-call:hover { border-color: var(--rim-color); text-decoration: underline; }
 /* Toolbar menu */
@@ -260,6 +278,14 @@ html.viewing-image { overflow: hidden; }
 .settings-heading h2 { margin: 0; font: inherit; font-weight: 700; }
 #settings-close { min-width: 36px; min-height: 36px; }
 #rename-heading { margin: 0 0 24px; font: inherit; font-weight: 700; }
+#layout-settings { margin-bottom: 24px; padding-bottom: 20px; border-bottom: 1px solid var(--line); }
+#layout-settings h3 { margin: 0 0 12px; font: inherit; font-weight: 700; color: var(--cyan); }
+#layout-settings label { display: block; margin-bottom: 8px; }
+.well-width-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+#well-width-custom { width: 9ch; padding: 5px 8px; border: 1px solid var(--line); border-radius: 0; background: var(--glass-control); }
+#well-width-custom:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
+#well-width-custom:invalid { border-color: var(--red); }
+#well-width-note { margin: 12px 0 0; color: var(--dim); font-size: 12px; }
 #rename-name { display: block; width: 100%; margin-top: 8px; padding: 10px 12px; border: 1px solid var(--line); background: var(--glass-control); }
 #rename-name:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
 #rename-error { color: var(--red); overflow-wrap: anywhere; }
