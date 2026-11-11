@@ -271,7 +271,9 @@ first-message title and agent renames during a running turn. Hover over a trunca
 heading to read its full title. The top bar aligns with the conversation and
 gives the title the room beside the status, **Activity**, and the menu (**⋯**).
 The menu holds **Rename session**, **Compact**, **Auto-continue**, **Archive**,
-and **Settings**; Escape or a click outside closes it. Narrow screens keep the
+**Settings**, and **Feedback**; Escape or a click outside closes it. **Feedback**
+opens a new issue for myco on GitHub in another tab; nothing is sent until you
+submit it. Narrow screens keep the
 title on its own row above the controls. Activity counts appear only while
 tools, background sessions, or timers are running.
 

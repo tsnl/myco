@@ -3283,6 +3283,7 @@ context_window = 100000
         toggle.click()
         expect(page.locator('#menu button')).to_have_text(
             ['Rename session', 'Compact', 'Auto-continue: on', 'Archive', 'Settings'])
+        expect(page.locator('#menu a')).to_have_text('Feedback')
         page.keyboard.press('Escape')
         expect(page.locator('#menu')).to_be_hidden()
         expect(toggle).to_be_focused()
@@ -3290,6 +3291,28 @@ context_window = 100000
         expect(page.locator('#menu')).to_be_hidden()
         expect(toggle).to_be_focused()
         expect(page.locator('#auto-continue-status')).to_be_hidden()
+
+    def test_feedback_opens_a_new_github_issue_from_the_menu_on_every_page(self):
+        self.context.route('https://github.com/**', lambda route: route.fulfill(body='New issue'))
+        page = self.page
+        for view in ['home', 'session']:
+            if view == 'session':
+                self.session(page)
+            with self.subTest(view=view):
+                page.get_by_role('button', name='Menu', exact=True).click()
+                entry = page.get_by_role('link', name='Feedback', exact=True)
+                expect(entry).to_have_attribute('href', 'https://github.com/tsnl/myco/issues/new')
+                self.assertEqual(page.locator('#menu > *').last.get_attribute('id'), 'feedback')
+                url = page.url
+                with self.context.expect_page() as issue:
+                    entry.click()
+                issue.value.wait_for_load_state()
+                self.assertEqual(issue.value.url, 'https://github.com/tsnl/myco/issues/new')
+                self.assertIsNone(issue.value.evaluate('window.opener'))
+                self.assertEqual(issue.value.evaluate('document.referrer'), '')
+                issue.value.close()
+                expect(page.locator('#menu')).to_be_hidden()
+                expect(page).to_have_url(url)
 
     def test_auto_continue_finishes_only_after_the_agent_disables_it(self):
         page = self.session(self.page)
