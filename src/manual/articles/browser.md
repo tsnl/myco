@@ -95,6 +95,9 @@ sky. Their tint follows the same light: cool blue in daylight, warm rose and amb
 around dawn and dusk, and deeper blue at night. Overcast weather softens the tint.
 The conversation stays in a central well, with the sky visible on both sides;
 its glass background continues below the viewport during native scroll bounce.
+Behind the well the sky is frosted: its light and soft cloud shapes show
+through, without stars, airplanes, or rain. A window no wider than the well
+shows only that frosted sky.
 **Settings → Layout** sets the well's width in columns of conversation text: 80,
 100 (the default), 120, 150, 200, unbounded, or a custom count from 40 to 1000.
 The top bar and input bar follow it. The choice is saved in this browser and

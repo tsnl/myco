@@ -14,6 +14,10 @@ const ASSETS: &[(&str, &str)] = &[
     ("/attachments.js", include_str!("assets/attachments.js")),
     ("/composer.js", include_str!("assets/composer.js")),
     (
+        "/composer-light.js",
+        include_str!("assets/composer-light.js"),
+    ),
+    (
         "/message-navigation.js",
         include_str!("assets/message-navigation.js"),
     ),
@@ -54,10 +58,6 @@ const ASSETS: &[(&str, &str)] = &[
         include_str!("assets/sky-atmosphere.js"),
     ),
     ("/cloud-field.js", include_str!("assets/cloud-field.js")),
-    (
-        "/cloud-textures.js",
-        include_str!("assets/cloud-textures.js"),
-    ),
 ];
 
 pub(super) fn routes<S: Clone + Send + Sync + 'static>(base: &str) -> Router<S> {

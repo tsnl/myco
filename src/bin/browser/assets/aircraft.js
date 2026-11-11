@@ -1,5 +1,7 @@
 // Decorative flybys use one timer and CSS motion. Only visible time counts
 // towards the next arrival, so returning to a tab cannot unleash a backlog.
+// A flight advances a pixel at a time: at its speed, smoother motion would
+// only ask for five times the frames.
 const between = (low, high) => low + Math.random() * (high - low);
 
 function airplane() {
@@ -26,6 +28,7 @@ function flight() {
   plane.style.setProperty('--flight-from-y', `${start}vh`);
   plane.style.setProperty('--flight-to-y', `${end}vh`);
   plane.style.setProperty('--flight-duration', `${between(135, 210)}s`);
+  plane.style.setProperty('--flight-steps', Math.round(Math.hypot(innerWidth + 600, (end - start) * innerHeight / 100)));
   plane.style.setProperty('--aircraft-scale', String(between(0.6, 0.85)));
   plane.style.setProperty('--contrail-length', `${between(160, 260)}px`);
   plane.style.setProperty('--beacon-delay', `${between(-4, 0)}s`);

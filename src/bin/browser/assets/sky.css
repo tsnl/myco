@@ -1,32 +1,35 @@
 /* Atmosphere and stars */
-#sky { position: fixed; inset: 0; z-index: -2; pointer-events: none; overflow: hidden; background: linear-gradient(180deg, #030916, #142039 70%, #35334a); }
+#sky { position: fixed; inset: 0; z-index: -2; pointer-events: none; overflow: hidden; container-type: size; }
+/* The sky is drawn twice: once in the open, and once without its detail
+   behind the conversation, as frosted glass would show it. That opaque copy
+   is drawn once; a backdrop blur would redo it for every frame drawn above it. */
+#sky-open, #sky-well { position: absolute; inset: 0; background: linear-gradient(180deg, #030916, #142039 70%, #35334a); }
+#sky-open { isolation: isolate; }
 .sky-atmosphere, .sky-glow, #sky-stars { position: absolute; inset: 0; width: 100%; height: 100%; transition: opacity 4s linear; }
+.sky-atmosphere { background-image: var(--sky-gradient); opacity: var(--sky-day, 1); }
 #sky-stars { opacity: 0; }
 #sky-stars circle { fill: #e4eeff; }
 .star-layer, .star-layer svg { position: absolute; inset: 0; width: 100%; height: 100%; }
 .star-layer { animation: twinkle var(--twinkle-duration) steps(var(--twinkle-steps)) var(--twinkle-delay) infinite alternate; }
 #sky.paused .star-layer { animation-play-state: paused; }
 @keyframes twinkle { from { opacity: .3; } to { opacity: 1; } }
-.sky-glow { background: radial-gradient(ellipse 55% 65% at var(--light-x, 50%) var(--light-y, 10%), rgb(var(--light-color, 222 240 255) / 1), rgb(var(--light-color, 222 240 255) / .25) 45%, transparent 80%); }
-#sky::after { content: ''; position: absolute; inset: 0; background: #34435c; opacity: var(--overcast, 0); transition: opacity 12s; }
+.sky-glow { opacity: var(--light-strength, 1); background: radial-gradient(ellipse 55% 65% at var(--light-x, 50%) var(--light-y, 10%), rgb(var(--light-color, 222 240 255) / 1), rgb(var(--light-color, 222 240 255) / .25) 45%, transparent 80%); }
+#sky-open::after, #sky-well::after { content: ''; position: absolute; inset: 0; background: #34435c; opacity: var(--overcast, 0); transition: opacity 12s; }
 
 /* Clouds */
-/* Composite the whole cloud bank before fading it: overlapping sprites must
-   still let the sky through, even with full cover in every altitude layer. */
-#sky-clouds { position: absolute; inset: 0; opacity: .56; }
-.cloud-layer { position: absolute; inset: 0 auto 0 50%; width: max(100vw, 1440px); transform: translateX(-50%); }
-.cloud-track { position: absolute; inset: 0; animation: cloud-drift var(--drift-duration, 4800s) steps(var(--drift-steps, 19200)) infinite; animation-direction: var(--drift-direction, normal); }
-.cloud-sprite { position: absolute; transform: translate(-50%, -50%); opacity: 0; transition: opacity 12s; }
-.cloud-sprite img { display: block; width: 100%; height: 100%; max-height: none; margin: 0; object-fit: fill; transform: rotate(var(--cloud-tilt, 0deg)); }
-.cloud-high { opacity: .64; }
-.cloud-mid { opacity: .87; }
-#sky.paused .cloud-track { animation-play-state: paused; }
-@keyframes cloud-drift { from { transform: translateX(0); } to { transform: translateX(-100%); } }
+/* The whole cloud bank fades as one image: overlapping clouds must still let
+   the sky through, even with full cover in every altitude layer. */
+#sky-clouds, #sky-clouds-soft { position: absolute; inset: 0; width: 100%; height: 100%; opacity: .56; }
+
+/* The well */
+#sky-well { inset-inline: max(0px, (100% - var(--well-width)) / 2); overflow: hidden; }
+/* Its copy spans the whole sky, so the light lines up with the light outside. */
+#sky-well > * { left: calc(50% - 50cqw); width: 100cqw; }
 
 /* Aircraft */
 #sky-aircraft { position: absolute; inset: 0; opacity: var(--sky-clarity, 1); transition: opacity 12s; }
-.sky-aircraft { position: absolute; left: 0; top: 0; animation: aircraft-pass var(--flight-duration) linear both; }
-.aircraft-bearing { width: 28px; height: 20px; position: absolute; left: -14px; top: -10px; transform: rotate(var(--flight-heading)) scale(var(--aircraft-scale)); }
+.sky-aircraft { position: absolute; left: 0; top: 0; animation: aircraft-pass var(--flight-duration) steps(var(--flight-steps)) both; }
+.aircraft-bearing { width: 28px; height: 20px; position: absolute; left: -14px; top: -10px; transform: rotate(var(--flight-heading)) scale(var(--aircraft-scale)); animation: aircraft-fade var(--flight-duration) both; }
 .aircraft-bearing svg { display: block; width: 100%; height: 100%; overflow: visible; }
 .aircraft-silhouette { fill: #e2ebf1; stroke: #536a8270; stroke-width: .5px; opacity: .8; }
 .aircraft-contrail { display: none; position: absolute; right: 90%; top: calc(50% - 2px); width: var(--contrail-length); height: 4px; opacity: .32; filter: blur(.6px); }
@@ -36,24 +39,27 @@
 .aircraft-lights { opacity: .15; }
 .aircraft-port { fill: #ff918b; }
 .aircraft-starboard { fill: #a4e9c9; }
-.aircraft-beacon { fill: #fff9db; animation: aircraft-beacon 4s ease-in-out var(--beacon-delay) infinite; }
+.aircraft-beacon { fill: #fff9db; animation: aircraft-beacon 4s steps(3) var(--beacon-delay) infinite; }
 #sky[data-phase="twilight"] .aircraft-contrail { opacity: .26; }
 #sky[data-phase="twilight"] .aircraft-contrail::before, #sky[data-phase="twilight"] .aircraft-contrail::after { background: linear-gradient(90deg, transparent, #f1c4ac40 25%, #ffe0be); }
 #sky[data-phase="night"] .aircraft-contrail { opacity: .045; }
 #sky[data-phase="night"] .aircraft-silhouette { fill: #8296b0; stroke: none; opacity: .2; }
 #sky[data-phase="night"] .aircraft-lights, #sky[data-phase="twilight"] .aircraft-lights { opacity: .9; filter: drop-shadow(0 0 1.5px #ffeac860); }
-#sky.paused .sky-aircraft, #sky.paused .aircraft-beacon { animation-play-state: paused; }
+#sky.paused :is(.sky-aircraft, .aircraft-bearing, .aircraft-beacon) { animation-play-state: paused; }
 @keyframes aircraft-pass {
-  from { transform: translate(var(--flight-from-x), var(--flight-from-y)); opacity: 0; }
-  8%, 92% { opacity: 1; }
-  to { transform: translate(var(--flight-to-x), var(--flight-to-y)); opacity: 0; }
+  from { transform: translate(var(--flight-from-x), var(--flight-from-y)); }
+  to { transform: translate(var(--flight-to-x), var(--flight-to-y)); }
+}
+@keyframes aircraft-fade {
+  from, to { opacity: 0; animation-timing-function: steps(8); }
+  8% { opacity: 1; animation-timing-function: step-end; }
+  92% { opacity: 1; animation-timing-function: steps(8); }
 }
 @keyframes aircraft-beacon { 0%, 55%, 100% { opacity: .25; } 70%, 78% { opacity: 1; } }
 
 /* Rain */
 #sky-rain { position: absolute; inset: 0; z-index: 1; mask-image: linear-gradient(transparent, #000 18%); }
 .rain-layer { position: absolute; inset: 0; transform: skewX(var(--rain-slant, 0deg)); }
-.rain-layer:first-child { filter: blur(.35px); }
 .rain-sheet { position: absolute; inset: -512px -50vh; background-repeat: repeat; animation: rain-fall 2s linear infinite; }
 #sky.paused .rain-sheet { animation-play-state: paused; }
 @keyframes rain-fall { from { transform: translateY(0); } to { transform: translateY(512px); } }
@@ -84,7 +90,6 @@
   .star-layer { animation: none; opacity: 1; }
   .sky-atmosphere, .sky-glow, #sky-stars { transition: none; }
   #sky-aircraft, #sky-rain { display: none; }
-  .sky-aircraft, .aircraft-beacon, .rain-sheet { animation: none; }
-  .cloud-track { animation: none; }
-  .cloud-sprite, #sky::after, #sky-aircraft { transition: none; }
+  .sky-aircraft, .aircraft-bearing, .aircraft-beacon, .rain-sheet { animation: none; }
+  #sky-open::after, #sky-well::after, #sky-aircraft { transition: none; }
 }

@@ -3,6 +3,7 @@ import { showActivity } from './activity.js';
 import { sessionTimers } from './timers.js';
 import { activeEvents, renderInbox } from './inbox.js';
 import { messageComposer } from './composer.js';
+import { composerLight } from './composer-light.js';
 import { messageNavigation } from './message-navigation.js';
 import { earlierHistory } from './history.js';
 import { sessionRenamer } from './rename.js';
@@ -35,6 +36,7 @@ const navigation = messageNavigation({
   onLatest: jumpToLatest,
 });
 const earlier = earlierHistory(blockNode);
+const updateLight = composerLight($('composer-frame'));
 
 function updateToolDuration(node, now = performance.now()) {
   const elapsed = Number(node.dataset.elapsed) + (node.dataset.running === 'true' ? now - Number(node.dataset.observed) : 0);
@@ -92,6 +94,7 @@ $('jump').onclick = jumpToLatest;
 trackToolbarHeight();
 new ResizeObserver(() => {
   document.documentElement.style.setProperty('--composer-height', `${$('composer').offsetHeight}px`);
+  updateLight();
   scrollLatest();
 }).observe($('composer'));
 function resizeInput() { $('prompt').style.height = 'auto'; $('prompt').style.height = `${$('prompt').scrollHeight}px`; }
@@ -381,6 +384,7 @@ function activity() {
   $('composer-frame').dataset.state = !connected ? 'reconnecting'
     : state.status === 'Stopped' ? 'stopped' : state.status === 'Cancelling' ? 'cancelling'
     : state.busy || count ? 'running' : 'ready';
+  updateLight();
   if (connected) status.title = current;
 }
 function activityCalls(calls) {

@@ -12,16 +12,16 @@ const sky = document.createElement('div');
 sky.id = 'sky';
 sky.setAttribute('aria-hidden', 'true');
 document.body.prepend(sky);
-const updateAtmosphere = createAtmosphere(sky);
-createAircraft(sky);
-const clouds = createClouds(sky);
-const updateRain = createRain(sky);
+const atmosphere = createAtmosphere(sky);
+createAircraft(atmosphere.open);
+const clouds = createClouds(sky, atmosphere.open, atmosphere.well);
+const updateRain = createRain(atmosphere.open);
 let forecast = null;
 
 function updateSky(weatherChanged = false) {
   if (document.hidden) return;
   const state = sampleSky(new Date(), forecast);
-  updateAtmosphere(state);
+  atmosphere.update(state);
   clouds.setLighting(state.lighting);
   if (weatherChanged) {
     clouds.setWeather(state.conditions);
