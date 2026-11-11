@@ -81,7 +81,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
             if not isinstance(content, str):
                 content = " ".join(part.get("text", "") for part in content)
             resuming |= '# Resumption\n\n' in content
-            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links|profile|getlink|view image|timer|autonomy|event)\b", content)
+            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links|profile|getlink|view image|timer|autonomy|event|thinking)\b", content)
             if match:
                 prompts.append(match.group(0))
         prompt = prompts[-1] if prompts else 'Alpha images'
@@ -167,6 +167,11 @@ class Provider(http.server.BaseHTTPRequestHandler):
             events = tool({'command': f'printf "%s" "$MYCO_PROFILE" > profile-tool.txt\nprintf "%s\\n" "$MYCO_PROFILE" "$MYCO_HOME" "$PWD" "$MYCO_SERVER_URL" > {marker}; cat {marker}', 'timeout_ms': 1000})
         elif "generate" in prompt:
             events = reply(f"{name} finished.")
+        elif "thinking" in prompt:
+            events = [{'type': 'response.reasoning_summary_text.delta', 'output_index': 0, 'summary_index': 0,
+                       'delta': 'Weigh the first option carefully.\n\nThen compare the second option.'},
+                      {'type': 'response.output_text.delta', 'output_index': 1, 'content_index': 0,
+                       'delta': f'{name} decided.'}]
         else:
             events = reply("# Heading\n\n**Bold** and _emphasis_.\n\n"
                            "| Name | Value |\n| --- | --- |\n| Tool | Ready |\n\n"
@@ -2907,6 +2912,47 @@ context_window = 100000
         self.assertEqual(attempts[0], attempts[1])
         self.assertEqual(len(self.requests), 3)
         expect(page.locator('.user .body')).to_have_text(['Alpha wait', 'Beta markdown'])
+
+    def test_thinking_text_selects_without_collapsing_and_its_rail_toggles(self):
+        page = self.session(self.page)
+        self.submit(page, 'Alpha thinking')
+        expect(page.locator('.assistant .body')).to_have_text('Alpha decided.')
+        trace = page.locator('.thinking')
+        trace.locator('summary').click()
+        expect(trace).to_have_js_property('open', True)
+        first, second = trace.locator('.body p').first, trace.locator('.body p').last
+        expect(first).to_have_text('Weigh the first option carefully.')
+        selected = lambda: page.evaluate('getSelection().toString()')
+        line = first.bounding_box()
+        middle = line['y'] + line['height'] / 2
+        page.mouse.move(line['x'] + 2, middle)
+        page.mouse.down()
+        page.mouse.move(line['x'] + 150, middle, steps=6)
+        page.mouse.up()
+        self.assertIn('Weigh the first', selected())
+        expect(trace).to_have_js_property('open', True)
+        first.dblclick(position={'x': 20, 'y': line['height'] / 2})
+        self.assertEqual(selected().strip(), 'Weigh')
+        expect(trace).to_have_js_property('open', True)
+        second.click(position={'x': 60, 'y': 8}, modifiers=['Shift'])
+        self.assertIn('Then', selected())
+        expect(trace).to_have_js_property('open', True)
+        # Dragging down the rail selects lines; it must not count as a rail click.
+        rail = trace.bounding_box()
+        page.mouse.move(rail['x'] + 6, line['y'] + 2)
+        page.mouse.down()
+        page.mouse.move(rail['x'] + 6, rail['y'] + rail['height'] - 2, steps=6)
+        page.mouse.up()
+        self.assertTrue(selected().strip())
+        expect(trace).to_have_js_property('open', True)
+        first.click(position={'x': 20, 'y': line['height'] / 2})
+        self.assertEqual(selected(), '')
+        expect(trace).to_have_js_property('open', True)
+        page.mouse.click(rail['x'] + 6, middle)
+        expect(trace).to_have_js_property('open', False)
+        expect(trace.locator('summary')).to_be_focused()
+        page.keyboard.press('Enter')
+        expect(trace).to_have_js_property('open', True)
 
     def test_tool_timers_tick_every_tenth_and_keep_independent_durations_across_refresh(self):
         page = self.page
