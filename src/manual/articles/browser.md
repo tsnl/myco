@@ -544,6 +544,16 @@ terminal errors stop the run; a later message can try again.
 An ineffective summary disables further automatic compaction until manual
 compaction or a session change. Cancellation preserves the source thread.
 
+After compaction the conversation opens at the successor thread, which begins
+with the recent turns it carried over. Scroll to the top, or use **Show earlier
+messages**, to load the thread before it above them; keep scrolling for older
+ones. Each loads once and keeps your place. A **Compacted** rule marks where the
+assistant continued from a summary, and each turn appears once, in its original
+thread or as carried over. Up-arrow message navigation reaches loaded messages.
+Earlier threads show their recorded results, not live process state. A reload
+starts from the successor again. A submission removed after a size rejection is
+kept in its saved thread for `session_history` but is not shown again.
+
 ## Running and resuming
 
 One server can run several sessions concurrently. Each has its own runner, model
@@ -600,6 +610,7 @@ Fetch Metadata. Access to this API includes session tools and shell execution.
 | `POST /api/sessions` | `{"request_id":"UUID"}` → `{"id":"SESSION_ID"}` |
 | `GET /api/sessions` | Visible sessions with `busy` and `status`; add `?archived=true` for archives |
 | `GET /api/sessions/ID` | Snapshot at `change.snapshot`, including `archived`, `busy`, `status`, `blocks`, `queued`, `timers`, `usage`, and `context_window_tokens` |
+| `GET /api/sessions/ID/threads/THREAD` | A replaced thread from the snapshot's `earlier_threads`: `replaced_at` and the `blocks` its successor did not carry over |
 | `POST /api/sessions/ID/action` | `{"request_id":"UUID","session_id":"ID","action":{"kind":"submit","text":"PROMPT"}}` → 202 accepted |
 | `POST /api/sessions/ID/action` | The same envelope with `{"kind":"compact"}` or `{"kind":"select_model","key":"KEY"}` |
 | `POST /api/sessions/ID/action` | The same envelope with `{"kind":"update_queued","message_id":"UUID","revision":0,"update":{"kind":"edit"}}` |

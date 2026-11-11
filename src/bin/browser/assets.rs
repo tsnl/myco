@@ -17,6 +17,7 @@ const ASSETS: &[(&str, &str)] = &[
         "/message-navigation.js",
         include_str!("assets/message-navigation.js"),
     ),
+    ("/history.js", include_str!("assets/history.js")),
     ("/links.js", include_str!("assets/links.js")),
     (
         "/markdown-content.js",

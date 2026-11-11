@@ -1208,6 +1208,78 @@ context_window = 100000
                 expect(page.locator('#transcript')).not_to_contain_text(re.compile('Summary saved|Continue the browser fixture task|Resumption|Prelude changes|SYSTEM'))
                 self.assertEqual(len(self.requests), requests, 'Reloading must not generate another continuation')
 
+    def compact(self, page):
+        page.fill('#prompt', '/compact')
+        page.press('#prompt', 'Enter')
+        expect(page.locator('#connection')).to_have_text('Ready')
+        expect(page.locator('#model')).to_be_enabled()
+
+    def test_messages_before_compaction_load_above_the_conversation_and_keep_the_readers_place(self):
+        self.stream_chunks = 30
+        page = self.session(self.page)
+        turns = ['First', 'Second', 'Third', 'Fourth', 'Fifth']
+        for turn in turns[:4]:
+            self.submit(page, f'{turn} Alpha stream')
+            expect(page.locator('#model')).to_be_enabled()
+        users = page.locator('#transcript .user .body')
+        said = lambda count: [f'{turn} Alpha stream' for turn in turns[:count]]
+        control = page.get_by_role('button', name='Show earlier messages', exact=True)
+        expect(control).to_be_hidden()
+        self.compact(page)
+        # The successor keeps its two copied turns; the rest waits above them.
+        expect(users).to_have_text(said(4)[2:])
+        expect(control).to_be_visible()
+        session = page.url.replace('/sessions/', '/api/sessions/')
+        state = self.context.request.get(session).json()['change']['snapshot']
+        self.assertEqual(len(state['earlier_threads']), 1)
+        for missing in [state['thread_id'], 'unknown']:
+            self.assertEqual(self.context.request.get(f'{session}/threads/{missing}').status, 404)
+        # Scrolling to the top brings the earlier thread in without moving the page.
+        before = page.evaluate("""() => {
+            window.scrollTo(0, 0);
+            return document.querySelector('#blocks .user').getBoundingClientRect().top;
+        }""")
+        expect(users).to_have_text(said(4))
+        expect(control).to_be_hidden()
+        self.assertGreater(page.evaluate('window.scrollY'), 1000)
+        self.assertAlmostEqual(page.locator('#blocks .user').first.bounding_box()['y'], before, delta=1)
+        boundary = page.locator('.thread-boundary')
+        expect(boundary).to_have_text(re.compile('^Compacted · '))
+        self.assertEqual(page.evaluate("""() => [...document.querySelectorAll('#transcript .user, .thread-boundary')]
+            .map(node => node.classList.contains('user') ? 'turn' : 'boundary')"""), ['turn', 'turn', 'boundary', 'turn', 'turn'])
+        expect(page.locator('#earlier .assistant .body').first).to_contain_text('Chunk 29.')
+        expect(page.locator('#transcript')).not_to_contain_text(re.compile('Summary saved|Continue the browser fixture task|Compaction resume'))
+        # Message navigation walks into the earlier thread.
+        page.click('#jump')
+        for _ in range(4):
+            page.press('#prompt', 'ArrowUp')
+        expect(page.locator('.user[aria-current="true"] .body')).to_have_text('First Alpha stream')
+        page.press('#prompt', 'Escape')
+        # A second compaction slots the thread it replaced between what is shown.
+        self.submit(page, 'Fifth Alpha stream')
+        expect(page.locator('#model')).to_be_enabled()
+        self.compact(page)
+        expect(users).to_have_text(said(5))
+        expect(boundary).to_have_count(2)
+        expect(page.locator('#blocks .user .body')).to_have_text(said(5)[3:])
+        self.assertEqual(len(self.context.request.get(session).json()['change']['snapshot']['earlier_threads']), 2)
+        # A reload starts from the live thread again. The button loads one
+        # thread at a time, nearest first.
+        requests = len(self.requests)
+        self.stop(self.process)
+        self.process, _ = self.launch(port=urlsplit(self.origin).port)
+        page.reload()
+        expect(page.locator('#model')).to_be_enabled()
+        expect(users).to_have_text(said(5)[3:])
+        press = "document.getElementById('earlier-load').click()"  # Without scrolling to it.
+        page.evaluate(press)
+        expect(users).to_have_text(said(5)[2:])
+        expect(control).to_be_visible()
+        page.evaluate(press)
+        expect(users).to_have_text(said(5))
+        expect(control).to_be_hidden()
+        self.assertEqual(len(self.requests), requests, 'Reading history must not call the model')
+
     def test_payload_rejection_recovers_after_tools_without_resending_images(self):
         self.reject_payload = lambda body: (any(item.get('type') == 'function_call_output'
                                                for item in body['input'])
@@ -2176,7 +2248,7 @@ context_window = 100000
         page = self.session(self.page)
         self.submit(page, 'Alpha wait')
         expect(page.locator('.tool.running')).to_have_count(1)
-        heading = page.locator('#transcript > .message-header')
+        heading = page.locator('#blocks > .message-header')
         expect(heading.locator('.role')).to_have_text('ASSISTANT')
         self.assertTrue(page.locator('.tool').evaluate("tool => tool.previousElementSibling.querySelector('.role').textContent === 'ASSISTANT'"))
         expect(heading.locator('time')).to_have_text(page.locator('.user time').inner_text())
