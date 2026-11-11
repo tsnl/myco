@@ -241,12 +241,22 @@ html.viewing-image { overflow: hidden; }
 #activity-empty { color: var(--dim); }
 .activity-section ul { margin: 12px 0 0; padding-left: 1.5em; color: var(--cyan); }
 .activity-section li { overflow-wrap: anywhere; margin-bottom: 10px; }
-.inbox-event { border-left: 2px solid var(--dim); padding: 0 0 0 12px; list-style: none; }
-.inbox-event[data-state="pending"], .inbox-event[data-state="running"] { border-color: var(--cyan); }
-.inbox-event p { color: #e6e6e6; margin: 0 0 6px; white-space: pre-wrap; }
-.inbox-state, .inbox-due, .inbox-expiry { display: block; color: var(--dim); font-size: .85em; }
-.inbox-state { text-transform: capitalize; }
+.activity-section :is(#inbox-list, .inbox-history ul) { padding-left: 0; list-style: none; }
+.inbox-event { --event-color: var(--dim); border-left: 2px solid var(--event-color); padding-left: 12px; }
+.inbox-event:is([data-state="pending"], [data-state="delivering"], [data-state="running"]) { --event-color: var(--cyan); }
+.inbox-event[data-state="completed"] { --event-color: var(--green); }
+.inbox-event[data-state="failed"] { --event-color: var(--red); }
+.inbox-event:is([data-state="interrupted"], [data-state="expired"]) { --event-color: var(--amber); }
+.inbox-event p { color: #e6e6e6; margin: 2px 0 4px; white-space: pre-wrap; }
+.inbox-state, .inbox-times { display: block; font-size: .85em; }
+.inbox-state { color: var(--event-color); font-weight: 600; }
+.inbox-times { color: var(--dim); font-variant-numeric: tabular-nums; }
 .inbox-event button { margin-top: 6px; }
+.inbox-history { margin-top: 14px; }
+.inbox-history summary { color: var(--dim); cursor: pointer; }
+.inbox-history summary:hover, .inbox-history[open] summary { color: #e6e6e6; }
+/* A delivered event is in the transcript in full; this is its index entry. */
+#inbox-read p { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
 .active-call { position: relative; --rim-color: #fff; display: block; width: 100%; text-align: left; border: 2px solid var(--rim-color); background: var(--glass-control); color: var(--rim-color); padding: 10px 12px; white-space: normal; overflow-wrap: anywhere; }
 .active-call:hover { border-color: var(--rim-color); text-decoration: underline; }
 /* Toolbar menu */

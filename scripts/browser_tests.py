@@ -737,7 +737,7 @@ context_window = 100000
         expect(page.locator('.tool.running')).to_have_count(0)
         self.assertTrue((self.home / 'Alpha-done').exists(), 'The original command must finish after the trigger')
         page.click('#activity-toggle')
-        expect(page.locator('.inbox-event')).to_contain_text('completed · urgent')
+        expect(page.locator('#inbox-read .inbox-event')).to_contain_text('Completed · urgent')
 
     def test_normal_timer_backgrounds_bash_and_delivers_at_its_settled_boundary(self):
         self.timer_wait = True
@@ -799,7 +799,7 @@ context_window = 100000
         expect(page.locator('#model')).to_be_enabled()
         self.assertNotIn('Beta event', self.turns)
         page.click('#activity-toggle')
-        expect(page.locator('.inbox-event')).to_contain_text('expired · normal')
+        expect(page.locator('#inbox-dropped .inbox-state')).to_have_text('Expired')
 
     def test_inbox_cancellation_is_scoped_and_does_not_invoke_a_model(self):
         page = self.session(self.page)
@@ -809,11 +809,53 @@ context_window = 100000
         foreign = other.url.replace('/sessions/', '/api/sessions/') + '/inbox/' + payload['event_id'] + '/cancel'
         self.assertEqual(self.context.request.post(foreign, data={}).status, 409)
         page.click('#activity-toggle')
-        expect(page.locator('.inbox-event')).to_contain_text('Scheduled · normal')
+        expect(page.locator('#inbox-list .inbox-state')).to_have_text('Scheduled')
         page.get_by_role('button', name='Cancel event', exact=True).click()
         self.inbox_state(endpoint, payload['event_id'], 'cancelled')
-        expect(page.locator('.inbox-event')).to_contain_text('cancelled · normal')
+        expect(page.locator('#inbox-dropped .inbox-state')).to_have_text('Cancelled')
         self.assertEqual(len(self.requests), 0)
+
+    def test_inbox_lists_events_awaiting_delivery_and_collapses_read_and_dropped_ones(self):
+        page = self.session(self.page)
+        endpoint, first = self.post_inbox_event(page, message='Beta event: build finished')
+        self.inbox_state(endpoint, first['event_id'], 'completed')
+        expect(page.locator('#model')).to_be_enabled()
+        soon = lambda minutes: (datetime.now().astimezone() + timedelta(minutes=minutes)).isoformat()
+        self.post_inbox_event(page, message='Beta event: later check', at=soon(30))
+        self.post_inbox_event(page, message='Beta event: check the canary', at=soon(5), priority='urgent')
+        _, stale = self.post_inbox_event(page, message='Beta event: stale reminder', at=soon(10))
+        page.click('#activity-toggle')
+        waiting = page.locator('#inbox-list .inbox-event')
+        expect(waiting.locator('.inbox-message')).to_have_text(
+            ['Beta event: check the canary', 'Beta event: stale reminder', 'Beta event: later check'])
+        expect(waiting.locator('.inbox-state')).to_have_text(['Scheduled · urgent', 'Scheduled', 'Scheduled'])
+        expect(page.locator('#activity-count')).to_have_text('3')
+        read, dropped = page.locator('#inbox-read'), page.locator('#inbox-dropped')
+        expect(read.locator('summary')).to_have_text('Read · 1')
+        expect(read).to_have_js_property('open', False)
+        expect(read.locator('.inbox-event')).to_be_hidden()
+        expect(dropped).to_be_hidden()
+        waiting.nth(1).get_by_role('button', name='Cancel event', exact=True).click()
+        self.inbox_state(endpoint, stale['event_id'], 'cancelled')
+        expect(waiting).to_have_count(2)
+        expect(dropped.locator('summary')).to_have_text('Not delivered · 1')
+        expect(dropped.locator('.inbox-event')).to_be_hidden()
+        read.locator('summary').click()
+        expect(read.locator('.inbox-event')).to_be_visible()
+        expect(read.locator('.inbox-state')).to_have_text('Completed')
+        expect(read.locator('.inbox-message')).to_have_text('Beta event: build finished')
+        # An update refreshes an open list in place, newest first.
+        _, second = self.post_inbox_event(page, message='Beta event: tests finished')
+        self.inbox_state(endpoint, second['event_id'], 'completed')
+        expect(read.locator('summary')).to_have_text('Read · 2')
+        expect(read).to_have_js_property('open', True)
+        expect(read.locator('.inbox-message')).to_have_text(['Beta event: tests finished', 'Beta event: build finished'])
+        expect(waiting).to_have_count(2)
+        page.reload()
+        page.click('#activity-toggle')
+        expect(page.locator('#inbox-list .inbox-event')).to_have_count(2)
+        expect(page.locator('#inbox-read')).to_have_js_property('open', False)
+        expect(page.locator('#inbox-read summary')).to_have_text('Read · 2')
 
     def test_timer_restores_and_wakes_after_restart_without_an_open_tab(self):
         self.timer_woke = threading.Event()

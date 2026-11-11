@@ -394,9 +394,12 @@ processes remain owned by the same session. Cancellation already requested by th
 user settles before any event starts.
 
 Expiry applies only before delivery starts; it never kills a running turn or
-process. The **Activity → Event inbox** section shows event text, priority, due
-time, expiry, status, and cancellation. Scheduled timers keep their countdowns in
-**Timers**. Event text remains ordinary input; priority does not grant approval or
+process. The **Activity → Event inbox** section lists events awaiting delivery
+with their text, status, priority, due time, expiry, and cancellation, soonest
+first. Delivered events move under **Read**; cancelled and expired events move
+under **Not delivered**. Both lists start collapsed and show the newest first.
+A delivered event's full text stays in the conversation. Scheduled timers keep
+their countdowns in **Timers**. Event text remains ordinary input; priority does not grant approval or
 additional tool authority.
 
 Each session accepts up to 100 active events in total and retains its last 100
