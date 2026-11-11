@@ -63,11 +63,11 @@ not delete the session's older threads from disk.
 
 ## Organize saved work
 
-Click **Archive** in the session toolbar or on the home page to hide a session
-without deleting it. Archived sessions show an **Archived** badge in the session
+Choose **Archive** from the session menu (**⋯**) or on the home page to hide a
+session without deleting it. Archived sessions show an **Archived** badge in the session
 header and browser list, alongside their activity status. Choose
-**Archived sessions** to find them; **Restore** is available in the list and toolbar.
-Restoring from the toolbar keeps your draft and stays in the session. Open tabs
+**Archived sessions** to find them; **Restore** is available in the list and the
+session menu. Restoring from the menu keeps your draft and stays in the session. Open tabs
 update their badges when you archive, restore, or undo. Opening an archived
 session URL does not restore it automatically. Archiving does not stop tools or
 archive children.

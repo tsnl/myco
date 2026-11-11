@@ -16,7 +16,8 @@ URL directly; there is no login, token, or browser cookie. Assets and Markdown
 rendering are bundled with myco, with no frontend build step or CDN. Stop the
 server with Ctrl-C in the launching terminal.
 
-**Auto-continue** is an opt-in per-session control, off by default. When on, the
+**Auto-continue** is an opt-in per-session control in the session menu, off by
+default. When on, the top bar shows an **Auto-continue** badge and the
 runner supplies internal follow-up prompts after completed responses or exhausted
 output caps. The agent disables it with `session_meta action=disable_auto_continue`
 when finished or when it needs user input. The control works during a run: turning
@@ -118,7 +119,7 @@ falling rain. Hidden tabs pause animation and airplane arrivals.
 The bundled renderer is adapted from [Horizon](https://github.com/dnlzro/horizon),
 with its MIT license retained in the served source.
 
-The **Settings** icon in the top bar opens a centered modal. Its **Sky** section
+**Settings** in the top bar's menu opens a centered modal. Its **Sky** section
 contains the weather controls. Choose a city or explicitly select **Use my
 location** to reflect its current cloud cover, rain, showers, and wind from
 [Open-Meteo](https://open-meteo.com/en/docs). The panel names the reported weather
@@ -178,13 +179,13 @@ bookmarks, middle-click, and browser tab groups. Click the myco name to return
 home. `--resume <id>` opens that session
 directly from the launch URL.
 
-Click **Archive** in the session toolbar to return to that profile's session
+Choose **Archive** from the session menu to return to that profile's session
 browser. The browser shows **Session Archived.** with an **Undo** button that
 restores the session to the active list. Undo remains available after a refresh.
 Archiving from a row in the session browser shows the same confirmation.
 Choose **Archived sessions** above the list to find archived sessions and **Restore**
 them. Archived sessions have an **Archived** badge in the list and session header,
-alongside their activity status. The session toolbar offers **Restore**, which
+alongside their activity status. The session menu offers **Restore**, which
 restores the session in place and keeps your draft. The badge updates in other
 open tabs when you archive, restore, or undo. Opening an archived session does
 not restore it. Archiving preserves history, the session URL, and running tools;
@@ -193,8 +194,8 @@ by another myco process must be archived from that process or after it closes.
 The list refreshes while the home page is visible; changes made outside this
 server can take up to ten seconds to appear.
 
-Use the pencil beside the session title, or **Rename** on a session-browser row,
-to edit its name. Enter or **Save** applies it; Escape or **Cancel** discards the
+Use **Rename session** in the session menu, or **Rename** on a session-browser
+row, to edit its name. Enter or **Save** applies it; Escape or **Cancel** discards the
 edit. Names must be non-empty and use the existing 120-character title limit.
 The title updates in open session tabs and the browser list. Renaming works
 while tools run and for archived sessions; it preserves the conversation, URL,
@@ -262,9 +263,12 @@ Queued image thumbnails are visible across session tabs and after a tab reload.
 
 The page heading and browser tab title follow the session title, including the
 first-message title and agent renames during a running turn. Hover over a truncated
-heading to read its full title. The top bar aligns with the conversation and keeps
-its controls on a separate row on narrow screens. Activity counts appear only
-while tools, background sessions, or timers are running.
+heading to read its full title. The top bar aligns with the conversation and
+gives the title the room beside the status, **Activity**, and the menu (**⋯**).
+The menu holds **Rename session**, **Compact**, **Auto-continue**, **Archive**,
+and **Settings**; Escape or a click outside closes it. Narrow screens keep the
+title on its own row above the controls. Activity counts appear only while
+tools, background sessions, or timers are running.
 
 Each tool appears as soon as execution starts, with a truncated argument
 preview in its collapsed header. Running calls are white; completed calls turn
