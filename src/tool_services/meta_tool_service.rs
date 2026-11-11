@@ -413,6 +413,18 @@ mod tests {
         (SessionMetaTool::new(active.clone()), active)
     }
 
+    /// Titles change when the user asks: the tool offers `set_title` without
+    /// telling the agent when to call it.
+    #[test]
+    fn the_description_offers_set_title_without_asking_the_agent_to_use_it() {
+        let mentions: Vec<_> = TOOL_DESCRIPTION
+            .lines()
+            .filter(|line| line.contains("set_title"))
+            .collect();
+        assert_eq!(mentions.len(), 1, "{mentions:?}");
+        assert!(mentions[0].starts_with("- set_title:"), "{mentions:?}");
+    }
+
     #[tokio::test]
     async fn set_title_and_get() {
         let _home = temp_home("meta-tool");
