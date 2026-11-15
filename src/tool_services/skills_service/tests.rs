@@ -101,8 +101,10 @@ async fn notices_follow_metadata_changes_and_removal_without_repeating() {
         .observe_successful_call(call.clone(), None, ctx.clone())
         .await
         .unwrap();
-    assert!(first.contains("first description"), "{first}");
-    assert!(!first.contains("PRIVATE_INSTRUCTIONS"));
+    assert!(first.text.contains("first description"), "{first:?}");
+    assert!(!first.text.contains("PRIVATE_INSTRUCTIONS"));
+    let summary = |listed: &[&str], removed: &[&str], warnings: usize| json!({"skills": {"listed": listed, "removed": removed, "warnings": warnings}});
+    assert_eq!(first.data, summary(&["project"], &[], 0));
     assert!(
         service
             .clone()
@@ -116,14 +118,17 @@ async fn notices_follow_metadata_changes_and_removal_without_repeating() {
         .observe_successful_call(call.clone(), None, ctx.clone())
         .await
         .unwrap();
-    assert!(changed.contains("second description"), "{changed}");
+    assert!(changed.text.contains("second description"), "{changed:?}");
+    assert_eq!(changed.data, summary(&["project"], &[], 0));
     std::fs::remove_file(path).unwrap();
     let removed = service
         .clone()
         .observe_successful_call(call.clone(), None, ctx.clone())
         .await
         .unwrap();
-    assert!(!removed.contains("second description"), "{removed}");
+    assert!(!removed.text.contains("second description"), "{removed:?}");
+    // The skill directory remains without a manifest, which is also a warning.
+    assert_eq!(removed.data, summary(&[], &["project"], 1));
     assert!(
         service
             .observe_successful_call(call, None, ctx)
@@ -305,10 +310,16 @@ async fn a_thread_starts_from_the_skills_its_prompt_lists() {
     assert_eq!(observe(&ctx).await, None, "repeated the prompt's catalog");
     skill(temp.path(), "changed after startup");
     let changed = observe(&ctx).await.unwrap();
-    assert!(changed.contains("changed after startup"), "{changed}");
+    assert!(
+        changed.text.contains("changed after startup"),
+        "{changed:?}"
+    );
     assert_eq!(observe(&ctx).await, None);
     // A rebuilt model's prompt replaces the old one, even within a thread.
     ctx.prompt_skills = Some(Arc::new(Reported::default()));
     let rebuilt = observe(&ctx).await.unwrap();
-    assert!(rebuilt.contains("changed after startup"), "{rebuilt}");
+    assert!(
+        rebuilt.text.contains("changed after startup"),
+        "{rebuilt:?}"
+    );
 }

@@ -558,7 +558,8 @@ directory, lists only what the thread has not been told: new or changed skills,
 listed skills no longer found in a layout the scan checked, and new discovery
 warnings. A skill already listed is not repeated when another directory sees it,
 and on the local host the startup catalog in the model's prompt counts as listed.
-Notices are model context; browser and terminal transcripts do not display them.
+Notices are model context; transcripts do not display them, though the browser
+labels the tool card with the skill names, such as `Skills: +review`.
 Observations are scoped to the session runtime and thread: a new thread receives
 skills again when it next operates where they are visible. Discovery has bounded
 directory, metadata, and notice limits. A partial catalog reports omissions or

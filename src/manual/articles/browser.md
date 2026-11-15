@@ -298,6 +298,10 @@ page refreshes; completion, failure, or cancellation freezes the final duration.
 Durations are observed by the running browser server and retained while viewing
 the same thread. Saved history opened after a server restart has no timing data.
 
+When a host reports skill changes with a tool result, the header also shows a
+short label such as `Skills: +review, -old, 1 warning`, listing up to three names.
+The notice itself is model context and stays out of the transcript.
+
 **Activity** opens a right-hand drawer containing all running tools in one list.
 Scheduled follow-ups appear in a separate **Timers** section with their own
 countdowns and cancellation controls.

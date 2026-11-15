@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::Async;
 use crate::generative_model::{ToolResult, ToolSpec, ToolUse};
-use crate::skills::{Reported, SkillCatalog};
+use crate::skills::{Report, Reported, SkillCatalog};
 
-use super::{HostDispatchContext, ToolService, tool_input_schema};
+use super::{HostDispatchContext, Observation, ToolService, tool_input_schema};
 
 #[derive(Default)]
 struct Observations {
@@ -65,7 +65,7 @@ impl SkillsService {
         target: Target,
         ctx: &HostDispatchContext,
         force: bool,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<(PathBuf, Report)>, String> {
         let owners = self.observations(ctx.agent_id);
         let observed = tokio::select! {
             biased;
@@ -92,13 +92,8 @@ impl SkillsService {
             observed.thread_id = ctx.thread_id.clone();
             observed.prompt_skills = ctx.prompt_skills.clone();
         }
-        let heading = if force {
-            "Skills for"
-        } else {
-            "Skill catalog changes for"
-        };
-        let body = catalog.report(&mut observed.reported, force);
-        Ok(body.map(|body| format!("{heading} {path:?}\n{body}")))
+        let report = catalog.report(&mut observed.reported, force);
+        Ok(report.map(|report| (path, report)))
     }
 }
 
@@ -140,7 +135,9 @@ impl ToolService for SkillsService {
             };
             let target = Target::Directory(input.path);
             match self.discover(target, &ctx, true).await {
-                Ok(Some(text)) => ToolResult::text(text),
+                Ok(Some((path, report))) => {
+                    ToolResult::text(format!("Skills for {path:?}\n{}", report.text))
+                }
                 Ok(None) => unreachable!("explicit discovery always returns a catalog"),
                 Err(error) => ToolResult::err(error),
             }
@@ -152,13 +149,23 @@ impl ToolService for SkillsService {
         tool: ToolUse,
         directory: Option<PathBuf>,
         ctx: HostDispatchContext,
-    ) -> Async<Option<String>> {
+    ) -> Async<Option<Observation>> {
         Box::pin(async move {
             let target = Target::from_tool(&tool, directory)?;
             match self.discover(target, &ctx, false).await {
-                Ok(notice) => notice,
+                Ok(report) => report.map(|(path, report)| Observation {
+                    text: format!("Skill catalog changes for {path:?}\n{}", report.text),
+                    data: serde_json::json!({"skills": {
+                        "listed": report.listed,
+                        "removed": report.removed,
+                        "warnings": report.warnings,
+                    }}),
+                }),
                 Err(_) if ctx.cancel.is_cancelled() => None,
-                Err(error) => Some(format!("Skill discovery incomplete: {error}")),
+                Err(error) => Some(Observation {
+                    text: format!("Skill discovery incomplete: {error}"),
+                    data: serde_json::json!({"skills": {"incomplete": true}}),
+                }),
             }
         })
     }

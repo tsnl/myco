@@ -66,6 +66,10 @@ pub(super) enum Block {
         running: bool,
         #[serde(rename = "elapsed_ms", skip_serializing_if = "Option::is_none")]
         timer: Option<ToolTimer>,
+        /// Skills hosts newly reported with the result, which the transcript
+        /// otherwise omits.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        skills: Option<String>,
     },
     Notice {
         text: String,
@@ -122,6 +126,7 @@ impl Block {
                 started,
                 finished: None,
             }),
+            skills: None,
         }
     }
 
@@ -137,10 +142,12 @@ impl Block {
             resource,
             waiting,
             tool,
+            skills,
             ..
         } = self
         {
             (*text, *images) = visible(&result.content);
+            *skills = skills_label(&result.content);
             *status = result
                 .status
                 .clone()
@@ -226,6 +233,41 @@ fn visible(content: &[Content]) -> (String, Vec<String>) {
         }
     }
     (text.join("\n"), images)
+}
+
+/// Summarize host skill observations by name: `Skills: +review, -old, 2 more`.
+fn skills_label(content: &[Content]) -> Option<String> {
+    const SHOWN: usize = 3;
+    let mut changes = Vec::new();
+    let mut notes = Vec::new();
+    for part in content {
+        let Content::System { kind, data, .. } = part else {
+            continue;
+        };
+        let skills = &data["skills"];
+        if kind != "host_observation" || skills.is_null() {
+            continue;
+        }
+        for (sign, key) in [("+", "listed"), ("-", "removed")] {
+            let names = skills[key].as_array().into_iter().flatten();
+            changes.extend(names.filter_map(|name| Some(format!("{sign}{}", name.as_str()?))));
+        }
+        match skills["warnings"].as_u64() {
+            Some(1) => notes.push("1 warning".to_owned()),
+            Some(n) if n > 1 => notes.push(format!("{n} warnings")),
+            _ => {}
+        }
+        if skills["incomplete"] == true {
+            notes.push("discovery incomplete".to_owned());
+        }
+    }
+    let hidden = changes.len().saturating_sub(SHOWN);
+    changes.truncate(SHOWN);
+    if hidden > 0 {
+        changes.push(format!("{hidden} more"));
+    }
+    changes.extend(notes);
+    (!changes.is_empty()).then(|| format!("Skills: {}", changes.join(", ")))
 }
 
 fn legacy_prelude_notice(text: &str) -> bool {

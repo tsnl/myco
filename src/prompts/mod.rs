@@ -326,7 +326,7 @@ fn skill_section(
 ) -> String {
     crate::skills::SkillCatalog::scan(directory, home)
         .report(listed, false)
-        .map(|catalog| format!("\n---\n\n# Local skills\n\n{catalog}"))
+        .map(|catalog| format!("\n---\n\n# Local skills\n\n{}", catalog.text))
         .unwrap_or_default()
 }
 

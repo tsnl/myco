@@ -54,11 +54,21 @@ pub struct SkillCatalog {
     roots: Vec<PathBuf>,
 }
 
-/// What one conversation thread has been told, bounded by `MAX_REPORTED`.
+/// What one conversation thread has been told, bounded by `MAX_REPORTED`:
+/// each manifest's metadata digest and skill name, and each warning.
 #[derive(Clone, Debug, Default)]
 pub struct Reported {
-    skills: BTreeMap<PathBuf, String>,
+    skills: BTreeMap<PathBuf, (String, String)>,
     warnings: BTreeSet<String>,
+}
+
+/// One rendered notice and the skills it newly lists or drops, by name.
+#[derive(Debug, Default, PartialEq)]
+pub struct Report {
+    pub text: String,
+    pub listed: Vec<String>,
+    pub removed: Vec<String>,
+    pub warnings: usize,
 }
 
 impl SkillCatalog {
@@ -89,22 +99,27 @@ impl SkillCatalog {
     /// repeats every current skill and warning. Lines over the notice budget
     /// stay unreported and are counted as omitted. Metadata is quoted as JSON
     /// to keep filenames and descriptions from inventing rows.
-    pub fn report(&self, reported: &mut Reported, all: bool) -> Option<String> {
+    pub fn report(&self, reported: &mut Reported, all: bool) -> Option<Report> {
         // Absence proves removal only after a complete scan of that layout.
-        let removed: Vec<PathBuf> = if self.truncated {
+        let removed: Vec<(PathBuf, String)> = if self.truncated {
             Vec::new()
         } else {
             reported
                 .skills
-                .keys()
-                .filter(|path| self.covers(path) && !self.entries.iter().any(|e| &e.path == *path))
-                .cloned()
+                .iter()
+                .filter(|(path, _)| {
+                    self.covers(path) && !self.entries.iter().any(|e| &e.path == *path)
+                })
+                .map(|(path, (_, name))| (path.clone(), name.clone()))
                 .collect()
         };
         let skills: Vec<_> = self
             .entries
             .iter()
-            .filter(|entry| all || reported.skills.get(&entry.path) != Some(&entry.digest))
+            .filter(|entry| {
+                all || reported.skills.get(&entry.path).map(|(digest, _)| digest)
+                    != Some(&entry.digest)
+            })
             .collect();
         let warnings: Vec<_> = self
             .issues
@@ -116,7 +131,10 @@ impl SkillCatalog {
                 return None;
             }
             if !self.truncated {
-                return Some("No skills found within this scan's scope.".into());
+                return Some(Report {
+                    text: "No skills found within this scan's scope.".into(),
+                    ..Report::default()
+                });
             }
         }
         let mut out = String::new();
@@ -134,19 +152,21 @@ impl SkillCatalog {
             }
             fits
         };
+        let mut report = Report::default();
         for entry in skills {
             if push(serde_json::to_string(entry).unwrap()) {
-                reported
-                    .skills
-                    .insert(entry.path.clone(), entry.digest.clone());
+                let listed = (entry.digest.clone(), entry.name.clone());
+                reported.skills.insert(entry.path.clone(), listed);
+                report.listed.push(entry.name.clone());
             }
         }
-        for path in removed {
+        for (path, name) in removed {
             if push(format!(
                 "No longer listed: {}",
                 serde_json::to_string(&path).unwrap()
             )) {
                 reported.skills.remove(&path);
+                report.removed.push(name);
             }
         }
         for issue in warnings {
@@ -155,6 +175,7 @@ impl SkillCatalog {
                 serde_json::to_string(issue).unwrap()
             )) {
                 reported.warnings.insert(issue.clone());
+                report.warnings += 1;
             }
         }
         if self.truncated || omitted > 0 {
@@ -164,7 +185,8 @@ impl SkillCatalog {
         if reported.skills.len() + reported.warnings.len() > MAX_REPORTED {
             *reported = Reported::default();
         }
-        Some(out)
+        report.text = out;
+        Some(report)
     }
 
     fn covers(&self, manifest: &Path) -> bool {
