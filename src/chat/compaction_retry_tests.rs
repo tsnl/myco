@@ -9,8 +9,10 @@ use std::time::Duration;
 
 use super::*;
 use crate::agent::NullEventSink;
+use crate::core::Async;
+use crate::generative_model::Message;
 use crate::harness::Harness;
-use crate::session::{ActiveSession, compact_thread};
+use crate::session::{ActiveSession, Session, Thread, compact_thread};
 use crate::test_support::{ScriptedModel, temp_home};
 
 #[derive(Default)]
