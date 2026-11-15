@@ -42,10 +42,7 @@ use crate::generative_model::{
 use crate::harness::{HarnessConfig, load_ssh_host_aliases};
 
 pub mod file;
-pub use file::{
-    AuthEntry, FileConfig, GatewayEntry, ModelEntry, RetryEntry, load_file_config,
-    parse_file_config_str,
-};
+use file::{AuthEntry, FileConfig, RetryEntry, load_file_config};
 
 /// Default per-generate output token cap when a model entry sets none.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: usize = 8192;
@@ -506,7 +503,7 @@ fn resolve_default_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use file::model_toml;
+    use file::{model_toml, parse_file_config_str};
 
     fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |key| {

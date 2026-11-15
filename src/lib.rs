@@ -38,7 +38,7 @@ pub use agent::{
     TraceContext,
 };
 pub use chat::{Compactor, ModelCompactor, SessionRunner, WorkflowEvent};
-pub use config::{Config, ConfigUserSettings, load_file_config};
+pub use config::{Config, ConfigUserSettings};
 pub use core::{CancelToken, HostResources, ModelInfo, ToolResource, uuid_simple_hex};
 pub use harness::{
     Harness, HarnessConfig, HostConfig, HostController, StartupPreflight, load_ssh_host_aliases,
