@@ -133,8 +133,8 @@ pub(super) async fn run_turn(
 pub(super) fn settle_stopped_run(agent: &mut Agent) -> Result<(), AgentInteractionError> {
     if !agent.state().is_idle() {
         agent.recover_interrupted()?;
-    } else if agent.checkpoint_failed() {
-        agent.checkpoint()?;
+    } else {
+        agent.repair_checkpoint()?;
     }
     Ok(())
 }

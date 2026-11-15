@@ -105,6 +105,34 @@ async fn repaired_terminal_checkpoint_commits_once_without_regeneration() {
 }
 
 #[tokio::test]
+async fn repair_checkpoint_saves_only_after_a_failed_save() {
+    let model = ScriptedModel::new(vec![output(false)]);
+    let events = Arc::new(Events::default());
+    let mut agent = Agent::new(model, Arc::new(Tools::default()), events.clone());
+    agent.append_input(user("task")).unwrap();
+    let failing = fail_saves(&mut agent);
+    agent.start_run().unwrap();
+    assert!(agent.step_once(CancelToken::new()).await.is_err());
+    assert!(agent.repair_checkpoint().is_err());
+
+    failing.store(false, Ordering::Relaxed);
+    agent.repair_checkpoint().unwrap();
+    assert!(!agent.checkpoint_failed());
+    assert_eq!(events.commits(), 1);
+
+    let saves = Arc::new(AtomicUsize::new(0));
+    agent.set_checkpoint(Some(Box::new({
+        let saves = saves.clone();
+        move |_| {
+            saves.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    })));
+    agent.repair_checkpoint().unwrap();
+    assert_eq!(saves.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
 async fn repaired_tool_checkpoints_commit_before_dispatch_and_never_repeat_completed_tools() {
     let model = ScriptedModel::new(vec![output(true), output(false)]);
     let events = Arc::new(Events::default());

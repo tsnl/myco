@@ -136,9 +136,7 @@ impl SessionRuntime {
     ) -> Result<(), crate::agent::AgentInteractionError> {
         // Preserve unsaved observations only while this agent still owns the
         // checkpoint. A superseded writer must not overwrite newer history.
-        if agent.checkpoint_failed() {
-            agent.checkpoint()?;
-        }
+        agent.repair_checkpoint()?;
         let session = self.session.snapshot();
         assert_eq!(
             self.session_id, session.id,

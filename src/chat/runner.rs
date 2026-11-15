@@ -466,9 +466,7 @@ impl Workflow {
         cancel: CancelToken,
         start: bool,
     ) -> Result<RunOutcome, AgentInteractionError> {
-        if agent.checkpoint_failed() {
-            agent.checkpoint()?;
-        }
+        agent.repair_checkpoint()?;
         self.record_runtime(agent, runtime).await?;
         if start {
             agent.start_run()?;

@@ -331,6 +331,15 @@ impl Agent {
         self.emit_checkpoint()
     }
 
+    /// [`Self::checkpoint`] only if the last save failed, so unsaved
+    /// observations persist before the agent is rebound or resumed.
+    pub fn repair_checkpoint(&self) -> Result<(), AgentInteractionError> {
+        if self.checkpoint_failed() {
+            self.emit_checkpoint()?;
+        }
+        Ok(())
+    }
+
     pub fn history(&self) -> &[Message] {
         self.state.history()
     }
