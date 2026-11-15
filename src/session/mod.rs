@@ -252,25 +252,37 @@ impl ActiveSession {
         f(&self.lock())
     }
 
+    /// Edit the live session without saving it. The next checkpoint persists
+    /// the edit; durable changes go through [`Self::update`].
     pub fn with_mut<R>(&self, f: impl FnOnce(&mut Session) -> R) -> R {
         f(&mut self.lock())
     }
 
-    /// Persist before exposing a mode change to a running session.
-    pub fn set_auto_continue(&self, enabled: bool) -> Result<(), String> {
+    /// Apply `f` to a copy and save it before it replaces the live session. A
+    /// failed edit or save leaves the live session unchanged, so no later
+    /// checkpoint can persist a change its caller reported as failed.
+    pub fn update<T>(
+        &self,
+        f: impl FnOnce(&mut Session) -> Result<T, String>,
+    ) -> Result<T, String> {
         let mut current = self.lock();
         let mut updated = current.clone();
-        updated.auto_continue = enabled;
-        store(&mut current, updated)
+        let value = f(&mut updated)?;
+        store(&mut current, updated)?;
+        Ok(value)
+    }
+
+    /// Persist before exposing a mode change to a running session.
+    pub fn set_auto_continue(&self, enabled: bool) -> Result<(), String> {
+        self.update(|session| {
+            session.auto_continue = enabled;
+            Ok(())
+        })
     }
 
     /// Save a title without replacing concurrent conversation or tool updates.
-    /// A failed save leaves the live metadata unchanged.
     pub fn rename(&self, title: String) -> Result<(), String> {
-        let mut current = self.lock();
-        let mut updated = current.clone();
-        updated.set_title(Some(title))?;
-        store(&mut current, updated)
+        self.update(|session| session.set_title(Some(title)))
     }
 
     /// Archive only this session, preserving threads, lineage and live tools.
@@ -401,17 +413,20 @@ impl ActiveSession {
 
     /// Set title if currently unset, from the first user line. Returns true if set.
     pub fn maybe_auto_title_from_user_text(&self, text: &str) -> Result<bool, String> {
-        let mut session = self.lock();
-        if session.title.is_some() {
+        // Every accepted submission calls this; only an untitled session saves.
+        if self.with(|session| session.title.is_some()) {
             return Ok(false);
         }
-        if let Some(title) = auto_title_from_text(text) {
-            let mut updated = session.clone();
-            updated.title = Some(title);
-            store(&mut session, updated)?;
-            return Ok(true);
-        }
-        Ok(false)
+        let Some(title) = auto_title_from_text(text) else {
+            return Ok(false);
+        };
+        self.update(|session| {
+            let untitled = session.title.is_none();
+            if untitled {
+                session.title = Some(title);
+            }
+            Ok(untitled)
+        })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Session> {
