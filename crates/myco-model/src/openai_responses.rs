@@ -5,7 +5,7 @@
 //! xAI: <https://docs.x.ai/docs/guides/function-calling>
 //! OpenRouter: <https://openrouter.ai/docs/api/api-reference/responses/create-responses>
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use super::driver_core::{Slot, SlotMap, SseAccumulator};
@@ -212,12 +212,10 @@ fn tool_result_to_output(result: &ToolResult) -> ResponsesFunctionOutput {
 struct StreamAccumulator {
     slots: SlotMap,
     reasoning: BTreeMap<usize, Reasoning>,
-    /// Streamed function-call arguments per `output_index`, so a
-    /// `function_call_arguments.done` with final arguments can be preferred
-    /// when no deltas were streamed.
-    tool_input_json: Vec<Option<String>>,
+    /// `output_index`es of function calls that already emitted arguments, so a
+    /// `function_call_arguments.done` repeats them only when nothing streamed.
+    streamed_arguments: BTreeSet<usize>,
     saw_tool_call: bool,
-    stop_reason: Option<TurnEndReason>,
     finished: bool,
 }
 
@@ -240,25 +238,22 @@ impl SseAccumulator for StreamAccumulator {
     fn finished(&self) -> bool {
         self.finished
     }
-
-    fn finish(self) -> Result<(), GenerateError> {
-        driver_core::validate_finish(
-            "OpenAI Responses",
-            self.stop_reason.is_some(),
-            self.tool_input_json
-                .iter()
-                .enumerate()
-                .filter_map(|(i, json)| json.as_deref().map(|j| (i, j))),
-        )
-    }
 }
 
 impl StreamAccumulator {
-    fn set_tool_json(&mut self, output_index: usize, json: String) {
-        while self.tool_input_json.len() <= output_index {
-            self.tool_input_json.push(None);
+    fn emit_arguments(
+        &mut self,
+        output_index: usize,
+        index: usize,
+        arguments: String,
+    ) -> MessagePart {
+        if !arguments.is_empty() {
+            self.streamed_arguments.insert(output_index);
         }
-        self.tool_input_json[output_index] = Some(json);
+        MessagePart::ToolUseDelta(ToolUseDelta {
+            index,
+            input_json_delta: arguments,
+        })
     }
 
     fn thinking_index(&mut self, output_index: usize, out: &mut Vec<MessagePart>) -> Option<usize> {
@@ -320,7 +315,6 @@ impl StreamAccumulator {
                         .into());
                     };
                     let tool_index = self.slots.open_tool_use(output_index);
-                    let arguments = arguments.unwrap_or_default();
                     self.saw_tool_call = true;
                     out.push(MessagePart::ToolUseStart(ToolUseStart {
                         index: tool_index,
@@ -329,13 +323,9 @@ impl StreamAccumulator {
                     }));
                     // Some gateways send the complete arguments here and
                     // stream no deltas.
-                    if !arguments.is_empty() {
-                        out.push(MessagePart::ToolUseDelta(ToolUseDelta {
-                            index: tool_index,
-                            input_json_delta: arguments.clone(),
-                        }));
+                    if let Some(arguments) = arguments.filter(|a| !a.is_empty()) {
+                        out.push(self.emit_arguments(output_index, tool_index, arguments));
                     }
-                    self.set_tool_json(output_index, arguments);
                 }
                 ResponsesOutputItem::Other => {
                     self.slots.ignore(output_index);
@@ -396,13 +386,7 @@ impl StreamAccumulator {
             } => {
                 match self.slots.get(output_index) {
                     Some(Slot::ToolUse { index }) => {
-                        if let Some(Some(acc)) = self.tool_input_json.get_mut(output_index) {
-                            acc.push_str(&delta);
-                        }
-                        out.push(MessagePart::ToolUseDelta(ToolUseDelta {
-                            index,
-                            input_json_delta: delta,
-                        }));
+                        out.push(self.emit_arguments(output_index, index, delta));
                     }
                     _ => {
                         // Without a prior output_item.added we have no call_id/name, so
@@ -421,24 +405,11 @@ impl StreamAccumulator {
                 output_index,
                 arguments,
             } => {
-                if let Some(arguments) = arguments {
-                    // Prefer the final assembled arguments when the gateway provides them.
-                    if let Some(Slot::ToolUse { index }) = self.slots.get(output_index) {
-                        // Emit a full replace only if we never streamed deltas.
-                        let prior = self
-                            .tool_input_json
-                            .get(output_index)
-                            .and_then(|j| j.as_ref())
-                            .map(|s| s.as_str())
-                            .unwrap_or("");
-                        if prior.is_empty() {
-                            out.push(MessagePart::ToolUseDelta(ToolUseDelta {
-                                index,
-                                input_json_delta: arguments.clone(),
-                            }));
-                        }
-                    }
-                    self.set_tool_json(output_index, arguments);
+                if let Some(arguments) = arguments
+                    && let Some(Slot::ToolUse { index }) = self.slots.get(output_index)
+                    && !self.streamed_arguments.contains(&output_index)
+                {
+                    out.push(self.emit_arguments(output_index, index, arguments));
                 }
             }
             ResponsesStreamEvent::ResponseCompleted { response } => {
@@ -477,7 +448,6 @@ impl StreamAccumulator {
                 for output_index in self.reasoning.keys().copied().collect::<Vec<_>>() {
                     self.finish_reasoning(output_index, &mut out);
                 }
-                self.stop_reason = Some(reason.clone());
                 if let Some(u) = response.usage {
                     out.push(MessagePart::Usage(u.into_token_usage()));
                 }
@@ -942,7 +912,6 @@ mod tests {
                 message.push(&part).unwrap();
             }
         }
-        stream.finish().unwrap();
         message.finish().unwrap()
     }
 
@@ -1122,7 +1091,6 @@ mod tests {
             })
             .unwrap();
         expect_turn_end(&items[0], TurnEndReason::ToolUse);
-        acc.finish().unwrap();
     }
 
     #[test]
@@ -1144,7 +1112,6 @@ mod tests {
             })
             .unwrap();
         expect_turn_end(&items[0], TurnEndReason::EndTurn);
-        acc.finish().unwrap();
     }
 
     #[test]

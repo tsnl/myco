@@ -1,6 +1,7 @@
 //! Protocol-independent scaffolding shared by the streaming drivers: HTTP
 //! client construction, the spawned generate task (channel + request + stream
-//! bridge), the SSE drive loop, and stream-index remapping.
+//! bridge), the SSE drive loop with end-of-stream validation, and
+//! stream-index remapping.
 
 use super::*;
 
@@ -39,38 +40,14 @@ pub(super) fn build_client(
         .map_err(|e| ModelCreationError::Uncategorized(format!("{e:?}")))
 }
 
-/// Accumulates one provider's SSE `data:` payloads into [`MessagePart`]s.
+/// Decodes one provider's SSE `data:` payloads into [`MessagePart`]s. Message
+/// validity (a stop reason arrived, tool arguments parse) is checked once, in
+/// the drive loop, on the parts the decoder emits.
 pub(super) trait SseAccumulator: Send + 'static {
     /// Parse one `data:` payload and return the parts it yields.
     fn handle_data(&mut self, data: &str) -> Result<Vec<MessagePart>, GenerationFailure>;
     /// True once the provider signalled end of message; the drive loop stops reading.
     fn finished(&self) -> bool;
-    /// Validate that the stream completed properly (stop reason arrived, …).
-    fn finish(self) -> Result<(), GenerateError>;
-}
-
-/// Shared end-of-stream validation behind every driver's
-/// [`SseAccumulator::finish`]: a stop reason must have arrived, and each
-/// accumulated tool-call argument string must parse as JSON (empty = `{}`).
-pub(super) fn validate_finish<'a>(
-    provider: &str,
-    stop_reason_seen: bool,
-    tool_args: impl IntoIterator<Item = (usize, &'a str)>,
-) -> Result<(), GenerateError> {
-    if !stop_reason_seen {
-        return Err(GenerateError::MalformedResponseError(format!(
-            "{provider} stream ended without a stop reason"
-        )));
-    }
-    for (i, args) in tool_args {
-        let json = if args.is_empty() { "{}" } else { args };
-        if let Err(e) = serde_json::from_str::<serde_json::Value>(json) {
-            return Err(GenerateError::MalformedResponseError(format!(
-                "Malformed stream: {provider} tool call arguments at index {i} invalid: {e}"
-            )));
-        }
-    }
-    Ok(())
 }
 
 pub(super) fn error_stream(e: GenerateError) -> AsyncStream<GenerationEvent> {
@@ -193,6 +170,10 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::
     Some(std::time::Duration::from_secs(raw.trim().parse().ok()?))
 }
 
+/// Forward decoded parts while checking them with a [`MessageAccumulator`],
+/// so a stream that would assemble into an invalid message fails here, as a
+/// failure carrying the 200 response's `Retry-After`, before the invalid part
+/// reaches the caller.
 async fn drive_sse_stream<A: SseAccumulator>(
     response: reqwest::Response,
     tx: &tokio::sync::mpsc::Sender<GenerationEvent>,
@@ -200,8 +181,19 @@ async fn drive_sse_stream<A: SseAccumulator>(
     provider: &str,
 ) -> Result<(), GenerationFailure> {
     let retry_after = parse_retry_after(response.headers());
+    // The agent also retries malformed drafts. Keep the provider's minimum
+    // for any caller that elects to retry this failure.
+    let malformed = |cause| GenerationFailure {
+        cause,
+        retryable: false,
+        retry_after,
+    };
     let mut byte_stream = response.bytes_stream();
     let mut sse = SseParser::default();
+    let mut message = MessageAccumulator::default();
+    message
+        .push(&MessagePart::MessageStart)
+        .map_err(malformed)?;
     let mut started = false;
 
     while let Some(chunk) = byte_stream.next().await {
@@ -216,11 +208,12 @@ async fn drive_sse_stream<A: SseAccumulator>(
 
         for data in sse.push(&chunk) {
             let mut parts = acc.handle_data(&data).map_err(|mut failure| {
-                // The agent also retries malformed drafts. Keep the provider's
-                // minimum for any caller that elects to retry this failure.
                 failure.retry_after = failure.retry_after.max(retry_after);
                 failure
             })?;
+            for part in &parts {
+                message.push(part).map_err(malformed)?;
+            }
             // HTTP headers and SSE keepalives are not model output. Delay the
             // synthetic start until there is a response part to consume.
             if !started && !parts.is_empty() {
@@ -243,11 +236,7 @@ async fn drive_sse_stream<A: SseAccumulator>(
         }
     }
 
-    acc.finish().map_err(|cause| GenerationFailure {
-        cause,
-        retryable: false,
-        retry_after,
-    })
+    message.finish().map(drop).map_err(malformed)
 }
 
 /// Maps a provider's unified stream indices (Anthropic content blocks, OpenAI

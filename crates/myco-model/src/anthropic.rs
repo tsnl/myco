@@ -291,7 +291,6 @@ fn convert_messages(input: &[Message]) -> Result<Vec<AnthropicMessage>, Generate
 #[derive(Default)]
 struct StreamAccumulator {
     slots: SlotMap,
-    stop_reason: Option<AnthropicStopReason>,
     finished: bool,
 }
 
@@ -307,10 +306,6 @@ impl SseAccumulator for StreamAccumulator {
 
     fn finished(&self) -> bool {
         self.finished
-    }
-
-    fn finish(self) -> Result<(), GenerateError> {
-        driver_core::validate_finish("Anthropic", self.stop_reason.is_some(), std::iter::empty())
     }
 }
 
@@ -488,7 +483,6 @@ impl StreamAccumulator {
                         )
                         .into());
                     }
-                    self.stop_reason = Some(stop_reason.clone());
                     out.push(MessagePart::TurnEndReason(TurnEndReason::from(stop_reason)));
                 }
             }
@@ -1398,6 +1392,5 @@ mod tests {
         })
         .unwrap();
         acc.handle_event(AnthropicStreamEvent::MessageStop).unwrap();
-        acc.finish().unwrap();
     }
 }
