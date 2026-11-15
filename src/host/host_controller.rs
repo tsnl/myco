@@ -30,6 +30,9 @@ use crate::tool_services::HostDispatchContext;
 const RESPONSE_GRACE_MS: u64 = 5_000;
 const DEFAULT_RESPONSE_TIMEOUT_MS: u64 = 60_000;
 const MAX_RESPONSE_TIMEOUT_MS: u64 = 1_800_000;
+/// After a cancel, how long to wait for the host's partial result before
+/// abandoning the waiter. Matches the agent's own cancel grace.
+const CANCEL_ACK_GRACE: Duration = Duration::from_secs(2);
 
 /// Configuration for one remote host endpoint (spawn argv).
 ///
@@ -406,13 +409,20 @@ impl HostController {
         let deadline = tokio::time::sleep(response_timeout);
         tokio::pin!(deadline);
         let mut background_sent = false;
+        let mut cancel_sent = false;
         let reply = loop {
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => {
+                _ = cancel.cancelled(), if !cancel_sent => {
+                    // Keep awaiting the reply: a cancel-aware host tool answers
+                    // with its honest partial result (bash drains output after
+                    // killing the group), exactly as in-process dispatch does.
+                    cancel_sent = true;
                     self.cancel_remote(&id).await;
-                    self.abandon(&id).await;
-                    return ToolResult::err("cancelled while awaiting host acknowledgement; effects are unknown");
+                    let ack_deadline = tokio::time::Instant::now() + CANCEL_ACK_GRACE;
+                    if ack_deadline < deadline.deadline() {
+                        deadline.as_mut().reset(ack_deadline);
+                    }
                 }
                 r = &mut rx => break r,
                 result = &mut background_request, if !background_sent => {
@@ -423,6 +433,10 @@ impl HostController {
                     }
                 }
                 _ = &mut deadline => {
+                    if cancel_sent {
+                        self.abandon(&id).await;
+                        return ToolResult::err("cancelled; host did not acknowledge before the deadline; effects are unknown");
+                    }
                     self.cancel_remote(&id).await;
                     self.abandon(&id).await;
                     let message = format!(

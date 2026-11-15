@@ -113,7 +113,7 @@ async fn background_remote_exec_preserves_the_process_and_connection() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cancel_midcall_then_next_call_succeeds() {
+async fn cancel_midcall_returns_the_hosts_partial_output_and_next_call_succeeds() {
     let client = subprocess_host();
     let sleep_tag = format!("97.{}", uuid::Uuid::new_v4().as_u128() % 100_000);
 
@@ -124,7 +124,7 @@ async fn cancel_midcall_then_next_call_succeeds() {
         ToolUse {
             name: "bash".into(),
             input: json!({
-                "command": format!("sleep {sleep_tag}; echo done-slow"),
+                "command": format!("echo before-cancel; sleep {sleep_tag}; echo done-slow"),
                 "timeout_ms": 180_000
             }),
             thought_signature: None,
@@ -140,6 +140,10 @@ async fn cancel_midcall_then_next_call_succeeds() {
     };
     assert!(cancelled.is_error, "{cancelled:?}");
     assert!(tool_text(&cancelled).contains("cancelled"), "{cancelled:?}");
+    assert!(
+        tool_text(&cancelled).contains("before-cancel"),
+        "the host's honest partial result must reach the caller: {cancelled:?}"
+    );
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while process_with(&format!("sleep {sleep_tag}")) {
