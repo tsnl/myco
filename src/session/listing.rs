@@ -84,7 +84,7 @@ pub fn list_sessions() -> Result<Vec<SessionListEntry>, String> {
 /// List sessions, newest first. When `include_hidden` is false, subagent/compact
 /// sessions are omitted.
 ///
-/// Unreadable files (corrupt JSON, wrong [`SESSION_FILE_VERSION`]) are skipped
+/// Unreadable files (corrupt JSON, wrong [`SESSION_FILE_VERSION`](super::SESSION_FILE_VERSION)) are skipped
 /// rather than failing the listing, but never silently: they are reported once
 /// per process. A session that vanishes from
 /// `/sessions` without a word is indistinguishable from one that was never
