@@ -169,7 +169,15 @@ async fn authorized_operations_do_not_retarget_reused_names_or_delay_owner_clean
     .await
     .unwrap();
     let old = operation
-        .collect(1000, 10, 4096, false, dispatch_ctx(original_owner))
+        .collect(
+            Wait {
+                timeout_ms: 1000,
+                idle_ms: 10,
+                max_bytes: 4096,
+            },
+            false,
+            &dispatch_ctx(original_owner),
+        )
         .await
         .unwrap();
     assert_eq!(old.owner, original_owner);
@@ -743,7 +751,11 @@ fn assert_timeout_resolution(base: serde_json::Value, default_ms: u64, max_ms: u
     };
     let timeout_of = |action: Action| match action {
         Action::Exec { timeout_ms, .. } => timeout_ms.expect("legacy exec timeout"),
-        Action::Read { timeout_ms, .. } => timeout_ms,
+        Action::Interact {
+            step: Step::Read,
+            wait,
+            ..
+        } => wait.timeout_ms,
         other => panic!("expected Exec/Read, got {other:?}"),
     };
 
@@ -1794,7 +1806,10 @@ fn signal_defaults_to_int_and_requires_session_id() {
     }))
     .unwrap();
     match resolve_action(&input).unwrap() {
-        Action::Signal { signal, .. } => assert_eq!(signal, SignalKind::Int),
+        Action::Interact {
+            step: Step::Signal(signal),
+            ..
+        } => assert_eq!(signal, SignalKind::Int),
         other => panic!("expected Signal, got {other:?}"),
     }
 
@@ -1805,7 +1820,10 @@ fn signal_defaults_to_int_and_requires_session_id() {
     }))
     .unwrap();
     match resolve_action(&input).unwrap() {
-        Action::Signal { signal, .. } => assert_eq!(signal, SignalKind::Term),
+        Action::Interact {
+            step: Step::Signal(signal),
+            ..
+        } => assert_eq!(signal, SignalKind::Term),
         other => panic!("expected Signal, got {other:?}"),
     }
 
