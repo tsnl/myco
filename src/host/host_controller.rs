@@ -439,10 +439,19 @@ impl HostController {
 
     /// Fire-and-forget: the worker reaps without replying, and a missing or
     /// dead connection is a quiet no-op (worker exit when the connection drops
-    /// is the hard guarantee).
+    /// is the hard guarantee). The worker reaps everything the owner retained,
+    /// so it stops pinning idle reaping and counting toward lost sessions.
     async fn notify_remote_agent_finished(&self, agent_id: uuid::Uuid) -> Result<(), String> {
+        let write_tx = self
+            .with_live_conn(|c| {
+                let mut activity = c.activity.lock().unwrap();
+                activity.owners.remove(&agent_id);
+                activity.bash_sessions.remove(&agent_id);
+                c.write_tx.clone()
+            })
+            .await;
         // Not connected: nothing to reap on the worker.
-        let Some(write_tx) = self.with_live_conn(|c| c.write_tx.clone()).await else {
+        let Some(write_tx) = write_tx else {
             return Ok(());
         };
         let bytes = Request::AgentFinished { agent_id }.encode()?;
@@ -1130,5 +1139,51 @@ mod tests {
             "{result:?}"
         );
         assert!(ctl.is_connected());
+    }
+
+    /// A finished owner can retain nothing on the worker, so it must stop
+    /// pinning idle reaping and stop counting toward lost sessions.
+    #[tokio::test]
+    async fn finished_owner_is_pruned_from_connection_bookkeeping() {
+        let result_line = String::from_utf8(
+            Response::ToolResult {
+                id: "1".into(),
+                result: ToolResult::text("done"),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+        let ctl = scripted_host(
+            "prune",
+            format!(
+                "read -r _hello; printf '%s\\n' '{}'; read -r _request; printf '%s\\n' '{}'; read -r _finished; read -r _done",
+                hello_line(env!("CARGO_PKG_VERSION")),
+                result_line.trim_end(),
+            ),
+        );
+        let owner = uuid::Uuid::new_v4();
+        let tool = ToolUse {
+            name: "bash".into(),
+            input: json!({"command": "true"}),
+            thought_signature: None,
+        };
+        assert!(!ctl.call(owner, tool, CancelToken::new()).await.is_error);
+        async fn tracked(ctl: &HostController, owner: uuid::Uuid) -> Option<(bool, bool)> {
+            ctl.with_live_conn(|c| {
+                let activity = c.activity.lock().unwrap();
+                (
+                    activity.owners.contains(&owner),
+                    activity.bash_sessions.contains_key(&owner),
+                )
+            })
+            .await
+        }
+        ctl.with_live_conn(|c| c.activity.lock().unwrap().bash_sessions.insert(owner, 2))
+            .await;
+        assert_eq!(tracked(&ctl, owner).await, Some((true, true)));
+
+        ctl.notify_remote_agent_finished(owner).await.unwrap();
+        assert_eq!(tracked(&ctl, owner).await, Some((false, false)));
     }
 }
