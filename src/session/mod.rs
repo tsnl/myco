@@ -308,16 +308,15 @@ impl ActiveSession {
         let mut updated = current.clone();
         updated.archived = archived;
         updated.touch();
-        updated.externalize_images()?;
         // Keep the archived flag until restore reaches the active directory.
         // A failed or interrupted move must remain visible in archived listings.
         if !archived {
             relocation.apply()?;
-            updated.save()?;
+            updated.save_externalized()?;
             *current = updated;
             return Ok(());
         }
-        updated.save()?;
+        updated.save_externalized()?;
         *current = updated;
         relocation.apply().map_err(|error| {
             format!("Archive status saved, but files could not all be moved; retry /archive {}: {error}", current.id)
@@ -420,8 +419,7 @@ impl ActiveSession {
 /// leaves the session as it was.
 fn store(current: &mut Session, mut updated: Session) -> Result<(), String> {
     updated.touch();
-    updated.externalize_images()?;
-    updated.save()?;
+    updated.save_externalized()?;
     *current = updated;
     Ok(())
 }
@@ -585,16 +583,23 @@ impl Session {
         Ok(())
     }
 
+    /// Write a copy with inline images moved to the profile's image store.
     pub fn save(&self) -> Result<(), String> {
+        self.clone().save_externalized()
+    }
+
+    /// Move inline images to the image store in place, then write. The live
+    /// session keeps the same references the file holds, so later saves only
+    /// externalize new images; externalizing a reference only validates it.
+    fn save_externalized(&mut self) -> Result<(), String> {
+        self.externalize_images()?;
         let path = self.json_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         // Minified, not pretty-printed: the file is rewritten every turn, and
         // structured readers (`session_history`, `jq`) don't need indentation.
-        let mut document = self.clone();
-        document.externalize_images()?;
-        let json = serde_json::to_vec(&document).map_err(|e| e.to_string())?;
+        let json = serde_json::to_vec(self).map_err(|e| e.to_string())?;
         atomically_write(&path, &json)
     }
 

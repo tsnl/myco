@@ -137,17 +137,16 @@ impl SessionRuntime {
         // Preserve unsaved observations only while this agent still owns the
         // checkpoint. A superseded writer must not overwrite newer history.
         agent.repair_checkpoint()?;
-        let session = self.session.snapshot();
+        let (session_id, thread) = self.active_thread();
         assert_eq!(
-            self.session_id, session.id,
+            self.session_id, session_id,
             "a runtime belongs to one session"
         );
-        let thread = session.active_thread();
         if !agent.state().is_idle() {
             return Err(crate::agent::StateError::Busy.into());
         }
         let mut history =
-            crate::agent::recover_checkpoint(thread.messages.clone(), thread.pending_operation)?;
+            crate::agent::recover_checkpoint(thread.messages, thread.pending_operation)?;
         crate::core::image_store::ImageStore::for_profile()
             .and_then(|store| store.externalize_messages(&mut history))
             .map_err(crate::agent::AgentInteractionError::Checkpoint)?;
@@ -161,8 +160,8 @@ impl SessionRuntime {
         agent.replace_context(history, thread.last_usage)?;
         agent.restore_context_size_hint(thread.context_tokens_estimate);
         let mut context = agent.context().clone();
-        context.session_id = Some(session.id.clone());
-        context.thread_id = Some(thread.id.clone());
+        context.session_id = Some(session_id);
+        context.thread_id = Some(thread.id);
         agent.set_context(context);
         agent.set_tools(self.clone());
         agent.set_checkpoint(None);
@@ -174,19 +173,25 @@ impl SessionRuntime {
         agent: &mut Agent,
         continuing: bool,
     ) -> Result<(), crate::agent::AgentInteractionError> {
-        let session = self.session.snapshot();
-        let thread = session.active_thread();
+        let (session_id, thread) = self.active_thread();
         if continuing {
-            agent.replace_at_boundary(thread.messages.clone(), thread.last_usage)?;
+            agent.replace_at_boundary(thread.messages, thread.last_usage)?;
         } else {
-            agent.replace_context(thread.messages.clone(), thread.last_usage)?;
+            agent.replace_context(thread.messages, thread.last_usage)?;
         }
         let mut context = agent.context().clone();
-        context.session_id = Some(session.id.clone());
-        context.thread_id = Some(thread.id.clone());
+        context.session_id = Some(session_id);
+        context.thread_id = Some(thread.id);
         agent.set_context(context);
         agent.set_checkpoint(None);
         Ok(())
+    }
+
+    /// The session id and a copy of its active thread, without cloning the
+    /// threads before it.
+    fn active_thread(&self) -> (String, crate::session::Thread) {
+        self.session
+            .with(|session| (session.id.clone(), session.active_thread().clone()))
     }
 
     /// Current resource observations; unavailable hosts remain explicitly unknown.

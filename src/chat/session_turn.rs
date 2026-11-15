@@ -255,7 +255,7 @@ fn wire_checkpoint_at(
 /// A session that never accepted input does not create a file.
 pub fn persist_session(agent: &Agent, session: &ActiveSession, force: bool) -> Result<(), String> {
     let history = agent.history();
-    if history.is_empty() && !session.snapshot().json_path().exists() {
+    if history.is_empty() && !session.with(|session| session.json_path().exists()) {
         return Ok(());
     }
     agent.checkpoint().map_err(|error| error.to_string())?;
@@ -263,7 +263,7 @@ pub fn persist_session(agent: &Agent, session: &ActiveSession, force: bool) -> R
         .context()
         .thread_id
         .clone()
-        .unwrap_or_else(|| session.snapshot().active_thread().id.clone());
+        .unwrap_or_else(|| session.with(|session| session.active_thread().id.clone()));
     session.persist_agent_state(&thread_id, agent.state(), force, None)
 }
 
