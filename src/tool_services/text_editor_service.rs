@@ -208,17 +208,34 @@ impl<R: Read> Read for Fingerprinting<R> {
 }
 
 /// Read a file for mutation, failing unless its bytes match the owner's stamp.
+///
+/// A streamed pre-check rejects a changed file in bounded memory; the buffer
+/// that is then edited is fingerprinted as it is read, so the edit can only
+/// ever apply to exactly the stamped bytes.
 fn read_stamped(read_files: &HashMap<PathBuf, Fingerprint>, path: &str) -> Result<String, String> {
     let Some(read_fingerprint) = read_files.get(Path::new(path)) else {
         return Err(format!(
             "File {path:?} was not read before being mutated. Read the file first."
         ));
     };
-    let bytes = std::fs::read(path).map_err(|e| format!("Error reading file '{path}': {e}"))?;
-    if fingerprint(&bytes) != *read_fingerprint {
-        return Err(format!(
+    let read_error = |e: io::Error| format!("Error reading file '{path}': {e}");
+    let modified = || {
+        format!(
             "File {path:?} was modified on disk after being read. Read the file again before mutating."
-        ));
+        )
+    };
+    let mut file = Fingerprinting::new(std::fs::File::open(path).map_err(read_error)?);
+    io::copy(&mut file, &mut io::sink()).map_err(read_error)?;
+    let Fingerprinting { mut inner, digest } = file;
+    if finish(digest) != *read_fingerprint {
+        return Err(modified());
+    }
+    io::Seek::rewind(&mut inner).map_err(read_error)?;
+    let mut file = Fingerprinting::new(inner);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(read_error)?;
+    if file.finish() != *read_fingerprint {
+        return Err(modified());
     }
     String::from_utf8(bytes).map_err(|e| format!("Error reading file '{path}': {e}"))
 }
