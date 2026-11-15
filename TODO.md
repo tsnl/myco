@@ -48,8 +48,10 @@ Correctness and reliability. Feature parity is worthless if long sessions corrup
   - The manual documents well-formed history on generate error / cancel (no stale caveat).
 - [x] **Remote host-side cancel** — request-id cancellation crosses the host protocol and
       reaches the worker-side token; local and remote bash execs both kill their process groups.
-- [ ] **Host liveness / reconnect** — V1 is attach-time + next tool error. Soft reconnect,
-      clearer mid-session DOWN UX in the browser.
+- [ ] **Host liveness / reconnect** — a remote reconnects on its next tool call, and the
+      browser shows `NAME down` beside the session status once a connection attempt fails or
+      a held connection dies. Remaining: a connection that hangs without closing is not shown as
+      down; its resource queries time out and its tool cards read "state unknown".
 - [x] (REJECT) **Cold resume honesty** — sessions restore messages only (no bash sessions, no editor
       stamps). Banner or rehydrate hints so `/resume` does not feel broken.
   - Note: `/help` already documents “conversation memory only”; reject is for extra UX work.

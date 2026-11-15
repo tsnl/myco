@@ -9,7 +9,7 @@
 //! Tool service implementations live in [`crate::tool_services`].
 
 mod host_controller;
-pub use host_controller::{HostConfig, HostController};
+pub use host_controller::{HostConfig, HostController, HostFailure};
 
 mod host_worker;
 pub use host_worker::HostWorker;

@@ -354,6 +354,11 @@ function metadata() {
   $('archive').disabled = !connected || !state.session_id || archiving;
   $('archive').textContent = state.archived ? 'Restore' : 'Archive';
   $('archived-status').hidden = !state.archived;
+  const down = state.down_hosts || [];
+  $('hosts-down').hidden = !down.length;
+  $('hosts-down').textContent = down.length === 1 ? `${down[0].name} down` : `${down.length} hosts down`;
+  $('hosts-down').title = down.map(host => `${host.name} failed at ${new Date(host.since).toLocaleTimeString()}: ${host.error}`)
+    .concat(down.length ? ['Tools retry the connection on their next call.'] : []).join('\n');
   $('rename').disabled = !connected || !state.session_id || archiving;
   $('session-title').textContent = state.title || 'Session';
   $('session-title').title = state.title || 'Session';

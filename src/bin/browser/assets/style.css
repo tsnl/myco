@@ -81,6 +81,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .session-state { display: flex; flex: none; align-items: center; gap: 8px; }
 #auto-continue-status { color: var(--cyan); }
 .archive-indicator { display: inline-block; padding: 0 6px; border: 1px solid var(--glass-border); color: var(--dim); font-size: 12px; white-space: nowrap; }
+.hosts-down { display: inline-block; padding: 0 6px; border: 1px solid var(--amber); color: var(--amber); font-size: 12px; white-space: nowrap; }
 .activity-indicator { display: inline-flex; align-items: center; gap: 8px; color: var(--dim); white-space: nowrap; }
 .activity-indicator::before { content: ''; flex: none; width: 7px; height: 7px; background: currentColor; }
 .activity-indicator[data-state="ready"] { color: var(--green); }

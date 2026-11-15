@@ -97,7 +97,17 @@ struct Snapshot {
     queued: VecDeque<QueuedMessage>,
     timers: Vec<timers::Timer>,
     inbox: Vec<InboxEntry>,
+    down_hosts: Vec<DownHost>,
     blocks: Vec<Block>,
+}
+
+/// A remote host whose last connection attempt or connection failed. Its
+/// next tool call retries; idle hosts are not down.
+#[derive(Clone, PartialEq, Serialize)]
+struct DownHost {
+    name: String,
+    since: DateTime<Utc>,
+    error: String,
 }
 
 impl Snapshot {
@@ -107,7 +117,7 @@ impl Snapshot {
             "title": self.title, "archived": self.archived, "model": self.model,
             "auto_continue": self.auto_continue,
             "busy": self.busy, "status": self.status, "queued": self.queued, "timers": self.timers,
-            "inbox": self.inbox,
+            "inbox": self.inbox, "down_hosts": self.down_hosts,
             "attachment_limits": self.attachment_limits,
             "usage": self.usage, "context_window_tokens": self.context_window_tokens,
         })
@@ -373,6 +383,25 @@ impl App {
         }
         if listing_changed {
             self.generation.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn hosts(&self, status: Vec<myco::HostStatus>) {
+        let down: Vec<_> = status
+            .into_iter()
+            .filter_map(|host| {
+                let failure = host.failure?;
+                Some(DownHost {
+                    name: host.name,
+                    since: failure.at,
+                    error: failure.message,
+                })
+            })
+            .collect();
+        let mut live = self.live.lock().unwrap();
+        if live.snapshot.down_hosts != down {
+            live.snapshot.down_hosts = down;
+            self.publish_metadata(&mut live.snapshot);
         }
     }
 
@@ -798,6 +827,7 @@ impl Sessions {
                             queued: VecDeque::new(),
                             timers: vec![],
                             inbox: vec![],
+                            down_hosts: vec![],
                             blocks: view::history(session.active_thread()),
                         },
                         cancel: None,
@@ -1004,12 +1034,14 @@ async fn worker(
     args: Arc<Args>,
 ) {
     let runtime = boot.runner.runtime().clone();
+    let harness = boot.harness.clone();
     let resources = async {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
             app.refresh_metadata(runtime.session());
+            app.hosts(harness.host_status());
             app.resources(runtime.resources().await);
         }
     };

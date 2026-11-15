@@ -20,7 +20,7 @@ pub use config::{
 };
 
 // HostController lives in `crate::host` (in-process local or remote subprocess).
-pub use crate::host::{HostConfig, HostController};
+pub use crate::host::{HostConfig, HostController, HostFailure};
 
 mod preflight;
 pub use preflight::{
@@ -41,8 +41,8 @@ pub struct HostStatus {
     /// True when tools run inside the agent process (local).
     pub in_process: bool,
     pub tools: Vec<String>,
-    /// Last connect failure (if any); cleared after a successful connect.
-    pub error: Option<String>,
+    /// Last transport failure (if any); cleared after a successful connect.
+    pub failure: Option<HostFailure>,
 }
 
 /// Agent-facing tool runtime: routes tools to hosts.
@@ -309,7 +309,7 @@ impl Harness {
                     connected: client.is_connected(),
                     in_process: client.is_in_process(),
                     tools: client.tool_specs().iter().map(|t| t.name.clone()).collect(),
-                    error: client.last_error(),
+                    failure: client.last_failure(),
                     name,
                     command,
                 }
@@ -806,7 +806,10 @@ mod tests {
         let status = harness.host_status();
         let ghost = status.iter().find(|s| s.name == "ghost").unwrap();
         assert!(!ghost.connected, "{ghost:?}");
-        assert!(ghost.error.is_none(), "no error until first use: {ghost:?}");
+        assert!(
+            ghost.failure.is_none(),
+            "no failure until first use: {ghost:?}"
+        );
         let inventory = harness.resources(uuid::Uuid::nil()).await;
         assert!(
             inventory
@@ -847,7 +850,7 @@ mod tests {
         let status = harness.host_status();
         let ghost = status.iter().find(|s| s.name == "ghost").unwrap();
         assert!(!ghost.connected, "{ghost:?}");
-        assert!(ghost.error.is_some(), "{ghost:?}");
+        assert!(ghost.failure.is_some(), "{ghost:?}");
         // Local still fine.
         let local = status.iter().find(|s| s.name == "local").unwrap();
         assert!(local.connected && local.in_process);
