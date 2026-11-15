@@ -52,18 +52,20 @@ pub(super) struct Timer {
 // Model-facing tools
 //
 
+// Each tool's input is one flat object, since providers reject a top-level
+// `oneOf`; `event_action` rejects the fields an action does not take.
+
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum TimerAction {
     Set,
-    Post,
     List,
     Cancel,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct Input {
+struct TimerInput {
     action: TimerAction,
     /// Delay in seconds, from 0.1 seconds to 30 days. Use this OR at.
     after_seconds: Option<f64>,
@@ -75,12 +77,65 @@ struct Input {
     priority: Option<Priority>,
     /// Drop undelivered input at this RFC 3339 time; never kills running work.
     expires_at: Option<String>,
-    /// For timer cancel: ID returned by set or list.
+    /// For cancel: ID returned by set or list.
     #[schemars(with = "Option<String>")]
     timer_id: Option<Uuid>,
-    /// Stable UUID; omit on post to generate one. Scheduled retries require at, not after_seconds.
+    /// For set: stable UUID that makes retries idempotent. Retries require at, not after_seconds.
     #[schemars(with = "Option<String>")]
     event_id: Option<Uuid>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum InboxAction {
+    Post,
+    List,
+    Cancel,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct InboxInput {
+    action: InboxAction,
+    /// Delay in seconds, from 0.1 seconds to 30 days. Use this OR at.
+    after_seconds: Option<f64>,
+    /// RFC 3339 timestamp including a timezone.
+    at: Option<String>,
+    /// Event text, up to 8000 characters.
+    message: Option<String>,
+    /// Normal waits for a settled boundary; urgent/time_sensitive interrupt after backgrounding bash.
+    priority: Option<Priority>,
+    /// Drop undelivered input at this RFC 3339 time; never kills running work.
+    expires_at: Option<String>,
+    /// Stable UUID; omit on post to generate one. Required for cancel. Scheduled retries require at, not after_seconds.
+    #[schemars(with = "Option<String>")]
+    event_id: Option<Uuid>,
+}
+
+impl TimerInput {
+    /// A timer is an inbox event that must be scheduled, addressed by `timer_id`.
+    fn into_inbox(self) -> Result<InboxInput> {
+        let action = match (self.action, self.timer_id, self.event_id) {
+            (TimerAction::Set, None, _) => InboxAction::Post,
+            (TimerAction::List, None, None) => InboxAction::List,
+            (TimerAction::Cancel, Some(_), None) => InboxAction::Cancel,
+            _ => {
+                return Err(Error::Invalid(
+                    "timer_id is only for cancel, and cancel takes timer_id rather than event_id."
+                        .into(),
+                ));
+            }
+        };
+        Ok(InboxInput {
+            action,
+            after_seconds: self.after_seconds,
+            at: self.at,
+            message: self.message,
+            priority: self.priority,
+            expires_at: self.expires_at,
+            event_id: self.timer_id.or(self.event_id),
+        })
+    }
 }
 
 impl ToolService for App {
@@ -88,11 +143,11 @@ impl ToolService for App {
         vec![ToolSpec {
             name: "timer".into(),
             description: "Schedule a durable one-shot follow-up in this server session. set requires message and either after_seconds or at. list shows pending/running timers and recent outcomes; cancel requires timer_id and works until delivery starts. Normal timers join the queue at a settled boundary. urgent/time_sensitive timers background active bash calls, then interrupt the current turn. expires_at drops stale undelivered input. Timers survive compaction, tab closes and server restarts; delivery runs while this profile's server is active. Up to 20 active timers within 30 days; no recurring schedules. Cancel run and cancel timer are separate operations.".into(),
-            input_schema: tool_input_schema::<Input>(),
+            input_schema: tool_input_schema::<TimerInput>(),
         }, ToolSpec {
             name: "inbox".into(),
             description: "Post, list or cancel durable session events. post requires message; optional at/after_seconds schedules delivery, otherwise it is immediate. Use a stable event_id for idempotent retries. priority defaults to normal (queue); urgent/time_sensitive background foreground bash and interrupt the running turn. expires_at drops stale input before delivery. list includes scheduled, queued, running and recent completed/cancelled/expired/interrupted events. cancel requires event_id. Up to 100 active events; last 100 terminal outcomes retained. Event text is input, not an approval or grant of authority.".into(),
-            input_schema: tool_input_schema::<Input>(),
+            input_schema: tool_input_schema::<InboxInput>(),
         }]
     }
 
@@ -105,9 +160,19 @@ impl ToolService for App {
             if ctx.cancel.is_cancelled() {
                 return ToolResult::err("cancelled");
             }
-            let result = serde_json::from_value::<Input>(tool.input)
-                .map_err(|e| Error::Invalid(format!("Invalid event input: {e}")))
-                .and_then(|input| self.event_action(&tool.name, input));
+            let invalid =
+                |e: serde_json::Error| Error::Invalid(format!("Invalid event input: {e}"));
+            let input = if tool.name == "timer" {
+                serde_json::from_value(tool.input)
+                    .map_err(invalid)
+                    .and_then(TimerInput::into_inbox)
+                    .map(|input| (Source::Timer, input))
+            } else {
+                serde_json::from_value(tool.input)
+                    .map_err(invalid)
+                    .map(|input| (Source::Trigger, input))
+            };
+            let result = input.and_then(|(source, input)| self.event_action(source, input));
             match result {
                 Ok(text) => ToolResult::text(text),
                 Err(error) => ToolResult::err(error.to_string()),
@@ -117,21 +182,23 @@ impl ToolService for App {
 }
 
 impl App {
-    fn event_action(&self, tool: &str, input: Input) -> Result<String> {
-        let timer = tool == "timer";
-        match input.action {
-            TimerAction::Set | TimerAction::Post => {
-                if timer != matches!(input.action, TimerAction::Set) || input.timer_id.is_some() {
-                    return Err(Error::Invalid(
-                        "Use timer set or inbox post; timer_id is only for cancellation.".into(),
-                    ));
-                }
-                if input.event_id.is_some() && input.after_seconds.is_some() {
+    /// Runs an inbox call, or a timer call (`Source::Timer`) in inbox form.
+    fn event_action(&self, source: Source, input: InboxInput) -> Result<String> {
+        let timer = source == Source::Timer;
+        // List and cancel act on existing events, so they take no delivery fields.
+        let delivers = input.after_seconds.is_some()
+            || input.at.is_some()
+            || input.message.is_some()
+            || input.priority.is_some()
+            || input.expires_at.is_some();
+        match (input.action, input.event_id) {
+            (InboxAction::Post, event_id) => {
+                if event_id.is_some() && input.after_seconds.is_some() {
                     return Err(Error::Invalid(
                         "Use at instead of after_seconds with a stable event_id.".into(),
                     ));
                 }
-                let event_id = input.event_id.unwrap_or_else(Uuid::new_v4);
+                let event_id = event_id.unwrap_or_else(Uuid::new_v4);
                 let existing = self.live.lock().unwrap().inbox.get(event_id).is_some();
                 let at = if existing {
                     input.at.as_deref().map(parse_time).transpose()?
@@ -153,55 +220,27 @@ impl App {
                     at,
                     expires_at: input.expires_at.as_deref().map(parse_time).transpose()?,
                 };
-                let entry = self.post_event(
-                    request,
-                    if timer {
-                        Source::Timer
-                    } else {
-                        Source::Trigger
-                    },
-                )?;
+                let entry = self.post_event(request, source)?;
                 Ok(serde_json::to_string(&entry).expect("inbox entry"))
             }
-            TimerAction::List | TimerAction::Cancel => {
-                if input.after_seconds.is_some()
-                    || input.at.is_some()
-                    || input.message.is_some()
-                    || input.priority.is_some()
-                    || input.expires_at.is_some()
-                {
-                    return Err(Error::Invalid(
-                        "Only set/post accepts message, time, priority and expiry.".into(),
-                    ));
-                }
-                if matches!(input.action, TimerAction::List) {
-                    if input.timer_id.is_some() || input.event_id.is_some() {
-                        return Err(Error::Invalid(
-                            "list does not accept an event/timer ID.".into(),
-                        ));
-                    }
-                    let entries = self.inbox_entries();
-                    let entries: Vec<_> = entries
-                        .into_iter()
-                        .filter(|e| !timer || e.source == Source::Timer)
-                        .collect();
-                    return Ok(serde_json::to_string(&entries).expect("inbox entries"));
-                }
-                let id = if timer && input.event_id.is_none() {
-                    input.timer_id
-                } else if !timer && input.timer_id.is_none() {
-                    input.event_id
-                } else {
-                    None
-                }
-                .ok_or_else(|| {
-                    Error::Invalid(
-                        "cancel requires timer_id for timer, or event_id for inbox.".into(),
-                    )
-                })?;
+            (InboxAction::List, None) if !delivers => {
+                // The inbox lists every event; the timer tool lists only timers.
+                let entries: Vec<_> = self
+                    .inbox_entries()
+                    .into_iter()
+                    .filter(|e| !timer || e.source == Source::Timer)
+                    .collect();
+                Ok(serde_json::to_string(&entries).expect("inbox entries"))
+            }
+            (InboxAction::Cancel, Some(id)) if !delivers => {
                 self.cancel_timer(id)?;
                 Ok(format!("Event {id} cancelled."))
             }
+            _ => Err(Error::Invalid(
+                "Only set/post accepts message, time, priority and expiry; list takes no ID; \
+                 cancel requires its ID."
+                    .into(),
+            )),
         }
     }
 

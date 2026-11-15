@@ -7,10 +7,14 @@ use myco::generative_model::{Content, Message, ToolUse};
 use myco::tool_services::{HostDispatchContext, ToolService};
 
 async fn tool(app: &Arc<App>, input: Value) -> myco::generative_model::ToolResult {
+    call(app, "timer", input).await
+}
+
+async fn call(app: &Arc<App>, name: &str, input: Value) -> myco::generative_model::ToolResult {
     app.clone()
         .dispatch_tool_use(
             ToolUse {
-                name: "timer".into(),
+                name: name.into(),
                 input,
 
                 thought_signature: None,
@@ -281,4 +285,105 @@ async fn timer_ownership_and_limits_include_fired_messages_waiting_for_delivery(
             .unwrap()
             .is_empty()
     );
+}
+
+/// Providers reject a top-level `oneOf`, so each tool is one flat object that
+/// names only its own actions and identifiers.
+#[test]
+fn timer_and_inbox_schemas_are_flat_and_offer_only_their_own_actions() {
+    let (app, _work) = app();
+    let specs = app.tool_specs();
+    let schema = |name: &str| {
+        let spec = specs.iter().find(|spec| spec.name == name).unwrap();
+        spec.input_schema.clone()
+    };
+    let (timer, inbox) = (schema("timer"), schema("inbox"));
+    for schema in [&timer, &inbox] {
+        assert_eq!(schema["type"], "object", "{schema}");
+        assert!(schema.get("oneOf").is_none() && schema.get("anyOf").is_none());
+    }
+    assert_eq!(
+        timer["properties"]["action"]["enum"],
+        json!(["set", "list", "cancel"])
+    );
+    assert_eq!(
+        inbox["properties"]["action"]["enum"],
+        json!(["post", "list", "cancel"])
+    );
+    assert!(timer["properties"].get("timer_id").is_some());
+    assert!(inbox["properties"].get("timer_id").is_none());
+}
+
+#[tokio::test]
+async fn timer_and_inbox_calls_accept_their_own_shapes_and_reject_the_other_tool_s() {
+    let (app, _work) = app();
+    let at = (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+    for (name, input) in [
+        (
+            "timer",
+            json!({"action":"post", "after_seconds":1, "message":"Wrong tool"}),
+        ),
+        (
+            "inbox",
+            json!({"action":"set", "after_seconds":1, "message":"Wrong tool"}),
+        ),
+        (
+            "timer",
+            json!({"action":"set", "after_seconds":1, "message":"Id", "timer_id":Uuid::new_v4()}),
+        ),
+        ("timer", json!({"action":"list", "timer_id":Uuid::new_v4()})),
+        (
+            "timer",
+            json!({"action":"cancel", "event_id":Uuid::new_v4()}),
+        ),
+        ("timer", json!({"action":"cancel"})),
+        (
+            "inbox",
+            json!({"action":"post", "message":"Id", "timer_id":Uuid::new_v4()}),
+        ),
+        ("inbox", json!({"action":"list", "event_id":Uuid::new_v4()})),
+        (
+            "inbox",
+            json!({"action":"cancel", "event_id":Uuid::new_v4(), "message":"Extra"}),
+        ),
+        ("inbox", json!({"action":"cancel"})),
+        (
+            "inbox",
+            json!({"action":"post", "event_id":Uuid::new_v4(), "after_seconds":1, "message":"Relative retry"}),
+        ),
+    ] {
+        assert!(
+            call(&app, name, input.clone()).await.is_error,
+            "{name} {input}"
+        );
+    }
+    assert!(app.inbox_entries().is_empty());
+
+    let event_id = Uuid::new_v4();
+    let posted = json!({"action":"post", "event_id":event_id, "at":at, "message":"Scheduled",
+        "priority":"urgent", "expires_at":(Utc::now() + chrono::Duration::hours(1)).to_rfc3339()});
+    assert!(!call(&app, "inbox", posted).await.is_error);
+    let immediate = call(&app, "inbox", json!({"action":"post", "message":"Now"})).await;
+    assert!(!immediate.is_error, "{immediate:?}");
+    let timer = call(
+        &app,
+        "timer",
+        json!({"action":"set", "after_seconds":60, "message":"Later"}),
+    )
+    .await;
+    assert!(!timer.is_error, "{timer:?}");
+    let listed = |result: myco::generative_model::ToolResult| match &result.content[..] {
+        [Content::Text { text }] => serde_json::from_str::<Vec<Value>>(text).unwrap().len(),
+        _ => panic!("{result:?}"),
+    };
+    assert_eq!(
+        listed(call(&app, "inbox", json!({"action":"list"})).await),
+        3
+    );
+    assert_eq!(
+        listed(call(&app, "timer", json!({"action":"list"})).await),
+        1
+    );
+    let cancelled = json!({"action":"cancel", "event_id":event_id});
+    assert!(!call(&app, "inbox", cancelled).await.is_error);
 }
