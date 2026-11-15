@@ -7,9 +7,7 @@ use std::sync::Arc;
 use crate::agent::AgentInteractionError;
 use crate::core::ModelInfo;
 use crate::core::image_store::{ImageStore, with_images};
-use crate::generative_model::{
-    self, BackendConfig, CatalogModel, Effort, GenerativeModel, GenerativeModelConfig,
-};
+use crate::generative_model::{self, CatalogModel, Effort, GenerativeModel, GenerativeModelConfig};
 use crate::harness::Harness;
 use crate::prelude::PreludeEntry;
 use crate::prompts;
@@ -43,17 +41,8 @@ impl AgentModel {
         suffix: Option<&str>,
     ) -> (Self, GenerativeModelConfig) {
         let mut catalog = catalog.clone();
-        match &mut catalog.backend {
-            // Thinking is always enabled; effort controls how hard the model thinks.
-            BackendConfig::Anthropic(c) => {
-                c.effort = Some(effort);
-                c.debug_dump_api_requests = debug_dump_api_requests;
-            }
-            BackendConfig::OpenAIResponses(c) | BackendConfig::OpenAICompletions(c) => {
-                c.effort = Some(effort);
-                c.debug_dump_api_requests = debug_dump_api_requests;
-            }
-        }
+        catalog.backend.effort = effort;
+        catalog.backend.debug_dump_api_requests = debug_dump_api_requests;
         let spec = &catalog.spec;
         let (epilogue, prelude, skills) = prompts::agent_prompt_epilogue();
         let mut prompt = vec![
@@ -113,7 +102,7 @@ impl SessionRunner {
         agent.set_before_generation_notice(Some(crate::session_runtime::prelude_change_notices(
             selected.prelude,
         )));
-        agent.set_retry_policy(selected.catalog.backend.retry_policy());
+        agent.set_retry_policy(selected.catalog.backend.retry);
         agent.set_max_truncated_resumes(spec.max_truncated_resumes);
         self.set_compactor(compactor, spec.auto_compact_at_tokens);
         self.runtime()

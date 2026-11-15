@@ -22,27 +22,13 @@ fn endpoint(value: &str) -> Option<String> {
 }
 
 fn backend(settings: &BackendConfig) -> Value {
-    let (base_url, max_output_tokens, max_request_bytes, effort) = match settings {
-        BackendConfig::Anthropic(value) => (
-            &value.anthropic_base_url,
-            Some(value.max_tokens_per_generate),
-            value.max_request_bytes,
-            value.effort,
-        ),
-        BackendConfig::OpenAIResponses(value) | BackendConfig::OpenAICompletions(value) => (
-            &value.base_url,
-            value.max_output_tokens,
-            value.max_request_bytes,
-            value.effort,
-        ),
-    };
     // An allowlist keeps new credential-bearing backend fields out of artifacts.
     json!({
-        "endpoint": endpoint(base_url),
-        "max_output_tokens": max_output_tokens,
-        "max_request_bytes": max_request_bytes,
-        "retry": settings.retry_policy(),
-        "effort": effort,
+        "endpoint": endpoint(&settings.base_url),
+        "max_output_tokens": settings.max_output_tokens,
+        "max_request_bytes": settings.max_request_bytes,
+        "retry": settings.retry,
+        "effort": settings.effort,
     })
 }
 
@@ -67,16 +53,15 @@ pub(super) fn configuration(config: &Config, model: &GenerativeModelConfig) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generative_model::OpenAIBackendConfig;
 
     #[test]
     fn backend_metadata_excludes_tokens_and_url_credentials() {
-        let value = backend(&BackendConfig::OpenAIResponses(OpenAIBackendConfig {
+        let value = backend(&BackendConfig {
             base_url: "https://user:password@example.com/v1?key=query-secret#fragment-secret"
                 .into(),
             auth_token: "auth-secret".into(),
             ..Default::default()
-        }));
+        });
         assert_eq!(value["endpoint"], "https://example.com/v1");
         let text = value.to_string();
         for secret in [

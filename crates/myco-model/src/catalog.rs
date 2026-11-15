@@ -2,8 +2,6 @@
 //! retry policy, model specs, and the backend (gateway + credentials) that
 //! serves each model.
 
-use super::*;
-
 /// Wire protocol a model is served over.
 ///
 /// Serde strings are the config.toml `protocol` values.
@@ -332,29 +330,41 @@ impl std::str::FromStr for Effort {
     }
 }
 
-/// Provider backend settings: gateway base URL, credential, per-request knobs.
+/// Gateway settings for one catalog model: endpoint, credential, and
+/// per-request knobs. The wire dialect is the model's [`ModelSpec::protocol`].
 #[derive(Debug, Clone)]
-pub enum BackendConfig {
-    Anthropic(AnthropicBackendConfig),
-    /// Responses API (`{base_url}/responses`).
-    OpenAIResponses(OpenAIBackendConfig),
-    /// Chat Completions API (`{base_url}/chat/completions`).
-    OpenAICompletions(OpenAIBackendConfig),
+pub struct BackendConfig {
+    /// Gateway base URL. Anthropic requests go to `{base_url}/v1/messages`;
+    /// the OpenAI dialects append `/responses` or `/chat/completions`, so their
+    /// base URL carries the path prefix (`https://api.x.ai/v1`,
+    /// `http://localhost:11434/v1`).
+    pub base_url: String,
+    /// Empty sends no credential. Anthropic sends `sk-ant-…` API keys as
+    /// `x-api-key`; every other token is `Authorization: Bearer`.
+    pub auth_token: String,
+    /// Per-generate output token cap.
+    pub max_output_tokens: usize,
+    pub debug_dump_api_requests: bool,
+    /// Maximum serialized request body, including history, images, tools, and prompts.
+    pub max_request_bytes: usize,
+    /// Transient-failure retry for this endpoint (`[gateways.NAME.retry]`).
+    pub retry: RetryPolicy,
+    /// How hard the model thinks. The model's [`ThinkingMode`] decides how it
+    /// is sent, and `none` sends no thinking or reasoning fields at all.
+    pub effort: Effort,
 }
 
-impl BackendConfig {
-    pub fn retry_policy(&self) -> RetryPolicy {
-        match self {
-            Self::Anthropic(config) => config.retry,
-            Self::OpenAIResponses(config) | Self::OpenAICompletions(config) => config.retry,
-        }
-    }
-
-    pub fn protocol(&self) -> Protocol {
-        match self {
-            BackendConfig::Anthropic(_) => Protocol::AnthropicMessages,
-            BackendConfig::OpenAIResponses(_) => Protocol::OpenAIResponses,
-            BackendConfig::OpenAICompletions(_) => Protocol::OpenAICompletions,
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self {
+            // No built-in gateway: the catalog (config.toml) supplies base_url.
+            base_url: String::new(),
+            auth_token: String::new(),
+            max_output_tokens: 8192,
+            debug_dump_api_requests: false,
+            max_request_bytes: crate::MAX_REQUEST_BYTES,
+            retry: RetryPolicy::default(),
+            effort: Effort::DEFAULT,
         }
     }
 }
@@ -469,7 +479,7 @@ mod tests {
     fn catalog_get_unknown_key_lists_configured_models() {
         let entry = CatalogModel {
             spec: spec("opus", Protocol::AnthropicMessages),
-            backend: BackendConfig::Anthropic(AnthropicBackendConfig::default()),
+            backend: BackendConfig::default(),
             auth_error: None,
         };
         let catalog = ModelCatalog::new([("opus".to_string(), entry)].into());
@@ -483,51 +493,11 @@ mod tests {
     fn catalog_get_reports_deferred_auth_error() {
         let entry = CatalogModel {
             spec: spec("kimi", Protocol::OpenAIResponses),
-            backend: BackendConfig::OpenAIResponses(OpenAIBackendConfig::default()),
+            backend: BackendConfig::default(),
             auth_error: Some("model `kimi`: auth env:OPENROUTER_API_KEY is unset".into()),
         };
         let catalog = ModelCatalog::new([("kimi".to_string(), entry)].into());
         let err = catalog.get("kimi").unwrap_err();
         assert!(err.contains("OPENROUTER_API_KEY"), "{err}");
-    }
-
-    #[test]
-    fn new_rejects_protocol_mismatch() {
-        let result = new(GenerativeModelConfig {
-            model: spec("grok", Protocol::OpenAIResponses),
-            tools: vec![],
-            system_prompt: String::new(),
-            backend_config: BackendConfig::Anthropic(AnthropicBackendConfig {
-                anthropic_auth_token: "dummy".into(),
-                ..Default::default()
-            }),
-        });
-        let err = match result {
-            Ok(_) => panic!("expected mismatch"),
-            Err(e) => e,
-        };
-        assert!(err.to_string().contains("speaks openai-responses"), "{err}");
-    }
-
-    #[test]
-    fn older_backend_configs_default_to_a_thirty_megabyte_request_cap() {
-        let mut anthropic = serde_json::to_value(AnthropicBackendConfig::default()).unwrap();
-        let mut openai = serde_json::to_value(OpenAIBackendConfig::default()).unwrap();
-        for config in [&mut anthropic, &mut openai] {
-            assert_eq!(config["max_request_bytes"], 30_000_000);
-            config.as_object_mut().unwrap().remove("max_request_bytes");
-        }
-        assert_eq!(
-            serde_json::from_value::<AnthropicBackendConfig>(anthropic)
-                .unwrap()
-                .max_request_bytes,
-            30_000_000
-        );
-        assert_eq!(
-            serde_json::from_value::<OpenAIBackendConfig>(openai)
-                .unwrap()
-                .max_request_bytes,
-            30_000_000
-        );
     }
 }

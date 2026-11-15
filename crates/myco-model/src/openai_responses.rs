@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use super::driver_core::{Slot, SlotMap, SseAccumulator};
 use super::openai_common::{
-    OpenAIBackendConfig, OpenAIUsage, image_url, images_of, reasoning_effort, text_of,
-    tool_result_text, user_content_parts,
+    OpenAIUsage, image_url, images_of, reasoning_effort, text_of, tool_result_text,
+    user_content_parts,
 };
 use super::*;
 
@@ -20,15 +20,13 @@ pub struct OpenAIResponsesGenerativeModel {
     model: ModelSpec,
     system_prompt: String,
     tools: Vec<ResponsesTool>,
-    backend: OpenAIBackendConfig,
+    backend: BackendConfig,
     client: reqwest::Client,
 }
 
 impl OpenAIResponsesGenerativeModel {
-    pub fn new(
-        config: GenerativeModelConfig,
-        backend: OpenAIBackendConfig,
-    ) -> Result<Arc<Self>, ModelCreationError> {
+    pub fn new(config: GenerativeModelConfig) -> Result<Arc<Self>, ModelCreationError> {
+        let backend = config.backend_config.clone();
         let client = driver_core::build_client(driver_core::bearer(&backend.auth_token), &[])?;
 
         let tools = config
@@ -70,7 +68,7 @@ impl OpenAIResponsesGenerativeModel {
             } else {
                 Some(&self.tools)
             },
-            max_output_tokens: self.backend.max_output_tokens,
+            max_output_tokens: Some(self.backend.max_output_tokens),
             // Stateless client: full history is resent every turn. Do not retain
             // conversations server-side (OpenAI default is store=true).
             store: false,

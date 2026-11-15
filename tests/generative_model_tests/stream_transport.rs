@@ -6,7 +6,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use myco::generative_model::{
     BackendConfig, Content, GenerationEvent, GenerativeModel, GenerativeModelConfig, Message,
-    ModelSpec, OpenAIBackendConfig, Protocol, RetryPolicy, ThinkingMode,
+    ModelSpec, Protocol, RetryPolicy, ThinkingMode,
 };
 use myco::{Agent, AgentEvent, CancelToken, EventSink};
 use serde_json::json;
@@ -27,10 +27,10 @@ fn model(server: &StubHttpServer) -> Arc<dyn GenerativeModel> {
         },
         tools: vec![],
         system_prompt: String::new(),
-        backend_config: BackendConfig::OpenAIResponses(OpenAIBackendConfig {
+        backend_config: BackendConfig {
             base_url: server.base_url(),
             ..Default::default()
-        }),
+        },
     })
     .unwrap()
 }

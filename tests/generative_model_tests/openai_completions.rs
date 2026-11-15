@@ -1,7 +1,7 @@
 use super::*;
 use myco::generative_model::{
-    BackendConfig, GenerateError, GenerativeModelConfig, ModelSpec, OpenAIBackendConfig, Protocol,
-    RetryPolicy, ThinkingMode, ToolSpec,
+    BackendConfig, GenerateError, GenerativeModelConfig, ModelSpec, Protocol, RetryPolicy,
+    ThinkingMode, ToolSpec,
 };
 
 use crate::test_utils::StubHttpServer;
@@ -46,11 +46,11 @@ fn stub_model(base_url: &str, tools: Vec<ToolSpec>) -> std::sync::Arc<dyn Genera
         },
         tools,
         system_prompt: "Answer in one word.".into(),
-        backend_config: BackendConfig::OpenAICompletions(OpenAIBackendConfig {
+        backend_config: BackendConfig {
             base_url: format!("{base_url}/v1"),
-            max_output_tokens: Some(32),
+            max_output_tokens: 32,
             ..Default::default()
-        }),
+        },
     })
     .expect("create stub-backed model")
 }

@@ -14,9 +14,7 @@ use crate::core::{
     Async, CancelToken,
     image_store::{ImageStore, sha256},
 };
-use crate::generative_model::{
-    BackendConfig, CatalogModel, Content, Effort, Message, TurnEndReason,
-};
+use crate::generative_model::{CatalogModel, Content, Effort, Message, Protocol, TurnEndReason};
 use crate::session::{ActiveSession, CompactOutcome, Session, Thread};
 use crate::{Config, ConfigUserSettings, Harness, SessionRuntime};
 
@@ -111,12 +109,10 @@ fn config(path: &Path, model: &str) -> Result<(Config, CatalogModel), String> {
 }
 
 fn enforce_free(model: &CatalogModel) -> Result<(), String> {
-    let base_url = match &model.backend {
-        BackendConfig::OpenAICompletions(config) | BackendConfig::OpenAIResponses(config) => {
-            &config.base_url
-        }
-        _ => return Err("--free-only requires an explicit OpenRouter :free model".into()),
-    };
+    if model.spec.protocol == Protocol::AnthropicMessages {
+        return Err("--free-only requires an explicit OpenRouter :free model".into());
+    }
+    let base_url = &model.backend.base_url;
     if !model.spec.api_id.ends_with(":free")
         || base_url.trim_end_matches('/') != "https://openrouter.ai/api/v1"
     {
@@ -127,16 +123,8 @@ fn enforce_free(model: &CatalogModel) -> Result<(), String> {
 
 fn model_hash(model: &CatalogModel, config: &Config) -> String {
     let mut backend = model.backend.clone();
-    match &mut backend {
-        BackendConfig::Anthropic(c) => {
-            c.anthropic_auth_token.clear();
-            c.debug_dump_api_requests = false;
-        }
-        BackendConfig::OpenAIResponses(c) | BackendConfig::OpenAICompletions(c) => {
-            c.auth_token.clear();
-            c.debug_dump_api_requests = false;
-        }
-    }
+    backend.auth_token.clear();
+    backend.debug_dump_api_requests = false;
     sha256(
         format!(
             "{:?}|{:?}|{}",

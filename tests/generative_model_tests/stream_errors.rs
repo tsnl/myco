@@ -5,9 +5,8 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use myco::generative_model::{
-    AnthropicBackendConfig, BackendConfig, Content, GenerationEvent, GenerativeModel,
-    GenerativeModelConfig, Message, ModelSpec, OpenAIBackendConfig, Protocol, RetryPolicy,
-    ThinkingMode,
+    BackendConfig, Content, GenerationEvent, GenerativeModel, GenerativeModelConfig, Message,
+    ModelSpec, Protocol, RetryPolicy, ThinkingMode,
 };
 use myco::{Agent, AgentEvent, CancelToken, EventSink};
 use serde_json::{Value, json};
@@ -116,10 +115,6 @@ impl Dialect {
 }
 
 fn model(server: &StubHttpServer, dialect: Dialect) -> Arc<dyn GenerativeModel> {
-    let openai = OpenAIBackendConfig {
-        base_url: server.base_url(),
-        ..Default::default()
-    };
     myco::generative_model::new(GenerativeModelConfig {
         model: ModelSpec {
             key: "test".into(),
@@ -133,13 +128,9 @@ fn model(server: &StubHttpServer, dialect: Dialect) -> Arc<dyn GenerativeModel> 
         },
         tools: vec![],
         system_prompt: String::new(),
-        backend_config: match dialect {
-            Dialect::Anthropic => BackendConfig::Anthropic(AnthropicBackendConfig {
-                anthropic_base_url: server.base_url(),
-                ..Default::default()
-            }),
-            Dialect::Completions => BackendConfig::OpenAICompletions(openai),
-            _ => BackendConfig::OpenAIResponses(openai),
+        backend_config: BackendConfig {
+            base_url: server.base_url(),
+            ..Default::default()
         },
     })
     .unwrap()

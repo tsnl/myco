@@ -11,64 +11,23 @@ use std::sync::Arc;
 use super::driver_core::{ImageSource, Slot, SlotMap, SseAccumulator};
 use super::*;
 
-/// Anthropic Messages API settings ([`BackendConfig::Anthropic`]).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct AnthropicBackendConfig {
-    pub anthropic_base_url: String,
-    pub anthropic_auth_token: String,
-    pub max_tokens_per_generate: usize,
-    pub debug_dump_api_requests: bool,
-    /// Maximum serialized request body, including history, images, tools, and prompts.
-    #[serde(default = "default_max_request_bytes")]
-    pub max_request_bytes: usize,
-    /// Transient-failure retry for this endpoint (`[gateways.NAME.retry]`).
-    #[serde(default)]
-    pub retry: RetryPolicy,
-    /// When set, enables Anthropic extended thinking at this effort level.
-    ///
-    /// The request shape follows the model's [`ThinkingMode`]: `adaptive` sends
-    /// `thinking.type: "adaptive"` plus `output_config.effort`; `budget` sends
-    /// `thinking.type: "enabled"` with a mapped `budget_tokens`; `none` sends
-    /// no thinking fields regardless of this value.
-    ///
-    /// Defaults to [`Effort::DEFAULT`] so thinking is always on for interactive use.
-    pub effort: Option<Effort>,
-}
-
-impl Default for AnthropicBackendConfig {
-    fn default() -> Self {
-        Self {
-            // No built-in gateway: the catalog (config.toml) supplies base_url.
-            anthropic_base_url: String::new(),
-            anthropic_auth_token: String::new(),
-            max_tokens_per_generate: 8192,
-            debug_dump_api_requests: false,
-            max_request_bytes: MAX_REQUEST_BYTES,
-            retry: RetryPolicy::default(),
-            effort: Some(Effort::DEFAULT),
-        }
-    }
-}
-
 /// Stateless Anthropic driver. Conversation history is owned by the caller.
 pub struct AnthropicGenerativeModel {
     model: ModelSpec,
     system_prompt: String,
     tools: Vec<AnthropicTool>,
-    backend: AnthropicBackendConfig,
+    backend: BackendConfig,
     client: reqwest::Client,
 }
 
 impl AnthropicGenerativeModel {
-    pub fn new(
-        config: GenerativeModelConfig,
-        backend: AnthropicBackendConfig,
-    ) -> Result<Arc<Self>, ModelCreationError> {
+    pub fn new(config: GenerativeModelConfig) -> Result<Arc<Self>, ModelCreationError> {
+        let backend = config.backend_config.clone();
         // api.anthropic.com authenticates API keys (`sk-ant-…`) via the
         // `x-api-key` header and rejects them as `Authorization: Bearer`;
         // Bearer is the convention for gateway/OAuth tokens. Pick by token
         // shape so both work against the default base URL.
-        let token = &backend.anthropic_auth_token;
+        let token = &backend.auth_token;
         let auth = if token.starts_with("sk-ant-") {
             Some(("x-api-key", token.clone()))
         } else {
@@ -114,7 +73,7 @@ impl AnthropicGenerativeModel {
             thinking_request_fields(self.model.thinking, self.backend.effort);
         // Anthropic requires max_tokens > thinking.budget_tokens for non-adaptive
         // extended thinking (e.g. Haiku). Adaptive thinking has no budget field.
-        let mut max_tokens = self.backend.max_tokens_per_generate;
+        let mut max_tokens = self.backend.max_output_tokens;
         if let Some(AnthropicThinkingConfig::Enabled { budget_tokens }) = &thinking {
             let need = (*budget_tokens as usize).saturating_add(1024);
             if max_tokens <= *budget_tokens as usize {
@@ -133,7 +92,7 @@ impl AnthropicGenerativeModel {
         };
 
         self.client
-            .post(format!("{}/v1/messages", self.backend.anthropic_base_url))
+            .post(format!("{}/v1/messages", self.backend.base_url))
             .json(&request)
     }
 }
@@ -760,18 +719,14 @@ struct AnthropicOutputConfig {
     effort: Option<&'static str>,
 }
 
-/// Build `thinking` / `output_config` for the given model when effort is set.
+/// Build `thinking` / `output_config` for the model's thinking mode.
 fn thinking_request_fields(
     mode: ThinkingMode,
-    effort: Option<Effort>,
+    effort: Effort,
 ) -> (
     Option<AnthropicThinkingConfig>,
     Option<AnthropicOutputConfig>,
 ) {
-    let Some(effort) = effort else {
-        return (None, None);
-    };
-
     match mode {
         ThinkingMode::Adaptive => (
             Some(AnthropicThinkingConfig::Adaptive {
@@ -1088,7 +1043,7 @@ mod tests {
     #[test]
     fn adaptive_thinking_uses_effort_not_budget() {
         let (thinking, output_config) =
-            thinking_request_fields(ThinkingMode::Adaptive, Some(Effort::High));
+            thinking_request_fields(ThinkingMode::Adaptive, Effort::High);
         let request = AnthropicMessagesRequest {
             max_tokens: 128,
             model: "claude-opus-4-8",
@@ -1109,7 +1064,7 @@ mod tests {
     #[test]
     fn manual_thinking_uses_budget_tokens() {
         let (thinking, output_config) =
-            thinking_request_fields(ThinkingMode::Budget, Some(Effort::Medium));
+            thinking_request_fields(ThinkingMode::Budget, Effort::Medium);
         let request = AnthropicMessagesRequest {
             max_tokens: 128,
             model: "claude-haiku-4-5",
@@ -1153,16 +1108,8 @@ mod tests {
     }
 
     #[test]
-    fn thinking_omitted_when_effort_unset() {
-        let (thinking, output_config) = thinking_request_fields(ThinkingMode::Adaptive, None);
-        assert!(thinking.is_none());
-        assert!(output_config.is_none());
-    }
-
-    #[test]
     fn thinking_mode_none_sends_no_thinking_fields() {
-        let (thinking, output_config) =
-            thinking_request_fields(ThinkingMode::None, Some(Effort::High));
+        let (thinking, output_config) = thinking_request_fields(ThinkingMode::None, Effort::High);
         assert!(thinking.is_none());
         assert!(output_config.is_none());
     }

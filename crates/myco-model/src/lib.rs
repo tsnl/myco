@@ -32,7 +32,6 @@ pub type AsyncStream<T> = std::pin::Pin<Box<dyn Stream<Item = T> + Send>>;
 mod test_support;
 
 mod anthropic;
-pub use anthropic::AnthropicBackendConfig;
 
 mod accumulator;
 pub use accumulator::MessageAccumulator;
@@ -46,7 +45,6 @@ pub use catalog::{
 mod driver_core;
 
 mod openai_common;
-pub use openai_common::OpenAIBackendConfig;
 
 mod openai_completions;
 mod openai_responses;
@@ -75,27 +73,17 @@ pub struct GenerativeModelConfig {
 /// Construct a driver, rejecting a protocol/backend mismatch before any request.
 /// No network request is made until the returned model is asked to generate.
 pub fn new(config: GenerativeModelConfig) -> Result<Arc<dyn GenerativeModel>, ModelCreationError> {
-    if config.backend_config.protocol() != config.model.protocol {
-        return Err(ModelCreationError::BadConfig(format!(
-            "model `{}` speaks {} but the backend config is for {}",
-            config.model,
-            config.model.protocol,
-            config.backend_config.protocol()
-        )));
-    }
-    match config.backend_config.clone() {
-        BackendConfig::Anthropic(backend) => {
-            let model = anthropic::AnthropicGenerativeModel::new(config, backend)?;
-            Ok(model as Arc<dyn GenerativeModel>)
+    match config.model.protocol {
+        Protocol::AnthropicMessages => {
+            Ok(anthropic::AnthropicGenerativeModel::new(config)? as Arc<dyn GenerativeModel>)
         }
-        BackendConfig::OpenAIResponses(backend) => {
-            let model = openai_responses::OpenAIResponsesGenerativeModel::new(config, backend)?;
-            Ok(model as Arc<dyn GenerativeModel>)
-        }
-        BackendConfig::OpenAICompletions(backend) => {
-            let model = openai_completions::OpenAICompletionsGenerativeModel::new(config, backend)?;
-            Ok(model as Arc<dyn GenerativeModel>)
-        }
+        Protocol::OpenAIResponses => Ok(openai_responses::OpenAIResponsesGenerativeModel::new(
+            config,
+        )? as Arc<dyn GenerativeModel>),
+        Protocol::OpenAICompletions => Ok(
+            openai_completions::OpenAICompletionsGenerativeModel::new(config)?
+                as Arc<dyn GenerativeModel>,
+        ),
     }
 }
 
@@ -558,10 +546,6 @@ pub enum Recovery {
 /// images accumulated in history and JSON overhead, and refuses oversized bodies
 /// before upload with [`Recovery::OmitLastMessage`].
 pub const MAX_REQUEST_BYTES: usize = 30_000_000;
-
-fn default_max_request_bytes() -> usize {
-    MAX_REQUEST_BYTES
-}
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum GenerateError {

@@ -144,7 +144,7 @@ pub(crate) async fn run_compact_worker(
     wrap_model: impl FnOnce(Arc<dyn GenerativeModel>) -> Arc<dyn GenerativeModel>,
 ) -> Result<(Thread, CompactOutcome), AgentInteractionError> {
     let tools = CompactTools::new(predecessor);
-    let mut retry = catalog_model.backend.retry_policy();
+    let mut retry = catalog_model.backend.retry;
     if single_attempt {
         retry.max_attempts = 1;
     }
