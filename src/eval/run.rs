@@ -722,7 +722,6 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
         prelude,
     )));
     agent.set_retry_policy(catalog.backend.retry_policy());
-    agent.set_context_window_tokens(catalog.spec.context_window_tokens);
     agent.set_max_truncated_resumes(catalog.spec.max_truncated_resumes);
     let mut runner = SessionRunner::new(agent, runtime)
         .await

@@ -365,7 +365,6 @@ async fn boot_session<S: EventSink + 'static>(
     agent
         .set_before_generation_notice(Some(myco::session_runtime::prelude_change_notices(prelude)));
     agent.set_retry_policy(catalog_model.backend.retry_policy());
-    agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
     agent.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
     let mut runner = SessionRunner::new(agent, runtime)
         .await
@@ -503,9 +502,6 @@ async fn select_runner_model(
     runner
         .agent_mut()
         .set_retry_policy(catalog.backend.retry_policy());
-    runner
-        .agent_mut()
-        .set_context_window_tokens(catalog.spec.context_window_tokens);
     runner
         .agent_mut()
         .set_max_truncated_resumes(catalog.spec.max_truncated_resumes);

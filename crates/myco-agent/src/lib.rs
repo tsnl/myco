@@ -234,8 +234,8 @@ pub struct RunOutcome {
 /// A headless model/tool loop over caller-supplied context and capabilities.
 ///
 /// Resource lifetime belongs to [`ToolExecutor`]; persistence belongs to the
-/// caller. The context-window setting is informational and does not enforce a
-/// token limit or perform automatic compaction.
+/// caller. The agent enforces no token limit and performs no automatic
+/// compaction.
 pub struct Agent {
     retry_policy: RetryPolicy,
     model: Arc<dyn GenerativeModel>,
@@ -243,8 +243,6 @@ pub struct Agent {
     sink: Arc<dyn EventSink>,
     context: TraceContext,
     state: AgentState,
-    /// Context window for the active model (tokens).
-    context_window_tokens: u64,
     checkpoint: Option<Checkpoint>,
     before_generation_notice: Option<BeforeGenerationNotice>,
     prepared_generation: Option<OperationId>,
@@ -276,7 +274,6 @@ impl Agent {
             sink,
             context,
             state: AgentState::default(),
-            context_window_tokens: 200_000,
             checkpoint: None,
             before_generation_notice: None,
             prepared_generation: None,
@@ -382,15 +379,6 @@ impl Agent {
         self.pending_generation_commit.get_mut().unwrap().take();
         self.emit_checkpoint()?;
         Ok(dropped)
-    }
-
-    /// Set the model context budget available to callers.
-    pub fn set_context_window_tokens(&mut self, tokens: u64) {
-        self.context_window_tokens = tokens.max(1);
-    }
-
-    pub fn context_window_tokens(&self) -> u64 {
-        self.context_window_tokens
     }
 
     /// Set how many consecutive `max_tokens` truncations one turn resumes

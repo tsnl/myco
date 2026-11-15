@@ -79,7 +79,6 @@ pub(super) async fn run(
         context,
     );
     worker.set_retry_policy(task.retry);
-    worker.set_context_window_tokens(catalog.spec.context_window_tokens);
     worker.set_max_truncated_resumes(catalog.spec.max_truncated_resumes);
     super::wire_checkpoint(&mut worker, &session);
     let result = run_worker(&mut worker, task.input, cancel).await;
