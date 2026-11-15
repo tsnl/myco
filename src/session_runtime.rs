@@ -416,7 +416,6 @@ mod tests {
                 vec![Content::Text {
                     text: "user task".into(),
                 }],
-                false,
                 CancelToken::new(),
                 chrono::Utc::now(),
                 |warning| panic!("{warning}"),
@@ -500,7 +499,6 @@ mod tests {
             vec![Content::Text {
                 text: "task".into(),
             }],
-            false,
             CancelToken::new(),
             chrono::Utc::now(),
             |warning| panic!("{warning}"),

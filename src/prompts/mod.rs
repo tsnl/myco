@@ -220,6 +220,33 @@ pub fn thread_stamp(session_id: &str, thread_id: &str, started_at: DateTime<Utc>
     )
 }
 
+/// The `session` part that opens a session's own conversation in a thread.
+pub fn thread_stamp_part(
+    session_id: &str,
+    thread_id: &str,
+    started_at: DateTime<Utc>,
+) -> crate::generative_model::Content {
+    crate::generative_model::Content::System {
+        kind: "session".into(),
+        text: thread_stamp(session_id, thread_id, started_at),
+        data: serde_json::json!({
+            "session_id": session_id, "thread_id": thread_id, "created_at": started_at,
+        }),
+    }
+}
+
+/// Whether `history` carries a stamp naming `session_id`. A fork's inherited
+/// stamp names its parent, and a stamp upgraded from a legacy file names none.
+pub fn has_session_stamp(history: &[crate::generative_model::Message], session_id: &str) -> bool {
+    use crate::generative_model::{Content, Message};
+    history.iter().any(|message| {
+        matches!(message, Message::UserMessage { content } if content.iter().any(|part| {
+            matches!(part, Content::System { kind, data, .. }
+                if kind == "session" && data["session_id"].as_str() == Some(session_id))
+        }))
+    })
+}
+
 /// Cap used when `config.toml` sets no `max_prelude_bytes`.
 ///
 /// The prelude is the default home for durable information (the workspace

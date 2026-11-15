@@ -10,7 +10,7 @@ use crate::agent::{Agent, AgentInteractionError, RunOutcome};
 use crate::core::CancelToken;
 use crate::generative_model::{Content, Message, Recovery};
 use crate::prompts;
-use crate::session::{ActiveSession, SessionWriter};
+use crate::session::{ActiveSession, Session, SessionWriter};
 
 pub struct SessionTurnOutcome {
     pub result: Result<RunOutcome, AgentInteractionError>,
@@ -24,7 +24,6 @@ pub async fn run_session_turn(
     agent: &mut Agent,
     runtime: &Arc<SessionRuntime>,
     input: Vec<Content>,
-    forked: bool,
     cancel: CancelToken,
     accepted_at: DateTime<Utc>,
     on_warning: impl Fn(&str) + Send + Sync + 'static,
@@ -34,7 +33,6 @@ pub async fn run_session_turn(
         runtime,
         Submission {
             input,
-            forked,
             accepted_at: Some(accepted_at),
         },
         &mut Workflow::default(),
@@ -46,7 +44,6 @@ pub async fn run_session_turn(
 
 pub(super) struct Submission {
     pub input: Vec<Content>,
-    pub forked: bool,
     pub accepted_at: Option<DateTime<Utc>>,
 }
 
@@ -60,7 +57,6 @@ pub(super) async fn run_turn(
 ) -> SessionTurnOutcome {
     let Submission {
         mut input,
-        forked,
         accepted_at,
     } = submission;
     let session = runtime.session();
@@ -99,8 +95,16 @@ pub(super) async fn run_turn(
         if let Err(error) = auto_title(session, &input) {
             on_warning(&format!("could not auto-title session: {error}"));
         }
-        if needs_session_stamp(agent.history(), forked) {
-            stamp_input(session, &mut input);
+        if let Some(stamp) = session.with(|session| {
+            needs_session_stamp(agent.history(), session).then(|| {
+                prompts::thread_stamp_part(
+                    &session.id,
+                    &session.active_thread().id,
+                    session.created_at,
+                )
+            })
+        }) {
+            input.insert(0, stamp);
         }
     }
     if let Some(notice) = workflow.runtime_notice(agent, runtime).await {
@@ -185,25 +189,6 @@ fn auto_title(session: &ActiveSession, input: &[Content]) -> Result<(), String> 
     Ok(())
 }
 
-fn stamp_input(session: &ActiveSession, input: &mut Vec<Content>) {
-    let text = session.with(|session| {
-        prompts::thread_stamp(&session.id, &session.active_thread().id, session.created_at)
-    });
-    input.insert(
-        0,
-        Content::System {
-            kind: "session".into(),
-            text,
-            data: session.with(|session| {
-                serde_json::json!({
-                    "session_id":session.id, "thread_id":session.active_thread().id,
-                    "created_at":session.created_at,
-                })
-            }),
-        },
-    );
-}
-
 fn rewind_rejected_input(
     agent: &mut Agent,
     runtime: &Arc<SessionRuntime>,
@@ -252,14 +237,9 @@ fn rewind_rejected_input(
     successor.context_tokens_estimate = None;
     if let Some(Message::UserMessage { content }) = successor.messages.first_mut() {
         for part in content {
-            if let Content::System { kind, text, data } = part
-                && kind == "session"
-            {
-                *text = prompts::thread_stamp(&original.id, &successor.id, original.created_at);
-                *data = serde_json::json!({
-                    "session_id": original.id, "thread_id": successor.id,
-                    "created_at": original.created_at,
-                });
+            if matches!(part, Content::System { kind, .. } if kind == "session") {
+                *part =
+                    prompts::thread_stamp_part(&original.id, &successor.id, original.created_at);
             }
         }
     }
@@ -312,9 +292,12 @@ pub fn persist_session(agent: &Agent, session: &ActiveSession, force: bool) -> R
     session.persist_agent_state(&thread_id, agent.state(), force, None)
 }
 
-// Forks inherit a parent's stamp and need their own; resumes keep the existing one.
-fn needs_session_stamp(history: &[Message], forked: bool) -> bool {
-    !history.iter().any(Message::is_user_turn) || forked
+/// A session stamps its first user turn. A child that has not stamped its own
+/// identity yet (a fork inherits its parent's stamp) stamps the next one.
+/// Resumes keep the existing stamp, including one upgraded from a legacy file.
+fn needs_session_stamp(history: &[Message], session: &Session) -> bool {
+    !history.iter().any(Message::is_user_turn)
+        || session.parent_session_id.is_some() && !prompts::has_session_stamp(history, &session.id)
 }
 
 #[cfg(test)]
@@ -351,7 +334,6 @@ mod tests {
                 vec![Content::Text {
                     text: "task".into(),
                 }],
-                false,
                 cancel,
                 chrono::Utc::now(),
                 |warning| panic!("{warning}"),
@@ -383,7 +365,6 @@ mod tests {
             vec![Content::Text {
                 text: "first accepted input".into(),
             }],
-            false,
             CancelToken::new(),
             Utc::now(),
             |_| {},
@@ -403,7 +384,6 @@ mod tests {
                 vec![Content::Text {
                     text: "continue after storage repair".into(),
                 }],
-                false,
                 CancelToken::new(),
                 Utc::now(),
                 |warning| panic!("{warning}"),
@@ -647,7 +627,6 @@ mod tests {
                     &mut agent,
                     &runtime,
                     vec![],
-                    false,
                     CancelToken::new(),
                     chrono::Utc::now(),
                     |warning| panic!("{warning}"),
@@ -687,7 +666,6 @@ mod tests {
                 &mut agent,
                 &SessionRuntime::new(Harness::local_with_services(vec![]), session.clone()),
                 vec![],
-                false,
                 cancel,
                 chrono::Utc::now(),
                 |warning| panic!("{warning}"),
@@ -704,16 +682,43 @@ mod tests {
 
     /// A session stamps its id on the first message of its own conversation:
     /// once on a fresh session, again on the first message a context fork adds
-    /// (the inherited one names the parent), never on a resumed turn.
+    /// (the inherited one names the parent), never on a resumed turn. A legacy
+    /// stamp names no session, so only a child restamps after one.
     #[test]
     fn session_stamp_covers_fresh_and_forked_runs_only() {
-        let seeded = [Message::UserMessage {
-            content: vec![Content::Text {
-                text: "inherited".into(),
-            }],
-        }];
-        assert!(needs_session_stamp(&[], /*forked*/ false));
-        assert!(needs_session_stamp(&seeded, /*forked*/ true));
-        assert!(!needs_session_stamp(&seeded, /*forked*/ false));
+        let parent = Session::new("test");
+        let stamped = |stamp: Content| {
+            vec![Message::UserMessage {
+                content: vec![
+                    stamp,
+                    Content::Text {
+                        text: "task".into(),
+                    },
+                ],
+            }]
+        };
+        let own = |session: &Session| {
+            stamped(prompts::thread_stamp_part(
+                &session.id,
+                &session.active_thread().id,
+                session.created_at,
+            ))
+        };
+        let legacy = stamped(Content::System {
+            kind: "session".into(),
+            text: "# Session".into(),
+            data: serde_json::json!({"legacy": true}),
+        });
+        let child = parent.fork_child("test");
+
+        assert!(needs_session_stamp(&[], &parent));
+        assert!(needs_session_stamp(&[], &child));
+        assert!(!needs_session_stamp(&own(&parent), &parent));
+        assert!(!needs_session_stamp(&legacy, &parent));
+        assert!(needs_session_stamp(&own(&parent), &child));
+        assert!(needs_session_stamp(&legacy, &child));
+        let mut forked = own(&parent);
+        forked.extend(own(&child));
+        assert!(!needs_session_stamp(&forked, &child));
     }
 }

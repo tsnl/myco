@@ -61,11 +61,7 @@ pub fn compact_thread(
     );
     successor.messages = vec![Message::UserMessage {
         content: vec![
-            Content::System {
-                kind: "session".into(),
-                text: prompts::thread_stamp(&session.id, &successor.id, session.created_at),
-                data: serde_json::json!({"session_id":session.id, "thread_id":successor.id, "created_at":session.created_at}),
-            },
+            prompts::thread_stamp_part(&session.id, &successor.id, session.created_at),
             Content::System {
                 kind: "compaction".into(),
                 text: resume,

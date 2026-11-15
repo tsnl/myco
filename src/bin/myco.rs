@@ -2,9 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use clap::{CommandFactory, Parser, ValueEnum};
 use myco::chat::{ModelCompactor, SessionRunner, WorkflowEvent, persist_session};
-use myco::generative_model::{
-    self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig,
-};
+use myco::generative_model::{self, BackendConfig, CatalogModel, Effort, GenerativeModelConfig};
 use myco::host::HostWorker;
 use myco::session::{ActiveSession, Session, SessionLockError, SessionWriteLock};
 use myco::{
@@ -376,17 +374,6 @@ async fn boot_session<S: EventSink + 'static>(
         )
         .await
         .map_err(|error| format!("cannot record runtime: {error}"))?;
-    // A fork may be opened again before its first submission. Derive its need
-    // for a child identity stamp from persisted context, not launch flags.
-    let saved = session.snapshot();
-    runner.set_forked(
-        saved.parent_session_id.is_some()
-            && !runner.agent().history().iter().any(|message| {
-                matches!(message, myco::generative_model::Message::UserMessage { content }
-            if content.iter().any(|part| matches!(part, Content::System { kind, data, .. }
-                if kind == "session" && data["session_id"].as_str() == Some(saved.id.as_str()))))
-            }),
-    );
     runner.set_compactor(
         Arc::new(ModelCompactor {
             model: catalog_model.clone(),

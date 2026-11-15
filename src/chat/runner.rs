@@ -80,7 +80,6 @@ pub struct SessionRunner {
     agent: Agent,
     runtime: Arc<SessionRuntime>,
     workflow: Workflow,
-    forked: bool,
 }
 
 impl SessionRunner {
@@ -99,7 +98,6 @@ impl SessionRunner {
                 resume_notice: true,
                 ..Default::default()
             },
-            forked: false,
         })
     }
 
@@ -112,10 +110,6 @@ impl SessionRunner {
     pub fn runtime(&self) -> &Arc<SessionRuntime> {
         &self.runtime
     }
-    pub fn set_forked(&mut self, forked: bool) {
-        self.forked = forked;
-    }
-
     pub fn set_compactor(&mut self, compactor: Arc<dyn Compactor>, auto_compact_at: Option<u64>) {
         self.workflow.compactor = Some(compactor);
         self.workflow.threshold = auto_compact_at.map(|tokens| tokens.max(1));
@@ -180,11 +174,10 @@ impl SessionRunner {
     ) -> SessionTurnOutcome {
         let submission = Submission {
             input,
-            forked: self.forked,
             accepted_at: Some(accepted_at),
         };
         let observer = self.workflow.observer.clone();
-        let outcome = run_turn(
+        run_turn(
             &mut self.agent,
             &self.runtime,
             submission,
@@ -192,13 +185,7 @@ impl SessionRunner {
             cancel,
             move |warning| observer(WorkflowEvent::Warning(warning.into())),
         )
-        .await;
-        if self.forked {
-            self.forked = !self.agent.history().iter().any(|message| matches!(message,
-                Message::UserMessage { content } if content.iter().any(|part| matches!(part,
-                    Content::System { kind, data, .. } if kind == "session" && data["session_id"].as_str() == Some(self.runtime.session_id())))));
-        }
-        outcome
+        .await
     }
 
     /// Continue a saved session without fabricating a human submission.
@@ -208,7 +195,7 @@ impl SessionRunner {
             kind: "continuation".into(),
             text: "Resume the work described in the saved context. Check the latest observations and runtime notices before continuing.".into(),
             data: serde_json::json!({"reason":"resume"}),
-        }], forked: false, accepted_at: None };
+        }], accepted_at: None };
         let observer = self.workflow.observer.clone();
         run_turn(
             &mut self.agent,
@@ -1665,6 +1652,81 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(Session::load(&path).unwrap().model, "another");
+        });
+    }
+
+    /// A fork opened again before its first submission still stamps its own
+    /// identity, exactly once, after the inherited stamp naming its parent.
+    #[test]
+    fn a_fork_stamps_its_own_identity_once_across_restarts() {
+        let _home = temp_home("runner-fork-stamp");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut parent = Session::new("scripted");
+            let stamp = prompts::thread_stamp_part(
+                &parent.id,
+                &parent.active_thread().id,
+                parent.created_at,
+            );
+            parent.replace_context(
+                vec![
+                    Message::UserMessage {
+                        content: vec![
+                            stamp,
+                            Content::Text {
+                                text: "parent task".into(),
+                            },
+                        ],
+                    },
+                    crate::test_support::assistant("parent answer"),
+                ],
+                None,
+            );
+            let child = parent.fork_child("scripted");
+            child.save().unwrap();
+            let path = child.json_path();
+            let open = |turns: usize| {
+                let path = path.clone();
+                async move {
+                    let session = ActiveSession::new(Session::load(&path).unwrap());
+                    let runtime =
+                        SessionRuntime::new(Harness::local_with_services(vec![]), session);
+                    let model =
+                        ScriptedModel::new(vec![output(20, None, TurnEndReason::EndTurn); turns]);
+                    let agent = Agent::new(model, runtime.clone(), Arc::new(NullEventSink));
+                    SessionRunner::new(agent, runtime).await.unwrap()
+                }
+            };
+            let stamps = |runner: &SessionRunner, id: &str| {
+                runner
+                    .agent()
+                    .history()
+                    .iter()
+                    .flat_map(Message::content)
+                    .filter(|part| {
+                        matches!(part, Content::System { kind, data, .. }
+                        if kind == "session" && data["session_id"].as_str() == Some(id))
+                    })
+                    .count()
+            };
+            drop(open(0).await);
+            let mut runner = open(1).await;
+            submit(&mut runner, CancelToken::new())
+                .await
+                .result
+                .unwrap();
+            assert!(
+                matches!(&runner.agent().history()[2], Message::UserMessage { content }
+                if matches!(&content[0], Content::System { kind, data, .. }
+                    if kind == "session" && data["session_id"].as_str() == Some(child.id.as_str())))
+            );
+            drop(runner);
+            let mut runner = open(1).await;
+            submit(&mut runner, CancelToken::new())
+                .await
+                .result
+                .unwrap();
+            assert_eq!(stamps(&runner, &parent.id), 1);
+            assert_eq!(stamps(&runner, &child.id), 1);
         });
     }
 
