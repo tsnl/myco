@@ -603,6 +603,7 @@ mod tests {
                 background: crate::core::CancelToken::new(),
                 max_image_base64_bytes: None,
                 thread_id: None,
+                prompt_skills: None,
             },
         ))
     }

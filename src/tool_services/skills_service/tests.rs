@@ -2,6 +2,7 @@ use super::*;
 use crate::core::CancelToken;
 use crate::generative_model::Content;
 use crate::host::HostWorker;
+use crate::skills::Reported;
 use crate::test_support::{result_text, temp_dir};
 use crate::tool_services::TextEditorService;
 use serde_json::json;
@@ -270,4 +271,34 @@ async fn concurrent_calls_dedupe_and_cancelled_scans_do_not_consume_notices() {
         service.clone().observe_successful_call(call, ctx),
     );
     assert_ne!(first.is_some(), second.is_some());
+}
+
+#[tokio::test]
+async fn a_thread_starts_from_the_skills_its_prompt_lists() {
+    let temp = temp_dir("skill-prompt");
+    skill(temp.path(), "listed at startup");
+    let service = service(temp.path());
+    let mut listed = Reported::default();
+    SkillCatalog::scan(temp.path(), None).report(&mut listed, false);
+    let mut ctx = context();
+    ctx.prompt_skills = Some(Arc::new(listed));
+    let bash = ToolUse {
+        name: "bash".into(),
+        input: json!({"command":"true"}),
+        thought_signature: None,
+    };
+    let observe = |ctx: &HostDispatchContext| {
+        service
+            .clone()
+            .observe_successful_call(bash.clone(), ctx.clone())
+    };
+    assert_eq!(observe(&ctx).await, None, "repeated the prompt's catalog");
+    skill(temp.path(), "changed after startup");
+    let changed = observe(&ctx).await.unwrap();
+    assert!(changed.contains("changed after startup"), "{changed}");
+    assert_eq!(observe(&ctx).await, None);
+    // A rebuilt model's prompt replaces the old one, even within a thread.
+    ctx.prompt_skills = Some(Arc::new(Reported::default()));
+    let rebuilt = observe(&ctx).await.unwrap();
+    assert!(rebuilt.contains("changed after startup"), "{rebuilt}");
 }

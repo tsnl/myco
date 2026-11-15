@@ -348,7 +348,11 @@ async fn boot_session<S: EventSink + 'static>(
     root_tools.extend([session_tool, history_tool, list_recent_tool, prelude_tool]);
     let harness = attach_harness(&app_config, &preflight, root_tools).await?;
 
-    let (model, prelude) = build_model(
+    let BuiltModel {
+        model,
+        prelude,
+        skills,
+    } = build_model(
         &catalog_model,
         &harness,
         args.debug_dump_api_requests,
@@ -356,6 +360,7 @@ async fn boot_session<S: EventSink + 'static>(
     )?;
     let runtime = myco::SessionRuntime::new(harness.clone(), session.clone());
     runtime.set_max_image_base64_bytes(catalog_model.spec.max_image_base64_bytes);
+    runtime.set_prompt_skills(skills);
     let mut agent = Agent::new(model.clone(), runtime.clone(), sink.clone());
     agent
         .set_before_generation_notice(Some(myco::session_runtime::prelude_change_notices(prelude)));
@@ -413,18 +418,19 @@ async fn boot_session<S: EventSink + 'static>(
     ))
 }
 
+/// A model and the prompt snapshots its live change notices start from.
+struct BuiltModel {
+    model: Arc<dyn generative_model::GenerativeModel>,
+    prelude: Vec<myco::prelude::PreludeEntry>,
+    skills: myco::skills::Reported,
+}
+
 fn build_model(
     catalog_model: &CatalogModel,
     harness: &Harness,
     debug_dump_api_requests: bool,
     effort: Effort,
-) -> Result<
-    (
-        Arc<dyn generative_model::GenerativeModel>,
-        Vec<myco::prelude::PreludeEntry>,
-    ),
-    String,
-> {
+) -> Result<BuiltModel, String> {
     let mut backend_config = catalog_model.backend.clone();
     match &mut backend_config {
         BackendConfig::Anthropic(c) => {
@@ -442,7 +448,7 @@ fn build_model(
         }
     }
 
-    let (epilogue, prelude) = prompts::agent_prompt_epilogue();
+    let (epilogue, prelude, skills) = prompts::agent_prompt_epilogue();
     let model = generative_model::new(GenerativeModelConfig {
         model: catalog_model.spec.clone(),
         tools: harness.tool_specs_with_image_limit(catalog_model.spec.max_image_base64_bytes),
@@ -464,7 +470,11 @@ fn build_model(
         myco::core::image_store::ImageStore::for_profile()?,
         catalog_model.spec.max_image_base64_bytes,
     );
-    Ok((model, prelude))
+    Ok(BuiltModel {
+        model,
+        prelude,
+        skills,
+    })
 }
 
 async fn select_runner_model(
@@ -475,7 +485,11 @@ async fn select_runner_model(
     debug_dump_api_requests: bool,
     compaction_max_requests: usize,
 ) -> Result<(), String> {
-    let (model, prelude) = build_model(catalog, harness, debug_dump_api_requests, effort)?;
+    let BuiltModel {
+        model,
+        prelude,
+        skills,
+    } = build_model(catalog, harness, debug_dump_api_requests, effort)?;
     runner
         .set_model(
             model,
@@ -505,6 +519,7 @@ async fn select_runner_model(
     runner
         .runtime()
         .set_max_image_base64_bytes(catalog.spec.max_image_base64_bytes);
+    runner.runtime().set_prompt_skills(skills);
     Ok(())
 }
 

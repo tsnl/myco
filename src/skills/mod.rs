@@ -55,7 +55,7 @@ pub struct SkillCatalog {
 }
 
 /// What one conversation thread has been told, bounded by `MAX_REPORTED`.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Reported {
     skills: BTreeMap<PathBuf, String>,
     warnings: BTreeSet<String>,

@@ -291,8 +291,13 @@ fn human_bytes(n: usize) -> String {
 /// of the rest of the workspace, when present. Read at model build time —
 /// session start, model switch, each worker spawn — so a running agent's prompt
 /// never changes mid-conversation and the cached conversation prefix stays valid.
-/// Returns the exact prelude snapshot used to seed live change notifications.
-pub fn agent_prompt_epilogue() -> (String, Vec<crate::prelude::PreludeEntry>) {
+/// Returns the exact prelude snapshot and local skills listed, which seed live
+/// change notices.
+pub fn agent_prompt_epilogue() -> (
+    String,
+    Vec<crate::prelude::PreludeEntry>,
+    crate::skills::Reported,
+) {
     let home = crate::core::myco_home().ok();
     let prelude = home
         .as_ref()
@@ -300,16 +305,26 @@ pub fn agent_prompt_epilogue() -> (String, Vec<crate::prelude::PreludeEntry>) {
         .unwrap_or_default();
     let cwd = std::env::current_dir().ok();
     let mut prompt = epilogue_with(home, cwd.clone(), &prelude);
+    let mut skills = crate::skills::Reported::default();
     if let Some(cwd) = cwd {
-        prompt.push_str(&skill_section(&cwd, dirs::home_dir().as_deref()));
+        prompt.push_str(&skill_section(
+            &cwd,
+            dirs::home_dir().as_deref(),
+            &mut skills,
+        ));
     }
-    (prompt, prelude)
+    (prompt, prelude, skills)
 }
 
-/// Startup uses the same bounded host-local scanner as live tool observations.
-fn skill_section(directory: &Path, home: Option<&Path>) -> String {
+/// Startup uses the same bounded host-local scanner as live tool observations;
+/// `listed` records exactly what the section shows.
+fn skill_section(
+    directory: &Path,
+    home: Option<&Path>,
+    listed: &mut crate::skills::Reported,
+) -> String {
     crate::skills::SkillCatalog::scan(directory, home)
-        .report(&mut Default::default(), false)
+        .report(listed, false)
         .map(|catalog| format!("\n---\n\n# Local skills\n\n{catalog}"))
         .unwrap_or_default()
 }
@@ -1059,7 +1074,8 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("SKILL.md"), format!("---\nname: {name}\ndescription: Use for {name} tasks\n---\nPRIVATE_BODY_SENTINEL\n")).unwrap();
         }
-        let section = super::skill_section(project.path(), Some(home.path()));
+        let mut listed = crate::skills::Reported::default();
+        let section = super::skill_section(project.path(), Some(home.path()), &mut listed);
         assert!(section.contains("project-skill"), "{section}");
         assert!(section.contains("user-skill"), "{section}");
         assert!(!section.contains("PRIVATE_BODY_SENTINEL"), "{section}");

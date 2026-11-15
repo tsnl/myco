@@ -666,7 +666,7 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
             c.debug_dump_api_requests = false;
         }
     }
-    let (epilogue, prelude) = crate::prompts::agent_prompt_epilogue();
+    let (epilogue, prelude, skills) = crate::prompts::agent_prompt_epilogue();
     let model_config = GenerativeModelConfig {
         model: catalog.spec.clone(),
         tools: harness.tool_specs_with_image_limit(catalog.spec.max_image_base64_bytes),
@@ -716,6 +716,7 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
         image_store,
         catalog.spec.max_image_base64_bytes,
     );
+    runtime.set_prompt_skills(skills);
     let mut agent = Agent::new(model.clone(), runtime.clone(), recorder.clone());
     agent.set_before_generation_notice(Some(crate::session_runtime::prelude_change_notices(
         prelude,
