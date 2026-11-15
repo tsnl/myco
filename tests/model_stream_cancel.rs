@@ -2,8 +2,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use myco::generative_model::{
-    BackendConfig, GenerativeModelConfig, Message, ModelSpec, OpenAIBackendConfig, Protocol,
-    ThinkingMode,
+    BackendConfig, GenerativeModelConfig, Message, ModelSpec, Protocol, ThinkingMode,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -111,10 +110,10 @@ fn model(base_url: &str) -> std::sync::Arc<dyn myco::generative_model::Generativ
         },
         tools: vec![],
         system_prompt: String::new(),
-        backend_config: BackendConfig::OpenAICompletions(OpenAIBackendConfig {
+        backend_config: BackendConfig {
             base_url: base_url.into(),
             ..Default::default()
-        }),
+        },
     })
     .unwrap()
 }

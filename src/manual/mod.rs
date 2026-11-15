@@ -16,7 +16,7 @@ pub struct Article {
     pub id: &'static str,
     /// Short human title for catalog listings.
     pub title: &'static str,
-    /// One-line summary shown by catalog / tool `list`.
+    /// One-line summary shown in `index.md` and the `--help` catalog.
     pub summary: &'static str,
     /// Full markdown body (`include_str!`).
     pub body: &'static str,
@@ -128,7 +128,7 @@ pub fn format_catalog() -> String {
     out
 }
 
-/// Full article body with a title header (CLI / tool `get`).
+/// Full article body with a title header (`myco --help <id>`).
 pub fn format_article(id: &str) -> Result<String, String> {
     match article(id) {
         Some(a) => Ok(format!("# {} (`{}`)\n\n{}", a.title, a.id, a.body)),

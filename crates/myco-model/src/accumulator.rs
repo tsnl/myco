@@ -99,6 +99,71 @@ impl MessageAccumulator {
     }
 }
 
+impl GenerateOutput {
+    /// The part stream [`MessageAccumulator`] assembles back into this
+    /// output, one delta per block: a stand-in for a provider stream in
+    /// scripted models.
+    ///
+    /// # Panics
+    ///
+    /// On a [`Content::System`] block, which is runtime input and never
+    /// model output.
+    pub fn into_parts(self) -> Vec<MessagePart> {
+        let mut parts = vec![MessagePart::MessageStart];
+        for (index, content) in self.content.into_iter().enumerate() {
+            match content {
+                Content::System { .. } => {
+                    panic!("system parts are runtime input, not model output")
+                }
+                Content::Text { text } => parts.extend([
+                    MessagePart::ContentStart(ContentStart::Text { index }),
+                    MessagePart::ContentDelta(ContentDelta::Text { index, delta: text }),
+                ]),
+                Content::Image { source } => parts.extend([
+                    MessagePart::ContentStart(ContentStart::Image { index }),
+                    MessagePart::ContentDelta(ContentDelta::Image {
+                        index,
+                        delta: source,
+                    }),
+                ]),
+                Content::Thinking {
+                    text,
+                    signature,
+                    redacted,
+                } => {
+                    parts.push(MessagePart::ContentStart(ContentStart::Thinking {
+                        index,
+                        signature,
+                        redacted,
+                    }));
+                    if !text.is_empty() && !redacted {
+                        parts.push(MessagePart::ContentDelta(ContentDelta::Thinking {
+                            index,
+                            delta: text,
+                        }));
+                    }
+                }
+            }
+        }
+        for (index, tool_use) in self.tool_uses.into_iter().enumerate() {
+            parts.extend([
+                MessagePart::ToolUseStart(ToolUseStart {
+                    index,
+                    name: tool_use.name,
+                    thought_signature: tool_use.thought_signature,
+                }),
+                MessagePart::ToolUseDelta(ToolUseDelta {
+                    index,
+                    input_json_delta: tool_use.input.to_string(),
+                }),
+            ]);
+        }
+        parts.extend(self.usage.map(MessagePart::Usage));
+        parts.push(MessagePart::TurnEndReason(self.turn_end_reason));
+        parts
+    }
+}
+
 struct IncompleteToolUse {
     name: String,
     input_json: String,
@@ -226,6 +291,46 @@ mod tests {
             accumulator.push(part)?;
         }
         accumulator.finish()
+    }
+
+    #[test]
+    fn into_parts_reassembles_into_the_same_output() {
+        let output = GenerateOutput {
+            content: vec![
+                Content::Thinking {
+                    text: "plan".into(),
+                    signature: Some("sig".into()),
+                    redacted: false,
+                },
+                Content::Thinking {
+                    text: String::new(),
+                    signature: Some("opaque".into()),
+                    redacted: true,
+                },
+                Content::Text {
+                    text: "answer".into(),
+                },
+                Content::Image {
+                    source: "data:image/png;base64,AA".into(),
+                },
+            ],
+            tool_uses: vec![ToolUse {
+                name: "bash".into(),
+                input: serde_json::json!({"command": "pwd"}),
+                thought_signature: Some("tool-sig".into()),
+            }],
+            turn_end_reason: TurnEndReason::ToolUse,
+            usage: Some(TokenUsage {
+                input_tokens: 10,
+                output_tokens: 2,
+                cached_input_tokens: 4,
+            }),
+        };
+        let assembled = assemble(&output.clone().into_parts()).unwrap();
+        assert_eq!(assembled.content, output.content);
+        assert_eq!(assembled.tool_uses, output.tool_uses);
+        assert_eq!(assembled.turn_end_reason, output.turn_end_reason);
+        assert_eq!(assembled.usage, output.usage);
     }
 
     #[test]

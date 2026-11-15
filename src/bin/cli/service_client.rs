@@ -6,7 +6,7 @@ use reqwest::{Client, Response};
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
-use crate::service_protocol::{Identity, Output, Submit};
+use crate::service_protocol::{Identity, Output, Submit, is_full_session_id};
 
 pub(super) struct Service {
     http: Client,
@@ -18,10 +18,7 @@ pub(super) struct Service {
 impl Service {
     pub(super) async fn connect(base: &str, session: &str) -> Result<Self, String> {
         let (base, profile) = endpoint(base)?;
-        if Uuid::parse_str(session).is_err()
-            || session.len() != 32
-            || session.to_ascii_lowercase() != session
-        {
+        if !is_full_session_id(session) {
             return Err("--server requires --resume with the full 32-character session id.".into());
         }
         let http = Client::builder()

@@ -15,20 +15,18 @@ use crate::tool_services::ToolService;
 
 mod command_nudge;
 mod config;
-pub use config::{
-    default_ssh_config_path, load_ssh_host_aliases, ssh_config_host_aliases, ssh_spawn_command,
-};
+pub use config::load_ssh_host_aliases;
 
 // HostController lives in `crate::host` (in-process local or remote subprocess).
 pub use crate::host::{HostConfig, HostController, HostFailure};
 
 mod preflight;
-pub use preflight::{
-    ExecutableCheckReport, StartupPreflight, check_expected_executables, fatal_startup_check,
-};
+pub use preflight::{StartupPreflight, fatal_startup_check};
 
 mod ssh;
-pub use ssh::{SshAgentPreflightReport, ensure_remote_ssh_identities};
+
+/// Tools that omit `host` run here: the always-on in-process worker.
+const DEFAULT_HOST: &str = "local";
 
 /// Snapshot of one configured host.
 #[derive(Debug, Clone)]
@@ -49,19 +47,14 @@ pub struct HostStatus {
 pub struct Harness {
     /// All hosts including always-present `"local"`.
     hosts: HashMap<String, Arc<HostController>>,
-    /// Full command lines for display (`in-process` stored as a single-token vec).
-    host_commands: HashMap<String, Vec<String>>,
-    /// Always `"local"` — tools that omit `host` run here.
-    default_host: String,
-    /// Union of tool names known across hosts (standard + root-only extras on local).
-    host_tool_names: std::collections::HashSet<String>,
     /// Tools installed only on the in-process local worker (not remotes).
     ///
     /// These always route to `local` and **must not** receive the injected routing
     /// `host` field — their own schemas may use `host` for other purposes
     /// (e.g. `session_meta` worktree links).
     root_only_tool_names: std::collections::HashSet<String>,
-    /// Cached tool specs advertised to the model (host field injected for multi-host tools).
+    /// Tool specs advertised to the model (host field injected for multi-host
+    /// tools): every tool any host serves.
     tool_specs: Vec<generative_model::ToolSpec>,
     max_image_base64_bytes: u64,
 }
@@ -173,9 +166,6 @@ impl Harness {
         let mut harness = Self::local_harness(root_services, config.max_image_base64_bytes);
         let connect_timeout = config.attach_timeout_secs;
         for host_cfg in config.remote_hosts {
-            harness
-                .host_commands
-                .insert(host_cfg.name.clone(), host_cfg.command.clone());
             let name = host_cfg.name.clone();
             harness.hosts.insert(
                 name,
@@ -189,11 +179,6 @@ impl Harness {
         }
 
         Ok(Arc::new(harness))
-    }
-
-    /// Test helper: attach only the in-process local host.
-    pub async fn attach_local_for_tests() -> Result<Arc<Self>, String> {
-        Self::attach(HarnessConfig::default()).await
     }
 
     /// In-process harness for unit tests: local host only, with the given services
@@ -213,47 +198,34 @@ impl Harness {
         root_services: Vec<Arc<dyn ToolService>>,
         max_image_base64_bytes: u64,
     ) -> Self {
-        let mut host_tool_names = std::collections::HashSet::new();
-        let mut root_only_tool_names = std::collections::HashSet::new();
-        let mut tool_specs = Vec::new();
-        let mut seen_tools = HashMap::<String, ()>::new();
-
         // Standard catalog (every host, including remotes) — inject routing `host`.
-        for spec in crate::host::HostWorker::standard_tool_specs(max_image_base64_bytes) {
-            host_tool_names.insert(spec.name.clone());
-            if seen_tools.insert(spec.name.clone(), ()).is_none() {
-                tool_specs.push(inject_host_field(spec));
-            }
-        }
+        let mut tool_specs: Vec<_> =
+            crate::host::HostWorker::standard_tool_specs(max_image_base64_bytes)
+                .into_iter()
+                .map(inject_host_field)
+                .collect();
 
-        // Root-only extras (session_meta, …) — local only; keep their schemas.
-        for service in &root_services {
-            for spec in service.tool_specs() {
-                host_tool_names.insert(spec.name.clone());
-                root_only_tool_names.insert(spec.name.clone());
-                if seen_tools.insert(spec.name.clone(), ()).is_none() {
-                    // Do **not** inject routing `host` — root tools may use `host` themselves.
-                    tool_specs.push(spec);
-                }
-            }
+        // Root-only extras (session_meta, …) — local only. Do **not** inject
+        // routing `host`: root tools may use `host` themselves. Duplicate names
+        // panic when the local worker below is built.
+        let mut root_only_tool_names = std::collections::HashSet::new();
+        for spec in root_services
+            .iter()
+            .flat_map(|service| service.tool_specs())
+        {
+            root_only_tool_names.insert(spec.name.clone());
+            tool_specs.push(spec);
         }
 
         let mut local_services: Vec<Arc<dyn ToolService>> =
             crate::host::HostWorker::standard_services(max_image_base64_bytes);
         local_services.extend(root_services);
 
-        let local_worker = Arc::new(crate::host::HostWorker::new("local", local_services));
-        let local = HostController::in_process("local", local_worker);
-        let mut hosts = HashMap::new();
-        let mut host_commands = HashMap::new();
-        hosts.insert("local".into(), local);
-        host_commands.insert("local".into(), vec!["in-process".into()]);
+        let local_worker = Arc::new(crate::host::HostWorker::new(DEFAULT_HOST, local_services));
+        let local = HostController::in_process(DEFAULT_HOST, local_worker);
 
         Self {
-            hosts,
-            host_commands,
-            default_host: "local".into(),
-            host_tool_names,
+            hosts: HashMap::from([(DEFAULT_HOST.to_string(), local)]),
             root_only_tool_names,
             tool_specs,
             max_image_base64_bytes,
@@ -282,11 +254,6 @@ impl Harness {
         specs
     }
 
-    /// Always `"local"`.
-    pub fn default_host(&self) -> &str {
-        &self.default_host
-    }
-
     pub fn host_names(&self) -> Vec<String> {
         let mut names: Vec<_> = self.hosts.keys().cloned().collect();
         names.sort();
@@ -303,15 +270,14 @@ impl Harness {
         self.host_names()
             .into_iter()
             .map(|name| {
-                let command = self.host_commands.get(&name).cloned().unwrap_or_default();
                 let client = self.hosts.get(&name).expect("host map key");
                 HostStatus {
+                    command: client.command(),
                     connected: client.is_connected(),
                     in_process: client.is_in_process(),
                     tools: client.tool_specs().iter().map(|t| t.name.clone()).collect(),
                     failure: client.last_failure(),
                     name,
-                    command,
                 }
             })
             .collect()
@@ -341,7 +307,7 @@ impl Harness {
         Box::pin(async move {
             let name = tool_use.name.clone();
 
-            if !self.host_tool_names.contains(&name) {
+            if !self.tool_specs.iter().any(|spec| spec.name == name) {
                 return generative_model::ToolResult::err(format!("unknown tool '{name}'"));
             }
 
@@ -349,24 +315,21 @@ impl Harness {
             // may use `host` for non-routing purposes (e.g. session_meta worktree links),
             // so do not resolve/strip a routing host field for them.
             let host_name = if self.root_only_tool_names.contains(&name) {
-                self.default_host.clone()
+                DEFAULT_HOST.to_string()
             } else {
-                match resolve_host_for_call(&tool_use, &self.default_host) {
+                let host_name = match resolve_host_for_call(&tool_use) {
                     Ok(h) => h,
                     Err(e) => return generative_model::ToolResult::err(e),
-                }
-            };
-
-            if !self.root_only_tool_names.contains(&name) {
+                };
                 // Strip routing-only `host` before forwarding multi-host tools.
                 strip_host_field(&mut tool_use);
-            }
+                host_name
+            };
 
             let Some(client) = self.hosts.get(&host_name).cloned() else {
                 let known = self.host_names().join(", ");
                 return generative_model::ToolResult::err(format!(
-                    "unknown host {host_name:?} (known: [{known}]; default={})",
-                    self.default_host
+                    "unknown host {host_name:?} (known: [{known}]; default={DEFAULT_HOST})"
                 ));
             };
 
@@ -418,17 +381,14 @@ impl Harness {
     }
 }
 
-/// Read optional `host` from tool input; default to `default_host` (always `"local"`).
-fn resolve_host_for_call(
-    tool_use: &generative_model::ToolUse,
-    default_host: &str,
-) -> Result<String, String> {
+/// Read optional `host` from tool input; default to [`DEFAULT_HOST`].
+fn resolve_host_for_call(tool_use: &generative_model::ToolUse) -> Result<String, String> {
     match tool_use.input.get("host") {
-        None | Some(serde_json::Value::Null) => Ok(default_host.to_string()),
+        None | Some(serde_json::Value::Null) => Ok(DEFAULT_HOST.to_string()),
         Some(serde_json::Value::String(s)) => {
             let s = s.trim();
             if s.is_empty() {
-                Ok(default_host.to_string())
+                Ok(DEFAULT_HOST.to_string())
             } else {
                 Ok(s.to_string())
             }
@@ -528,21 +488,21 @@ mod tests {
             input: json!({"command": "echo"}),
             thought_signature: None,
         };
-        assert_eq!(resolve_host_for_call(&tu, "local").unwrap(), "local");
+        assert_eq!(resolve_host_for_call(&tu).unwrap(), "local");
 
         let tu = ToolUse {
             name: "bash".into(),
             input: json!({"command": "echo", "host": "devbox"}),
             thought_signature: None,
         };
-        assert_eq!(resolve_host_for_call(&tu, "local").unwrap(), "devbox");
+        assert_eq!(resolve_host_for_call(&tu).unwrap(), "devbox");
 
         let tu = ToolUse {
             name: "bash".into(),
             input: json!({"host": "  "}),
             thought_signature: None,
         };
-        assert_eq!(resolve_host_for_call(&tu, "local").unwrap(), "local");
+        assert_eq!(resolve_host_for_call(&tu).unwrap(), "local");
     }
 
     #[test]
@@ -700,7 +660,6 @@ mod tests {
         let harness = Harness::attach(HarnessConfig::default())
             .await
             .expect("attach");
-        assert_eq!(harness.default_host(), "local");
         let status = harness.host_status();
         assert_eq!(status.len(), 1);
         assert_eq!(status[0].name, "local");
@@ -729,7 +688,6 @@ mod tests {
             ..Default::default()
         };
         let harness = Harness::attach(cfg).await.expect("attach");
-        assert_eq!(harness.default_host(), "local");
         let status = harness.host_status();
         assert_eq!(status.len(), 3); // local + a + b
         let local = status.iter().find(|s| s.name == "local").unwrap();

@@ -2,7 +2,8 @@
 
 mod tail;
 
-pub use tail::select_tail;
+#[cfg(test)]
+use tail::select_tail;
 use tail::select_tail_indexed;
 
 use crate::generative_model::{Content, Message};
@@ -50,8 +51,7 @@ pub fn compact_thread(
     );
     let runtime = crate::core::latest_runtime_part(&predecessor.messages);
     let tail_messages = tail.len() + usize::from(runtime.is_some());
-    let mut successor = super::Thread::new();
-    successor.predecessor_id = Some(predecessor.id.clone());
+    let mut successor = super::Thread::successor_of(predecessor);
     let resume = format!(
         "# Compaction resume\n\n{}\n\n---\nSession: `{}`\nPredecessor thread: `{}`\nSummary file: `{}`\n",
         summary_markdown.trim(),
@@ -61,11 +61,7 @@ pub fn compact_thread(
     );
     successor.messages = vec![Message::UserMessage {
         content: vec![
-            Content::System {
-                kind: "session".into(),
-                text: prompts::thread_stamp(&session.id, &successor.id, session.created_at),
-                data: serde_json::json!({"session_id":session.id, "thread_id":successor.id, "created_at":session.created_at}),
-            },
+            prompts::thread_stamp_part(&session.id, &successor.id, session.created_at),
             Content::System {
                 kind: "compaction".into(),
                 text: resume,
@@ -205,9 +201,14 @@ mod tests {
         active.with_mut(|session| session.title = Some("updated during compaction".into()));
         writer.commit_thread(next.clone()).unwrap();
         assert!(
-            active
-                .persist_thread_messages(&predecessor, &[user("stale")], None, true)
-                .is_err()
+            crate::test_support::persist_messages(
+                &active,
+                &predecessor,
+                &[user("stale")],
+                None,
+                true
+            )
+            .is_err()
         );
         assert_eq!(
             active.snapshot().title.as_deref(),

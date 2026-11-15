@@ -1,6 +1,8 @@
-//! Bounded auxiliary inference with a separate, parent-linked saved history.
-//! The caller supplies capabilities and retry policy and remains responsible for
-//! interpreting the result. This runner never installs a result in the parent.
+//! Bounded auxiliary inference with a separate, parent-linked saved history,
+//! stored as a hidden compaction worker session. The caller supplies
+//! capabilities and retry policy and remains responsible for interpreting the
+//! result. This runner never installs a result in the parent. Failures other
+//! than cancellation are reported as compaction failures.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,7 +20,6 @@ use crate::session::{ActiveSession, Session, SessionKind, SessionWriteLock};
 //
 
 pub(super) struct AuxiliaryTask {
-    pub kind: SessionKind,
     pub parent_session_id: String,
     pub title: String,
     pub system_prompt: String,
@@ -28,12 +29,6 @@ pub(super) struct AuxiliaryTask {
     /// The role knows which configuration setting can increase its budget.
     pub request_limit_error: String,
     pub retry: RetryPolicy,
-}
-
-#[derive(Debug)]
-pub(super) enum AuxiliaryError {
-    Cancelled,
-    Failed(String),
 }
 
 //
@@ -46,7 +41,7 @@ pub(super) async fn run(
     cancel: CancelToken,
     wrap_model: impl FnOnce(Arc<dyn GenerativeModel>) -> Arc<dyn GenerativeModel>,
     sink: Arc<dyn EventSink>,
-) -> Result<Vec<Content>, AuxiliaryError> {
+) -> Result<Vec<Content>, AgentInteractionError> {
     let worker_id = uuid::Uuid::new_v4();
     let (session, _writer) = saved_session(&task, catalog, worker_id)?;
     let model = generative_model::new(GenerativeModelConfig {
@@ -55,10 +50,13 @@ pub(super) async fn run(
         system_prompt: task.system_prompt,
         backend_config: catalog.backend.clone(),
     })
-    .map_err(|error| AuxiliaryError::Failed(format!("failed to create model: {error:?}")))?;
+    .map_err(|error| {
+        AgentInteractionError::Compaction(format!("failed to create model: {error:?}"))
+    })?;
     let model = crate::core::image_store::with_images(
         wrap_model(model),
-        crate::core::image_store::ImageStore::for_profile().map_err(AuxiliaryError::Failed)?,
+        crate::core::image_store::ImageStore::for_profile()
+            .map_err(AgentInteractionError::Compaction)?,
         catalog.spec.max_image_base64_bytes,
     );
     let context = TraceContext {
@@ -79,17 +77,13 @@ pub(super) async fn run(
         context,
     );
     worker.set_retry_policy(task.retry);
-    worker.set_context_window_tokens(catalog.spec.context_window_tokens);
     worker.set_max_truncated_resumes(catalog.spec.max_truncated_resumes);
     super::wire_checkpoint(&mut worker, &session);
     let result = run_worker(&mut worker, task.input, cancel).await;
     // Even failed or cancelled work must leave its observations inspectable.
     // Persistence failure takes precedence over a model result or cancellation.
     super::persist_session(&worker, &session, true).map_err(|error| {
-        AuxiliaryError::Failed(format!(
-            "could not save {} worker state: {error}",
-            task.kind
-        ))
+        AgentInteractionError::Compaction(format!("could not save compact worker state: {error}"))
     })?;
     result
 }
@@ -98,32 +92,21 @@ fn saved_session(
     task: &AuxiliaryTask,
     catalog: &CatalogModel,
     worker_id: uuid::Uuid,
-) -> Result<(ActiveSession, SessionWriteLock), AuxiliaryError> {
-    if task.kind.is_user() {
-        return Err(AuxiliaryError::Failed(
-            "auxiliary sessions must be hidden".into(),
-        ));
-    }
+) -> Result<(ActiveSession, SessionWriteLock), AgentInteractionError> {
     let mut session = Session::new_hidden(
         catalog.spec.key.clone(),
         uuid_simple_hex(worker_id),
-        task.kind,
+        SessionKind::Compact,
         Some(task.parent_session_id.clone()),
     );
     // The child is discoverable on disk while running. Its lease prevents a
     // browser or another process from opening a competing writer.
     let writer = SessionWriteLock::acquire(&session.id).map_err(|error| {
-        AuxiliaryError::Failed(format!(
-            "could not lock {} worker session: {error}",
-            task.kind
-        ))
+        AgentInteractionError::Compaction(format!("could not lock compact worker session: {error}"))
     })?;
     session.title = Some(task.title.clone());
     session.save().map_err(|error| {
-        AuxiliaryError::Failed(format!(
-            "could not save {} worker session: {error}",
-            task.kind
-        ))
+        AgentInteractionError::Compaction(format!("could not save compact worker session: {error}"))
     })?;
     Ok((ActiveSession::new(session), writer))
 }
@@ -132,12 +115,12 @@ async fn run_worker(
     worker: &mut Agent,
     input: Vec<Content>,
     cancel: CancelToken,
-) -> Result<Vec<Content>, AuxiliaryError> {
+) -> Result<Vec<Content>, AgentInteractionError> {
     super::interact(worker, input, cancel)
         .await
         .map_err(|error| match error {
-            AgentInteractionError::Cancelled => AuxiliaryError::Cancelled,
-            error => AuxiliaryError::Failed(format!("worker failed: {error}")),
+            AgentInteractionError::Cancelled => error,
+            error => AgentInteractionError::Compaction(format!("worker failed: {error}")),
         })
 }
 
@@ -221,7 +204,7 @@ mod tests {
         let mut worker = Agent::new(model, Arc::new(NoTools), Arc::new(NullEventSink));
         let result = run_worker(&mut worker, input(), CancelToken::new()).await;
         assert!(
-            matches!(result, Err(AuxiliaryError::Failed(text)) if text.contains("2-request limit"))
+            matches!(result, Err(AgentInteractionError::Compaction(text)) if text.contains("2-request limit"))
         );
         assert_eq!(inner.remaining(), 1);
         crate::agent::validate_context(worker.history()).unwrap();
@@ -235,7 +218,7 @@ mod tests {
         worker.set_checkpoint(Some(Box::new(|_| Err("storage unavailable".into()))));
         let result = run_worker(&mut worker, input(), CancelToken::new()).await;
         assert!(
-            matches!(result, Err(AuxiliaryError::Failed(text)) if text.contains("storage unavailable"))
+            matches!(result, Err(AgentInteractionError::Compaction(text)) if text.contains("storage unavailable"))
         );
         assert!(worker.checkpoint_failed());
         assert!(worker.state().pending_operation().is_none());
@@ -288,7 +271,7 @@ mod tests {
             started.notified().await;
             cancel.cancel();
         });
-        assert!(matches!(result, Err(AuxiliaryError::Cancelled)));
+        assert!(matches!(result, Err(AgentInteractionError::Cancelled)));
         assert!(worker.state().pending_operation().is_none());
         crate::agent::validate_context(worker.history()).unwrap();
     }
@@ -354,7 +337,6 @@ mod tests {
 
     fn task(parent: &Session) -> AuxiliaryTask {
         AuxiliaryTask {
-            kind: SessionKind::Subagent,
             parent_session_id: parent.id.clone(),
             title: "inspect task".into(),
             system_prompt: "Inspect supplied data with no tools.".into(),
@@ -414,7 +396,7 @@ mod tests {
                 }]
             );
             assert_ne!(child.id, parent.id);
-            assert_eq!(child.kind, SessionKind::Subagent);
+            assert_eq!(child.kind, SessionKind::Compact);
             assert_eq!(child.title.as_deref(), Some("inspect task"));
             assert!(!child.auto_continue);
             assert_eq!(
@@ -452,7 +434,7 @@ mod tests {
                 tool_uses: vec![], usage: None, turn_end_reason: TurnEndReason::EndTurn,
             }]);
             let result = run(task(&parent), &catalog(), CancelToken::new(), |_| model.clone(), Arc::new(BlockFinalSave(home.path().into()))).await;
-            assert!(matches!(result, Err(AuxiliaryError::Failed(ref text)) if text.contains("could not save subagent worker state")), "{result:?}");
+            assert!(matches!(result, Err(AgentInteractionError::Compaction(ref text)) if text.contains("could not save compact worker state")), "{result:?}");
             assert_eq!(model.remaining(), 0);
             std::fs::remove_file(home.path().join("session")).unwrap();
             std::fs::rename(home.path().join("saved-session"), home.path().join("session")).unwrap();
@@ -497,7 +479,7 @@ mod tests {
                     cancel.cancel();
                 }
             );
-            assert!(matches!(result, Err(AuxiliaryError::Cancelled)));
+            assert!(matches!(result, Err(AgentInteractionError::Cancelled)));
             let child = child_of(&parent);
             assert!(SessionWriteLock::acquire(&child.id).is_ok());
             assert!(child.active_thread().pending_operation.is_none());

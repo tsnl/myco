@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use chrono::Utc;
 use serde_json::json;
 
-use super::{CompactWorkerError, Compactor, SessionRunner};
+use super::{Compactor, SessionRunner, WorkflowEvent};
 use crate::agent::{Agent, AgentEvent, AgentInteractionError, EventSink, validate_context};
 use crate::core::{Async, CancelToken, ModelInfo};
 use crate::generative_model::{Content, GenerateOutput, Message, ToolUse, TurnEndReason};
@@ -45,15 +45,17 @@ impl Compactor for Summarize {
     fn compact(
         self: Arc<Self>,
         predecessor: Session,
+        _single_attempt: bool,
+        _observer: Arc<dyn Fn(WorkflowEvent) + Send + Sync>,
         _cancel: CancelToken,
-    ) -> Async<Result<(Thread, CompactOutcome), CompactWorkerError>> {
+    ) -> Async<Result<(Thread, CompactOutcome), AgentInteractionError>> {
         Box::pin(async move {
             validate_context(&predecessor.active_thread().messages).unwrap();
             compact_thread(
                 &predecessor,
                 "Preserve the task and completed tool observations",
             )
-            .map_err(CompactWorkerError::Failed)
+            .map_err(AgentInteractionError::Compaction)
         })
     }
 }

@@ -4,17 +4,77 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
 use futures::StreamExt;
 use myco::generative_model::ToolUse;
 use myco::generative_model::{Content, Message, ToolResult};
+use myco::session::ActiveSession;
+use myco::{AgentEvent, EventSink};
 
 use super::super::http::{
     Server, SessionRequest, events, live_events, session_action, session_cancel,
 };
+use super::queue::MAX_QUEUED_MESSAGES;
+use super::sessions::RunningSession;
 use super::*;
+use crate::{Args, Boot, Config, StartupPreflight};
 
 pub(super) fn app() -> (Arc<App>, mpsc::Receiver<Work>) {
     app_for("session", broadcast::channel(4).0)
+}
+
+/// `activity.js` and `app.js` match these labels literally.
+#[test]
+fn run_status_serializes_to_the_labels_the_browser_matches() {
+    for (status, label) in [
+        (Status::Ready, "Ready"),
+        (Status::Running, "Running"),
+        (Status::Compacting, "Compacting"),
+        (Status::Retrying, "Retrying"),
+        (Status::Cancelling, "Cancelling"),
+        (Status::Stopped, "Stopped"),
+    ] {
+        assert_eq!(json!(status), label);
+    }
+    let (app, _) = app();
+    assert_eq!(app.snapshot().change["snapshot"]["busy"], false);
+    app.live.lock().unwrap().snapshot.meta.cancel = Some(CancelToken::new());
+    assert_eq!(app.snapshot().change["snapshot"]["busy"], true);
+}
+
+#[test]
+fn snapshot_and_meta_updates_carry_the_keys_the_browser_reads() {
+    let meta_keys = [
+        "archived",
+        "attachment_limits",
+        "auto_continue",
+        "busy",
+        "context_window_tokens",
+        "down_hosts",
+        "inbox",
+        "model",
+        "queued",
+        "session_id",
+        "status",
+        "thread_id",
+        "timers",
+        "title",
+        "usage",
+    ];
+    let keys = |value: &Value| {
+        let mut keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    let (app, _) = app();
+    let mut snapshot_keys = [&meta_keys[..], &["blocks", "earlier_threads", "models"]].concat();
+    snapshot_keys.sort();
+    assert_eq!(keys(&app.snapshot().change["snapshot"]), snapshot_keys);
+    let mut events = app.events.subscribe();
+    app.publish_metadata(&mut app.live.lock().unwrap().snapshot);
+    assert_eq!(keys(&events.try_recv().unwrap().change["meta"]), meta_keys);
 }
 
 #[test]
@@ -141,29 +201,23 @@ fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc:
             generation_start: None,
             retry_notice: None,
             snapshot: Snapshot {
-                revision: 0,
-                session_id: id.into(),
-                thread_id: "thread".into(),
-                earlier_threads: vec![],
-                title: "Test".into(),
-                archived: false,
-                auto_continue: false,
-                model: "test".into(),
+                meta: Metadata {
+                    session_id: id.into(),
+                    thread_id: "thread".into(),
+                    facts: SessionFacts {
+                        title: "Test".into(),
+                        ..Default::default()
+                    },
+                    model: "test".into(),
+                    attachment_limits: attachments::Limits::new(
+                        myco::config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
+                    ),
+                    context_window_tokens: 100_000,
+                    ..Default::default()
+                },
                 models: vec!["test".into(), "second".into()],
-                attachment_limits: attachments::Limits::new(
-                    myco::config::DEFAULT_MAX_IMAGE_BASE64_BYTES,
-                ),
-                usage: None,
-                context_window_tokens: 100_000,
-                busy: false,
-                status: "Ready".into(),
-                queued: VecDeque::new(),
-                timers: vec![],
-                inbox: vec![],
-                down_hosts: vec![],
-                blocks: vec![],
+                ..Default::default()
             },
-            cancel: None,
             background: HashMap::new(),
             accepted: HashMap::new(),
             service: service::Receipts::default(),
@@ -267,7 +321,7 @@ fn queued_messages_run_in_order_once_and_preserve_acceptance_time() {
     let snapshot = app.snapshot().change;
     assert_eq!(snapshot["snapshot"]["queued"].as_array().unwrap().len(), 2);
     assert_eq!(snapshot["snapshot"]["queued"][0]["text"], "second");
-    let accepted_at = app.live.lock().unwrap().snapshot.queued[0].accepted_at;
+    let accepted_at = app.live.lock().unwrap().snapshot.meta.queued[0].accepted_at;
     app.start_next(&mut app.live.lock().unwrap()).unwrap();
     let next = work.try_recv().unwrap();
     assert_eq!(next.request, second);
@@ -304,7 +358,7 @@ fn cancellation_preserves_followups_and_queue_limits_leave_requests_retryable() 
     app.cancel("session").unwrap();
     assert!(current.cancel.is_cancelled());
     assert_eq!(
-        app.live.lock().unwrap().snapshot.queued.len(),
+        app.live.lock().unwrap().snapshot.meta.queued.len(),
         MAX_QUEUED_MESSAGES
     );
     assert!(matches!(
@@ -315,13 +369,13 @@ fn cancellation_preserves_followups_and_queue_limits_leave_requests_retryable() 
     let next = work.try_recv().unwrap();
     assert!(!next.cancel.is_cancelled());
     assert_eq!(
-        app.live.lock().unwrap().snapshot.queued.len(),
+        app.live.lock().unwrap().snapshot.meta.queued.len(),
         MAX_QUEUED_MESSAGES - 1
     );
     app.accept(overflow).unwrap();
     assert!(work.try_recv().is_err());
     assert_eq!(
-        app.live.lock().unwrap().snapshot.queued.len(),
+        app.live.lock().unwrap().snapshot.meta.queued.len(),
         MAX_QUEUED_MESSAGES
     );
 }
@@ -334,7 +388,7 @@ fn editing_holds_the_queue_and_saving_drains_the_latest_content_once() {
     let second = action_request();
     let third = action_request();
     app.accept(second.clone()).unwrap();
-    let time = app.live.lock().unwrap().snapshot.queued[0].accepted_at;
+    let time = app.live.lock().unwrap().snapshot.meta.queued[0].accepted_at;
     let edit = queue_update(&second, 0, json!({"kind":"edit"}));
     app.accept(edit.clone()).unwrap();
     app.accept(edit).unwrap();
@@ -513,7 +567,7 @@ fn title_changes_reach_live_metadata_and_invalidate_session_listings() {
             .set_title(Some("Renamed while running".into()))
             .unwrap()
     });
-    app.live.lock().unwrap().snapshot.busy = true;
+    app.live.lock().unwrap().snapshot.meta.cancel = Some(CancelToken::new());
     let mut updates = app.events.subscribe();
     app.refresh_metadata(&active);
     let update = updates.try_recv().unwrap();
@@ -533,7 +587,7 @@ fn auto_continue_changes_reach_live_clients_while_the_run_is_busy() {
     let (app, _) = app();
     let active = ActiveSession::new(Session::new_with_id("test", "session"));
     active.with_mut(|session| session.auto_continue = true);
-    app.live.lock().unwrap().snapshot.busy = true;
+    app.live.lock().unwrap().snapshot.meta.cancel = Some(CancelToken::new());
     let mut updates = app.events.subscribe();
     app.refresh_metadata(&active);
     let update = updates.try_recv().unwrap();
@@ -554,7 +608,7 @@ fn recorded_usage_reaches_live_and_reconnect_metadata_without_inventing_unknown_
     let mut session = Session::new_with_id("test", "session");
     session.title = Some("Test".into());
     let active = ActiveSession::new(session);
-    app.live.lock().unwrap().snapshot.busy = true;
+    app.live.lock().unwrap().snapshot.meta.cancel = Some(CancelToken::new());
     let mut updates = app.events.subscribe();
     for usage in [
         Some(TokenUsage {
@@ -658,7 +712,7 @@ fn background_controls_target_one_call_and_reject_stale_or_foreign_requests() {
     assert_eq!(blocks[0]["running"], true);
     assert_eq!(blocks[1]["status"], "backgrounded");
     assert!(app.background("session", second).is_err());
-    app.live.lock().unwrap().snapshot.status = "Cancelling".into();
+    app.live.lock().unwrap().snapshot.meta.status = Status::Cancelling;
     assert!(app.background("session", first).is_err());
     assert!(!first_signal.is_cancelled());
 }
@@ -890,7 +944,7 @@ async fn retries_keep_one_action_and_its_original_cancellation() {
     );
     app.cancel("session").unwrap();
     assert!(accepted.cancel.is_cancelled());
-    app.live.lock().unwrap().snapshot.busy = false;
+    app.live.lock().unwrap().snapshot.meta.cancel = None;
     app.accept(request.clone()).unwrap();
     assert!(
         work.try_recv().is_err(),
@@ -918,7 +972,7 @@ async fn model_selection_requires_an_idle_current_session() {
     request.action = Action::SelectModel {
         key: "second".into(),
     };
-    app.live.lock().unwrap().snapshot.busy = true;
+    app.live.lock().unwrap().snapshot.meta.cancel = Some(CancelToken::new());
     assert_eq!(
         app.accept(request.clone())
             .unwrap_err()
@@ -926,7 +980,7 @@ async fn model_selection_requires_an_idle_current_session() {
             .status(),
         StatusCode::CONFLICT
     );
-    app.live.lock().unwrap().snapshot.busy = false;
+    app.live.lock().unwrap().snapshot.meta.cancel = None;
     let mut stale = request.clone();
     stale.session_id = "another-session".into();
     assert_eq!(
@@ -973,7 +1027,7 @@ async fn an_unavailable_worker_does_not_accept_a_turn() {
         StatusCode::SERVICE_UNAVAILABLE
     );
     let live = app.live.lock().unwrap();
-    assert!(!live.snapshot.busy);
+    assert!(!live.snapshot.meta.busy());
     assert!(live.accepted.is_empty());
 }
 
@@ -1063,7 +1117,7 @@ async fn lagged_live_observers_drop_stale_deltas_and_request_one_resync() {
     let resync = event_data(&stream.next().await.unwrap().unwrap());
     assert_eq!(resync, json!({"kind":"resync"}));
 
-    app.status("Running");
+    app.status(Status::Running);
     let fresh = event_data(&stream.next().await.unwrap().unwrap());
     assert_eq!(fresh["revision"], app.snapshot().revision);
     assert_eq!(fresh["change"]["kind"], "meta");
@@ -1170,7 +1224,7 @@ fn compaction_reports_activity_and_separates_tool_first_continuation_without_a_m
     assert_eq!(blocks[2]["kind"], "assistant_heading");
     assert_eq!(blocks[2]["time"], blocks[1]["time"]);
     assert_eq!(blocks[3]["kind"], "tool");
-    app.live.lock().unwrap().snapshot.status = "Cancelling".into();
+    app.live.lock().unwrap().snapshot.meta.status = Status::Cancelling;
     app.finish_compaction();
     assert_eq!(app.snapshot().change["snapshot"]["status"], "Cancelling");
 }
@@ -1703,13 +1757,13 @@ async fn a_rebuilt_history_relays_only_its_changed_tail_on_the_same_thread() {
         let update = events.try_recv().unwrap();
         serde_json::to_string(&update.live_update()).unwrap()
     };
-    app.sync_with(&boot, "Ready", |_| {});
+    app.sync_with(&boot, Status::Ready, |_| {});
     relayed();
     let saved_blocks = app.live.lock().unwrap().snapshot.blocks.len();
     app.notice("shown only until the turn settles");
     relayed();
 
-    app.sync_with(&boot, "Ready", |_| {});
+    app.sync_with(&boot, Status::Ready, |_| {});
     let event = relayed();
     assert!(
         event.len() < 4096,
@@ -1724,13 +1778,13 @@ async fn a_rebuilt_history_relays_only_its_changed_tail_on_the_same_thread() {
 
     // A tail too large to relay, or another thread, is fetched instead.
     app.live.lock().unwrap().snapshot.blocks.clear();
-    app.sync_with(&boot, "Ready", |_| {});
+    app.sync_with(&boot, Status::Ready, |_| {});
     assert_eq!(
         serde_json::from_str::<Value>(&relayed()).unwrap()["change"],
         json!({"kind":"refresh"})
     );
-    app.live.lock().unwrap().snapshot.thread_id = "replaced".into();
-    app.sync_with(&boot, "Ready", |_| {});
+    app.live.lock().unwrap().snapshot.meta.thread_id = "replaced".into();
+    app.sync_with(&boot, Status::Ready, |_| {});
     assert_eq!(
         serde_json::from_str::<Value>(&relayed()).unwrap()["change"],
         json!({"kind":"refresh"})
@@ -1762,7 +1816,7 @@ async fn receipt_completion_and_next_admission_share_the_settlement_lock() {
             None
         );
 
-        app.sync_with(&boot, "Ready", |receipts| {
+        app.sync_with(&boot, Status::Ready, |receipts| {
             receipts.finish(input.request_id, &Ok(()), false);
             assert!(
                 matches!(

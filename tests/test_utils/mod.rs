@@ -1,9 +1,7 @@
 #![allow(dead_code, unused_imports)]
 use std::sync::Once;
 
-use myco::generative_model::{
-    AnthropicBackendConfig, BackendConfig, ModelSpec, OpenAIBackendConfig, Protocol, ThinkingMode,
-};
+use myco::generative_model::{BackendConfig, ModelSpec, Protocol, ThinkingMode};
 
 mod scripted_model;
 mod stub_http_server;
@@ -51,14 +49,14 @@ pub fn live_anthropic_haiku() -> (ModelSpec, BackendConfig) {
         max_truncated_resumes: 3,
         auto_compact_at_tokens: None,
     };
-    let backend = BackendConfig::Anthropic(AnthropicBackendConfig {
-        anthropic_base_url: std::env::var("ANTHROPIC_BASE_URL")
+    let backend = BackendConfig {
+        base_url: std::env::var("ANTHROPIC_BASE_URL")
             .unwrap_or_else(|_| "https://api.anthropic.com".into()),
-        anthropic_auth_token: std::env::var("ANTHROPIC_AUTH_TOKEN")
+        auth_token: std::env::var("ANTHROPIC_AUTH_TOKEN")
             .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
             .unwrap_or_default(),
         ..Default::default()
-    });
+    };
     (spec, backend)
 }
 
@@ -73,7 +71,7 @@ pub fn live_xai_grok() -> (ModelSpec, BackendConfig) {
         max_truncated_resumes: 3,
         auto_compact_at_tokens: None,
     };
-    let backend = BackendConfig::OpenAIResponses(OpenAIBackendConfig {
+    let backend = BackendConfig {
         base_url: std::env::var("XAI_API_BASE_URL")
             .or_else(|_| std::env::var("OPENAI_BASE_URL"))
             .unwrap_or_else(|_| "https://api.x.ai/v1".into()),
@@ -81,7 +79,7 @@ pub fn live_xai_grok() -> (ModelSpec, BackendConfig) {
             .or_else(|_| std::env::var("OPENAI_API_KEY"))
             .unwrap_or_default(),
         ..Default::default()
-    });
+    };
     (spec, backend)
 }
 
@@ -99,15 +97,11 @@ pub fn live_openrouter_kimi(protocol: Protocol) -> (ModelSpec, BackendConfig) {
         max_truncated_resumes: 3,
         auto_compact_at_tokens: None,
     };
-    let openai = OpenAIBackendConfig {
+    let backend = BackendConfig {
         base_url: std::env::var("OPENROUTER_BASE_URL")
             .unwrap_or_else(|_| "https://openrouter.ai/api/v1".into()),
         auth_token: std::env::var("OPENROUTER_API_KEY").unwrap_or_default(),
         ..Default::default()
-    };
-    let backend = match protocol {
-        Protocol::OpenAICompletions => BackendConfig::OpenAICompletions(openai),
-        _ => BackendConfig::OpenAIResponses(openai),
     };
     (spec, backend)
 }

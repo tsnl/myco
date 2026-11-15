@@ -30,10 +30,6 @@ pub struct SshAgentPreflightReport {
     pub agent_ok: bool,
     /// Human-readable agent status (fingerprint list or error).
     pub agent_status: String,
-    /// Identity files that were already present in the agent.
-    pub already_loaded: Vec<PathBuf>,
-    /// Identity files successfully added during this preflight.
-    pub added: Vec<PathBuf>,
     /// Identity files still missing after attempts (with reason).
     pub still_missing: Vec<(PathBuf, String)>,
     /// Non-fatal notes (e.g. no IdentityFile listed for a host, no TTY).
@@ -90,13 +86,14 @@ impl SshAgentPreflightReport {
 /// 4. For each still-missing key, run interactive `ssh-add` on `/dev/tty` when available.
 ///
 /// Never fatally errors for soft-fail hosts: returns a report the server can display.
-/// Returns `Err` only when the preflight machinery itself is unusable in a
-/// surprising way (rare); callers may still continue attach.
+///
+/// Every remote *is* an `~/.ssh/config` alias of the same name, spawned as
+/// `ssh <alias> …` by construction ([`super::HarnessConfig::from_ssh_aliases`]),
+/// so host names are the ssh destinations.
 pub fn ensure_remote_ssh_identities(hosts: &[HostConfig]) -> SshAgentPreflightReport {
     let mut report = SshAgentPreflightReport::default();
 
-    let ssh_targets = ssh_host_targets(hosts);
-    if ssh_targets.is_empty() {
+    if hosts.is_empty() {
         report
             .notes
             .push("no SSH-backed hosts in config; skipping agent preflight".into());
@@ -106,7 +103,7 @@ pub fn ensure_remote_ssh_identities(hosts: &[HostConfig]) -> SshAgentPreflightRe
 
     // Map identity path → hosts that need it (for messages).
     let mut identity_hosts: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
-    for host in &ssh_targets {
+    for host in hosts.iter().map(|h| &h.name) {
         match identity_files_for_alias(host) {
             Ok(paths) => {
                 if paths.is_empty() {
@@ -160,24 +157,30 @@ pub fn ensure_remote_ssh_identities(hosts: &[HostConfig]) -> SshAgentPreflightRe
         }
     };
 
-    // Classify identities.
-    let mut missing: Vec<PathBuf> = Vec::new();
-    for path in identity_hosts.keys() {
-        match identity_fingerprint(path) {
-            Ok(fp) if loaded.contains(&fp) => {
-                report.already_loaded.push(path.clone());
-            }
-            Ok(_) => missing.push(path.clone()),
-            Err(e) => {
-                // Cannot fingerprint (missing file, etc.) — still try ssh-add later.
-                report.notes.push(format!(
-                    "could not fingerprint {}: {e} (will still try ssh-add)",
-                    path.display()
-                ));
-                missing.push(path.clone());
-            }
-        }
-    }
+    // Fingerprint each identity once. One that cannot be fingerprinted
+    // (missing file, etc.) counts as missing, so ssh-add still gets a try.
+    let fingerprints: Vec<(PathBuf, Option<String>)> = identity_hosts
+        .keys()
+        .map(|path| {
+            let fingerprint = identity_fingerprint(path)
+                .map_err(|e| {
+                    report.notes.push(format!(
+                        "could not fingerprint {}: {e} (will still try ssh-add)",
+                        path.display()
+                    ))
+                })
+                .ok();
+            (path.clone(), fingerprint)
+        })
+        .collect();
+    let not_loaded = |loaded: &BTreeSet<String>| {
+        fingerprints
+            .iter()
+            .filter(|(_, fingerprint)| fingerprint.as_ref().is_none_or(|fp| !loaded.contains(fp)))
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>()
+    };
+    let mut missing = not_loaded(&loaded);
 
     if missing.is_empty() {
         return report;
@@ -201,17 +204,7 @@ pub fn ensure_remote_ssh_identities(hosts: &[HostConfig]) -> SshAgentPreflightRe
             report.agent_status = status;
             loaded = fps;
         }
-        missing.retain(|path| match identity_fingerprint(path) {
-            Ok(fp) => {
-                if loaded.contains(&fp) {
-                    report.already_loaded.push(path.clone());
-                    false
-                } else {
-                    true
-                }
-            }
-            Err(_) => true,
-        });
+        missing = not_loaded(&loaded);
     }
 
     if missing.is_empty() {
@@ -244,13 +237,8 @@ pub fn ensure_remote_ssh_identities(hosts: &[HostConfig]) -> SshAgentPreflightRe
             .map(join_hosts)
             .unwrap_or_else(|| "?".into());
         eprintln!("ssh-agent: unlocking {} (hosts: {hosts})", path.display());
-        match interactive_ssh_add(&path) {
-            Ok(()) => {
-                report.added.push(path.clone());
-            }
-            Err(e) => {
-                report.still_missing.push((path, e));
-            }
+        if let Err(e) = interactive_ssh_add(&path) {
+            report.still_missing.push((path, e));
         }
     }
 
@@ -266,13 +254,6 @@ pub fn ensure_remote_ssh_identities(hosts: &[HostConfig]) -> SshAgentPreflightRe
 // ---------------------------------------------------------------------------
 // Discovery
 // ---------------------------------------------------------------------------
-
-/// SSH destination per configured host: every remote *is* an `~/.ssh/config`
-/// alias of the same name, spawned as `ssh <alias> …` by construction
-/// ([`super::HarnessConfig::from_ssh_aliases`]), so this is just the name list.
-pub(crate) fn ssh_host_targets(hosts: &[HostConfig]) -> Vec<String> {
-    hosts.iter().map(|h| h.name.clone()).collect()
-}
 
 fn identity_files_for_alias(alias: &str) -> Result<Vec<PathBuf>, String> {
     let output = SSH
@@ -513,7 +494,6 @@ mod tests {
             had_ssh_hosts: true,
             agent_ok: true,
             agent_status: "2 key(s) in agent".into(),
-            already_loaded: vec![PathBuf::from("/home/u/.ssh/id_ed25519")],
             notes: vec!["host \"x\": ssh -G listed no IdentityFile".into()],
             ..Default::default()
         };

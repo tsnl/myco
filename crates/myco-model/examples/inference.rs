@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use futures::StreamExt;
 use myco_model::{
     BackendConfig, Content, ContentDelta, GenerativeModelConfig, Message, MessageAccumulator,
-    MessagePart, ModelSpec, OpenAIBackendConfig, Protocol, ThinkingMode,
+    MessagePart, ModelSpec, Protocol, ThinkingMode,
 };
 
 #[tokio::main(flavor = "current_thread")]
@@ -21,13 +21,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         tools: vec![],
         system_prompt: "Give a brief, helpful answer.".into(),
-        backend_config: BackendConfig::OpenAICompletions(OpenAIBackendConfig {
+        backend_config: BackendConfig {
             base_url: std::env::var("MYCO_EXAMPLE_BASE_URL")?,
             auth_token: std::env::var("MYCO_EXAMPLE_API_KEY").unwrap_or_default(),
-            effort: None,
-            max_output_tokens: Some(512),
+            max_output_tokens: 512,
             ..Default::default()
-        }),
+        },
     })?;
     let history = vec![Message::UserMessage {
         content: vec![Content::Text {

@@ -53,10 +53,15 @@ enum Phase {
         reason: TurnEndReason,
     },
     Cancelled,
-    Generating(OperationId),
+    /// `executing` once [`AgentState::begin_effect`] dispatched the operation.
+    Generating {
+        operation: OperationId,
+        executing: bool,
+    },
+    /// The batch's calls are those of the last history message.
     Tools {
         operation: OperationId,
-        count: usize,
+        executing: bool,
         next: Next,
     },
 }
@@ -82,7 +87,6 @@ pub struct AgentState {
     last_usage: Option<TokenUsage>,
     phase: Phase,
     sequence: u64,
-    executing: bool,
     run_usage: Option<TokenUsage>,
     truncations: u32,
     max_truncated_resumes: u32,
@@ -96,7 +100,6 @@ impl Default for AgentState {
             last_usage: None,
             phase: Phase::Ready,
             sequence: 0,
-            executing: false,
             run_usage: None,
             truncations: 0,
             max_truncated_resumes: crate::DEFAULT_MAX_TRUNCATED_RESUMES,
@@ -154,7 +157,7 @@ impl AgentState {
             Phase::Ready | Phase::GenerationFailed | Phase::Finished { .. } | Phase::Cancelled => {
                 None
             }
-            Phase::Generating(operation) => Some(PendingOperation::Generation { operation }),
+            Phase::Generating { operation, .. } => Some(PendingOperation::Generation { operation }),
             Phase::Tools { operation, .. } => Some(PendingOperation::Tools { operation }),
         }
     }
@@ -165,22 +168,33 @@ impl AgentState {
         !matches!(self.phase, Phase::Tools { .. })
     }
 
+    fn executing(&self) -> bool {
+        match self.phase {
+            Phase::Generating { executing, .. } | Phase::Tools { executing, .. } => executing,
+            _ => false,
+        }
+    }
+
+    /// The calls of the pending tool batch: in [`Phase::Tools`] the last
+    /// message is always the assistant turn that made them.
+    fn pending_calls(&self) -> &[ToolUse] {
+        let Some(Message::AssistantMessage { tool_uses, .. }) = self.history.last() else {
+            unreachable!("a tool batch follows its assistant message")
+        };
+        tool_uses
+    }
+
     /// The next effect, or terminal outcome, without advancing the controller.
     pub fn effect(&self) -> Option<Effect> {
         match &self.phase {
             Phase::Ready | Phase::GenerationFailed => None,
-            Phase::Generating(operation) => Some(Effect::Generate {
+            Phase::Generating { operation, .. } => Some(Effect::Generate {
                 operation: *operation,
             }),
-            Phase::Tools { operation, .. } => {
-                let Some(Message::AssistantMessage { tool_uses, .. }) = self.history.last() else {
-                    unreachable!()
-                };
-                Some(Effect::ExecuteTools {
-                    operation: *operation,
-                    calls: tool_uses.clone(),
-                })
-            }
+            Phase::Tools { operation, .. } => Some(Effect::ExecuteTools {
+                operation: *operation,
+                calls: self.pending_calls().to_vec(),
+            }),
             Phase::Finished { answer, reason } => Some(Effect::Finished {
                 answer: answer.clone(),
                 reason: reason.clone(),
@@ -191,19 +205,20 @@ impl AgentState {
 
     /// An interpreter must not dispatch a dropped future's operation again.
     pub fn begin_effect(&mut self, operation: OperationId) -> Result<(), StateError> {
-        if self.executing {
+        if self.executing() {
             return Err(StateError::Busy);
         }
-        match self.pending_operation() {
-            Some(
-                PendingOperation::Generation {
-                    operation: expected,
-                }
-                | PendingOperation::Tools {
-                    operation: expected,
-                },
-            ) if expected == operation => {
-                self.executing = true;
+        match &mut self.phase {
+            Phase::Generating {
+                operation: expected,
+                executing,
+            }
+            | Phase::Tools {
+                operation: expected,
+                executing,
+                ..
+            } if *expected == operation => {
+                *executing = true;
                 Ok(())
             }
             _ => Err(StateError::UnexpectedCompletion),
@@ -211,10 +226,11 @@ impl AgentState {
     }
 
     pub fn can_replace_at_boundary(&self) -> bool {
-        matches!(
-            self.phase,
-            Phase::Generating(_) | Phase::GenerationFailed | Phase::Finished { .. }
-        ) && !self.executing
+        match self.phase {
+            Phase::Generating { executing, .. } => !executing,
+            Phase::GenerationFailed | Phase::Finished { .. } => true,
+            _ => false,
+        }
     }
 
     pub fn cancel_at_boundary(&mut self) -> Result<(), StateError> {
@@ -245,20 +261,16 @@ impl AgentState {
     /// survive; an executing tool batch is reconciled as unknown, never replayed.
     /// Live intents that never began have known, unexecuted outcomes.
     pub fn recover_interrupted(&mut self) -> Result<(), StateError> {
-        if self.executing {
+        if self.executing() {
             let history = recover_checkpoint(self.history.clone(), self.pending_operation())?;
             self.replace_history(history, self.last_usage);
-        } else if let Phase::Tools {
-            operation, count, ..
-        } = self.phase
-        {
-            let results = (0..count).map(|_| ToolResult::err(
+        } else if let Phase::Tools { operation, .. } = self.phase {
+            let results = self.pending_calls().iter().map(|_| ToolResult::err(
                 "not executed: the run stopped before this tool batch began. Reconsider this action using the latest input before trying again.",
             )).collect();
             self.tools_completed(operation, results, true)?;
         }
         self.phase = Phase::Ready;
-        self.executing = false;
         Ok(())
     }
 
@@ -297,7 +309,7 @@ impl AgentState {
     /// Record runtime observations at a settled boundary without changing the
     /// run's result, usage, or truncation counters.
     pub fn append_system(&mut self, parts: Vec<Content>) -> Result<(), StateError> {
-        if self.executing || !self.is_model_boundary() {
+        if self.executing() || !self.is_model_boundary() {
             return Err(StateError::Busy);
         }
         if parts.is_empty()
@@ -310,7 +322,7 @@ impl AgentState {
             ));
         }
         self.push(Message::UserMessage { content: parts });
-        if matches!(self.phase, Phase::Generating(_)) {
+        if matches!(self.phase, Phase::Generating { .. }) {
             self.generate();
         }
         Ok(())
@@ -359,19 +371,20 @@ impl AgentState {
 
     fn generate(&mut self) -> Effect {
         let operation = self.operation();
-        self.phase = Phase::Generating(operation);
-        self.executing = false;
+        self.phase = Phase::Generating {
+            operation,
+            executing: false,
+        };
         Effect::Generate { operation }
     }
 
     /// Stop a failed or cancelled generation without adding a partial response.
     /// Context can be repaired at this boundary without resetting run counters.
     pub fn generation_failed(&mut self, operation: OperationId) -> Result<(), StateError> {
-        if !matches!(self.phase, Phase::Generating(id) if id == operation) {
+        if !matches!(self.phase, Phase::Generating { operation: id, .. } if id == operation) {
             return Err(StateError::UnexpectedCompletion);
         }
         self.phase = Phase::GenerationFailed;
-        self.executing = false;
         Ok(())
     }
 
@@ -380,7 +393,7 @@ impl AgentState {
         operation: OperationId,
         text: String,
     ) -> Result<(), StateError> {
-        if !matches!(self.phase, Phase::Generating(id) if id == operation) {
+        if !matches!(self.phase, Phase::Generating { operation: id, .. } if id == operation) {
             return Err(StateError::UnexpectedCompletion);
         }
         let notice = Content::System {
@@ -411,7 +424,7 @@ impl AgentState {
         operation: OperationId,
         output: GenerateOutput,
     ) -> Result<Effect, StateError> {
-        if !matches!(self.phase, Phase::Generating(id) if id == operation) {
+        if !matches!(self.phase, Phase::Generating { operation: id, .. } if id == operation) {
             return Err(StateError::UnexpectedCompletion);
         }
         if output
@@ -430,7 +443,6 @@ impl AgentState {
                 "turn ended in tool_use but streamed zero tool uses".into(),
             ));
         }
-        self.executing = false;
         if let Some(usage) = output.usage {
             self.context_size.observe_input(usage);
             self.run_usage = Some(TokenUsage {
@@ -485,7 +497,7 @@ impl AgentState {
             let operation = self.operation();
             self.phase = Phase::Tools {
                 operation,
-                count: calls.len(),
+                executing: false,
                 next,
             };
             Ok(Effect::ExecuteTools { operation, calls })
@@ -502,8 +514,8 @@ impl AgentState {
     ) -> Result<Effect, StateError> {
         let Phase::Tools {
             operation: expected,
-            count,
             next,
+            ..
         } = &self.phase
         else {
             return Err(StateError::UnexpectedCompletion);
@@ -511,14 +523,14 @@ impl AgentState {
         if operation != *expected {
             return Err(StateError::UnexpectedCompletion);
         }
-        if results.len() != *count {
+        let count = self.pending_calls().len();
+        if results.len() != count {
             return Err(StateError::InvalidContext(format!(
                 "expected {count} tool results, received {}",
                 results.len(),
             )));
         }
         let next = next.clone();
-        self.executing = false;
         self.push(Message::ToolResults {
             tool_use_results: results,
         });

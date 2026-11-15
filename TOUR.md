@@ -36,7 +36,7 @@ HTTP and server-sent events. Closing a tab does not stop its runner.
 
 ```mermaid
 flowchart TD
-    Server[HTTP session worker] --> Chat[chat::run_session_turn]
+    Server[HTTP session worker] --> Chat[chat::SessionRunner]
     Chat --> Input[chat::interact]
     Input --> Agent[Agent::run]
     Agent --> Generation[Generation attempts and retries]
@@ -82,7 +82,7 @@ once. Each opened session acquires its writer lock, constructs the event sink an
 harness with local session tools, then builds its model, runtime, and agent.
 
 `Boot` bundles those resources for the worker. In
-[src/bin/browser/runtime.rs](src/bin/browser/runtime.rs), `Sessions` owns workers
+[src/bin/browser/runtime/](src/bin/browser/runtime/mod.rs), `Sessions` owns workers
 and `App` publishes snapshots and changes. The worker retains its runner and
 live tools independently of browser connections.
 
@@ -258,17 +258,17 @@ across the agent, controller, worker, and actual process, read
 
 Return to `AgentEvent` and `EventSink` in
 [crates/myco-agent/src/lib.rs](crates/myco-agent/src/lib.rs), then open
-[src/bin/browser/runtime.rs](src/bin/browser/runtime.rs).
+[src/bin/browser/runtime/app.rs](src/bin/browser/runtime/app.rs).
 
 The runtime emits text/thinking deltas, tool starts, failures, and completion.
 `App` projects these into transcript blocks and publishes updates to clients.
-[src/bin/browser/view.rs](src/bin/browser/view.rs) reconstructs blocks from saved
+[src/bin/browser/view/](src/bin/browser/view/mod.rs) reconstructs blocks from saved
 history, preserving observed outcomes and hiding runtime-only context.
 
 [src/bin/browser/assets/app.js](src/bin/browser/assets/app.js) updates the page
 incrementally. Markdown rendering lives in
 [src/bin/browser/markdown.rs](src/bin/browser/markdown.rs). Authentication and
-HTTP endpoints live in [http.rs](src/bin/browser/http.rs); tabs share their event
+HTTP endpoints live in [http/](src/bin/browser/http/mod.rs); tabs share their event
 connection through a browser SharedWorker.
 
 ## 7. Follow state onto disk, through resume and compaction
@@ -288,7 +288,7 @@ intent and structured system parts; versions 2–4 have explicit upgrades on loa
 Reading alone does not rewrite an existing file.
 
 The chat adapter's `wire_checkpoint` binds a checkpoint to a particular thread.
-Stale callbacks cannot overwrite a successor. `run_session_turn` force-saves
+Stale callbacks cannot overwrite a successor. `SessionRunner` force-saves
 after a turn, including a failed or cancelled one; server shutdown
 also uses `persist_session`. The [session-turn tests](src/chat/session_turn.rs)
 verify recovery, queued turns selecting the successor, and cancellation before
@@ -299,7 +299,7 @@ compaction inside a process. [SessionWriteLock](src/session/lock.rs) prevents a
 second server process from writing the same session. Metadata edits use the shared
 document mutex and can continue while a compaction worker runs. Search and
 picking live in [src/session/search.rs](src/session/search.rs) and
-[src/bin/browser/runtime.rs](src/bin/browser/runtime.rs). The browser lists visible
+[src/bin/browser/runtime/sessions.rs](src/bin/browser/runtime/sessions.rs). The browser lists visible
 sessions; `session_meta` also searches saved excerpts and legacy console tails.
 
 Compaction crosses three boundaries while holding the session writer:

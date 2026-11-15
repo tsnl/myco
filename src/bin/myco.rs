@@ -1,16 +1,11 @@
 use std::{path::PathBuf, sync::Arc};
 
 use clap::{CommandFactory, Parser, ValueEnum};
-use myco::chat::{ModelCompactor, SessionRunner, WorkflowEvent, persist_session};
-use myco::generative_model::{
-    self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig,
-};
+use myco::chat::{AgentModel, ModelCompactor, SessionRunner, WorkflowEvent, persist_session};
+use myco::generative_model::{CatalogModel, Effort};
 use myco::host::HostWorker;
 use myco::session::{ActiveSession, Session, SessionLockError, SessionWriteLock};
-use myco::{
-    Agent, Config, ConfigUserSettings, EventSink, Harness, ListRecentService, PreludeTool,
-    SessionHistoryTool, SessionMetaTool, StartupPreflight, prompts,
-};
+use myco::{Agent, Config, ConfigUserSettings, EventSink, Harness, StartupPreflight};
 
 #[path = "browser/mod.rs"]
 mod browser;
@@ -211,13 +206,9 @@ fn configure_profile(profile: Option<&str>) -> Result<(), String> {
 /// hosts (ssh … myco --mode host). The agent-side local host is in-process and
 /// does not spawn this mode.
 async fn run_host(args: Args) {
-    if let Err(e) = HostWorker::standard(args.name, args.max_image_base64_bytes)
+    HostWorker::standard(args.name, args.max_image_base64_bytes)
         .serve_stdio()
-        .await
-    {
-        eprintln!("myco host error: {e}");
-        std::process::exit(1);
-    }
+        .await;
 }
 
 fn resolve_app_config_or_exit(args: &Args) -> (Config, CatalogModel) {
@@ -338,63 +329,37 @@ async fn boot_session<S: EventSink + 'static>(
     let session = ActiveSession::new(loaded);
     let sink = make_sink(&app_config, &preflight, &session)?;
     let mut root_tools = root_tools(&sink);
-
-    let session_tool =
-        Arc::new(SessionMetaTool::new(session.clone())) as Arc<dyn myco::ToolService>;
-    let history_tool = Arc::new(SessionHistoryTool::new()) as Arc<dyn myco::ToolService>;
-    let list_recent_tool = Arc::new(ListRecentService::new()) as Arc<dyn myco::ToolService>;
-    let prelude_tool =
-        Arc::new(PreludeTool::new(app_config.max_prelude_bytes)) as Arc<dyn myco::ToolService>;
-    root_tools.extend([session_tool, history_tool, list_recent_tool, prelude_tool]);
+    root_tools.extend(myco::session_runtime::session_root_tools(
+        &session,
+        app_config.max_prelude_bytes,
+    ));
     let harness = attach_harness(&app_config, &preflight, root_tools).await?;
 
-    let BuiltModel {
-        model,
-        prelude,
-        skills,
-    } = build_model(
+    let (selected, config) = AgentModel::new(
         &catalog_model,
         &harness,
-        args.debug_dump_api_requests,
         args.effort,
-    )?;
+        args.debug_dump_api_requests,
+        SYSTEM_PROMPT_PROLOGUE,
+        None,
+    );
+    let model = selected.build(config, |model| model)?;
     let runtime = myco::SessionRuntime::new(harness.clone(), session.clone());
-    runtime.set_max_image_base64_bytes(catalog_model.spec.max_image_base64_bytes);
-    runtime.set_prompt_skills(skills);
-    let mut agent = Agent::new(model.clone(), runtime.clone(), sink.clone());
-    agent
-        .set_before_generation_notice(Some(myco::session_runtime::prelude_change_notices(prelude)));
-    agent.set_retry_policy(catalog_model.backend.retry_policy());
-    agent.set_context_window_tokens(catalog_model.spec.context_window_tokens);
-    agent.set_max_truncated_resumes(catalog_model.spec.max_truncated_resumes);
+    let agent = Agent::new(model.clone(), runtime.clone(), sink.clone());
     let mut runner = SessionRunner::new(agent, runtime)
         .await
         .map_err(|error| format!("cannot bind session: {error}"))?;
     runner
-        .set_model(
+        .select_model(
             model,
-            myco::ModelInfo::from_spec(&catalog_model.spec, Some(args.effort)),
+            selected,
+            Arc::new(ModelCompactor {
+                model: catalog_model.clone(),
+                max_requests: app_config.compaction_max_requests,
+            }),
         )
         .await
         .map_err(|error| format!("cannot record runtime: {error}"))?;
-    // A fork may be opened again before its first submission. Derive its need
-    // for a child identity stamp from persisted context, not launch flags.
-    let saved = session.snapshot();
-    runner.set_forked(
-        saved.parent_session_id.is_some()
-            && !runner.agent().history().iter().any(|message| {
-                matches!(message, myco::generative_model::Message::UserMessage { content }
-            if content.iter().any(|part| matches!(part, Content::System { kind, data, .. }
-                if kind == "session" && data["session_id"].as_str() == Some(saved.id.as_str()))))
-            }),
-    );
-    runner.set_compactor(
-        Arc::new(ModelCompactor {
-            model: catalog_model.clone(),
-            max_requests: app_config.compaction_max_requests,
-        }),
-        catalog_model.spec.auto_compact_at_tokens,
-    );
     runner.set_observer(Arc::new(|event| match event {
         WorkflowEvent::Warning(message) => session_warning(&message),
         WorkflowEvent::Retrying { error, delay } => session_warning(&format!(
@@ -418,65 +383,6 @@ async fn boot_session<S: EventSink + 'static>(
     ))
 }
 
-/// A model and the prompt snapshots its live change notices start from.
-struct BuiltModel {
-    model: Arc<dyn generative_model::GenerativeModel>,
-    prelude: Vec<myco::prelude::PreludeEntry>,
-    skills: myco::skills::Reported,
-}
-
-fn build_model(
-    catalog_model: &CatalogModel,
-    harness: &Harness,
-    debug_dump_api_requests: bool,
-    effort: Effort,
-) -> Result<BuiltModel, String> {
-    let mut backend_config = catalog_model.backend.clone();
-    match &mut backend_config {
-        BackendConfig::Anthropic(c) => {
-            if debug_dump_api_requests {
-                c.debug_dump_api_requests = true;
-            }
-            // Always enable thinking; effort controls how hard the model thinks.
-            c.effort = Some(effort);
-        }
-        BackendConfig::OpenAIResponses(c) | BackendConfig::OpenAICompletions(c) => {
-            if debug_dump_api_requests {
-                c.debug_dump_api_requests = true;
-            }
-            c.effort = Some(effort);
-        }
-    }
-
-    let (epilogue, prelude, skills) = prompts::agent_prompt_epilogue();
-    let model = generative_model::new(GenerativeModelConfig {
-        model: catalog_model.spec.clone(),
-        tools: harness.tool_specs_with_image_limit(catalog_model.spec.max_image_base64_bytes),
-        system_prompt: [
-            SYSTEM_PROMPT_PROLOGUE.to_string(),
-            epilogue,
-            prompts::model_stamp(&catalog_model.spec.key),
-            prompts::auto_compact_notice(
-                catalog_model.spec.auto_compact_at_tokens,
-                catalog_model.spec.context_window_tokens,
-            ),
-        ]
-        .join("\n"),
-        backend_config,
-    })
-    .map_err(|error| format!("could not create model: {error}"))?;
-    let model = myco::core::image_store::with_images(
-        model,
-        myco::core::image_store::ImageStore::for_profile()?,
-        catalog_model.spec.max_image_base64_bytes,
-    );
-    Ok(BuiltModel {
-        model,
-        prelude,
-        skills,
-    })
-}
-
 async fn select_runner_model(
     runner: &mut SessionRunner,
     harness: &Harness,
@@ -485,42 +391,26 @@ async fn select_runner_model(
     debug_dump_api_requests: bool,
     compaction_max_requests: usize,
 ) -> Result<(), String> {
-    let BuiltModel {
-        model,
-        prelude,
-        skills,
-    } = build_model(catalog, harness, debug_dump_api_requests, effort)?;
+    let (selected, config) = AgentModel::new(
+        catalog,
+        harness,
+        effort,
+        debug_dump_api_requests,
+        SYSTEM_PROMPT_PROLOGUE,
+        None,
+    );
+    let model = selected.build(config, |model| model)?;
     runner
-        .set_model(
+        .select_model(
             model,
-            myco::ModelInfo::from_spec(&catalog.spec, Some(effort)),
+            selected,
+            Arc::new(ModelCompactor {
+                model: catalog.clone(),
+                max_requests: compaction_max_requests,
+            }),
         )
         .await
-        .map_err(|error| error.to_string())?;
-    runner
-        .agent_mut()
-        .set_before_generation_notice(Some(myco::session_runtime::prelude_change_notices(prelude)));
-    runner
-        .agent_mut()
-        .set_retry_policy(catalog.backend.retry_policy());
-    runner
-        .agent_mut()
-        .set_context_window_tokens(catalog.spec.context_window_tokens);
-    runner
-        .agent_mut()
-        .set_max_truncated_resumes(catalog.spec.max_truncated_resumes);
-    runner.set_compactor(
-        Arc::new(ModelCompactor {
-            model: catalog.clone(),
-            max_requests: compaction_max_requests,
-        }),
-        catalog.spec.auto_compact_at_tokens,
-    );
-    runner
-        .runtime()
-        .set_max_image_base64_bytes(catalog.spec.max_image_base64_bytes);
-    runner.runtime().set_prompt_skills(skills);
-    Ok(())
+        .map_err(|error| error.to_string())
 }
 
 fn print_launcher_help(topic: &str) {

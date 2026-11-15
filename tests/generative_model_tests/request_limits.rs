@@ -1,9 +1,8 @@
 //! All protocols apply the cap to the actual JSON body before opening a connection.
 
 use myco::generative_model::{
-    self, AnthropicBackendConfig, BackendConfig, Content, GenerateError, GenerateOutput,
-    GenerativeModelConfig, Message, ModelSpec, OpenAIBackendConfig, Protocol, Recovery,
-    ThinkingMode, ToolSpec,
+    self, BackendConfig, Content, GenerateError, GenerateOutput, GenerativeModelConfig, Message,
+    ModelSpec, Protocol, Recovery, ThinkingMode, ToolSpec,
 };
 use serde_json::json;
 
@@ -14,19 +13,10 @@ fn model(
     protocol: Protocol,
     limit: usize,
 ) -> std::sync::Arc<dyn generative_model::GenerativeModel> {
-    let openai = OpenAIBackendConfig {
+    let backend_config = BackendConfig {
         base_url: server.base_url(),
         max_request_bytes: limit,
         ..Default::default()
-    };
-    let backend_config = match protocol {
-        Protocol::AnthropicMessages => BackendConfig::Anthropic(AnthropicBackendConfig {
-            anthropic_base_url: server.base_url(),
-            max_request_bytes: limit,
-            ..Default::default()
-        }),
-        Protocol::OpenAIResponses => BackendConfig::OpenAIResponses(openai),
-        Protocol::OpenAICompletions => BackendConfig::OpenAICompletions(openai),
     };
     generative_model::new(GenerativeModelConfig {
         model: ModelSpec {

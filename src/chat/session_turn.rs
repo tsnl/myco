@@ -10,43 +10,15 @@ use crate::agent::{Agent, AgentInteractionError, RunOutcome};
 use crate::core::CancelToken;
 use crate::generative_model::{Content, Message, Recovery};
 use crate::prompts;
-use crate::session::{ActiveSession, SessionWriter};
+use crate::session::{ActiveSession, Session, SessionWriter, Thread};
 
 pub struct SessionTurnOutcome {
     pub result: Result<RunOutcome, AgentInteractionError>,
     pub rewound: Option<Vec<Content>>,
 }
 
-/// Submit already-expanded input. Automatic retries retain the live interpreter
-/// and wait for persistence before advancing effects.
-/// The caller keeps ownership of the agent, session lock, and cancellation source.
-pub async fn run_session_turn(
-    agent: &mut Agent,
-    runtime: &Arc<SessionRuntime>,
-    input: Vec<Content>,
-    forked: bool,
-    cancel: CancelToken,
-    accepted_at: DateTime<Utc>,
-    on_warning: impl Fn(&str) + Send + Sync + 'static,
-) -> SessionTurnOutcome {
-    run_turn(
-        agent,
-        runtime,
-        Submission {
-            input,
-            forked,
-            accepted_at: Some(accepted_at),
-        },
-        &mut Workflow::default(),
-        cancel,
-        on_warning,
-    )
-    .await
-}
-
 pub(super) struct Submission {
     pub input: Vec<Content>,
-    pub forked: bool,
     pub accepted_at: Option<DateTime<Utc>>,
 }
 
@@ -60,7 +32,6 @@ pub(super) async fn run_turn(
 ) -> SessionTurnOutcome {
     let Submission {
         mut input,
-        forked,
         accepted_at,
     } = submission;
     let session = runtime.session();
@@ -99,8 +70,16 @@ pub(super) async fn run_turn(
         if let Err(error) = auto_title(session, &input) {
             on_warning(&format!("could not auto-title session: {error}"));
         }
-        if needs_session_stamp(agent.history(), forked) {
-            stamp_input(session, &mut input);
+        if let Some(stamp) = session.with(|session| {
+            needs_session_stamp(agent.history(), session).then(|| {
+                prompts::thread_stamp_part(
+                    &session.id,
+                    &session.active_thread().id,
+                    session.created_at,
+                )
+            })
+        }) {
+            input.insert(0, stamp);
         }
     }
     if let Some(notice) = workflow.runtime_notice(agent, runtime).await {
@@ -133,8 +112,8 @@ pub(super) async fn run_turn(
 pub(super) fn settle_stopped_run(agent: &mut Agent) -> Result<(), AgentInteractionError> {
     if !agent.state().is_idle() {
         agent.recover_interrupted()?;
-    } else if agent.checkpoint_failed() {
-        agent.checkpoint()?;
+    } else {
+        agent.repair_checkpoint()?;
     }
     Ok(())
 }
@@ -185,25 +164,6 @@ fn auto_title(session: &ActiveSession, input: &[Content]) -> Result<(), String> 
     Ok(())
 }
 
-fn stamp_input(session: &ActiveSession, input: &mut Vec<Content>) {
-    let text = session.with(|session| {
-        prompts::thread_stamp(&session.id, &session.active_thread().id, session.created_at)
-    });
-    input.insert(
-        0,
-        Content::System {
-            kind: "session".into(),
-            text,
-            data: session.with(|session| {
-                serde_json::json!({
-                    "session_id":session.id, "thread_id":session.active_thread().id,
-                    "created_at":session.created_at,
-                })
-            }),
-        },
-    );
-}
-
 fn rewind_rejected_input(
     agent: &mut Agent,
     runtime: &Arc<SessionRuntime>,
@@ -224,12 +184,17 @@ fn rewind_rejected_input(
         .filter(|part| !matches!(part, Content::System { .. }))
         .cloned()
         .collect();
-    let original = runtime.session().snapshot();
-    let mut successor = original.active_thread().clone();
-    successor.id = uuid::Uuid::new_v4().as_simple().to_string();
-    successor.created_at = chrono::Utc::now();
-    successor.predecessor_id = Some(original.active_thread().id.clone());
+    let (session_id, created_at, predecessor) = runtime.session().with(|session| {
+        let thread = session.active_thread().clone();
+        (session.id.clone(), session.created_at, thread)
+    });
+    if predecessor.pending_operation.is_some() {
+        return Err("cannot install a successor with an outstanding operation".into());
+    }
+    let mut successor = Thread::successor_of(&predecessor);
     successor.messages = agent.history()[..index].to_vec();
+    successor.user_turn_timestamps = predecessor.user_turn_timestamps;
+    successor.user_turn_timestamps.retain(|&key, _| key < index);
     if let Some(part) = crate::core::latest_runtime_part(agent.history())
         && crate::core::latest_runtime_part(&successor.messages) != Some(part)
     {
@@ -243,23 +208,14 @@ fn rewind_rejected_input(
     {
         successor.messages.push(Message::UserMessage { content: vec![Content::System {
             kind: "recovery".into(),
-            text: format!("The latest submission was removed from model context after a size rejection. Tools had already returned results in predecessor thread {} of session {}. Their external effects were not undone. Inspect those observations with session_history before repeating actions.", original.active_thread().id, original.id),
-            data: serde_json::json!({"reason":"rejected_input", "predecessor_id":original.active_thread().id, "from_index":index}),
+            text: format!("The latest submission was removed from model context after a size rejection. Tools had already returned results in predecessor thread {} of session {session_id}. Their external effects were not undone. Inspect those observations with session_history before repeating actions.", predecessor.id),
+            data: serde_json::json!({"reason":"rejected_input", "predecessor_id":predecessor.id, "from_index":index}),
         }] });
     }
-    successor.user_turn_timestamps.retain(|&key, _| key < index);
-    successor.last_usage = None;
-    successor.context_tokens_estimate = None;
     if let Some(Message::UserMessage { content }) = successor.messages.first_mut() {
         for part in content {
-            if let Content::System { kind, text, data } = part
-                && kind == "session"
-            {
-                *text = prompts::thread_stamp(&original.id, &successor.id, original.created_at);
-                *data = serde_json::json!({
-                    "session_id": original.id, "thread_id": successor.id,
-                    "created_at": original.created_at,
-                });
+            if matches!(part, Content::System { kind, .. } if kind == "session") {
+                *part = prompts::thread_stamp_part(&session_id, &successor.id, created_at);
             }
         }
     }
@@ -300,7 +256,7 @@ fn wire_checkpoint_at(
 /// A session that never accepted input does not create a file.
 pub fn persist_session(agent: &Agent, session: &ActiveSession, force: bool) -> Result<(), String> {
     let history = agent.history();
-    if history.is_empty() && !session.snapshot().json_path().exists() {
+    if history.is_empty() && !session.with(|session| session.json_path().exists()) {
         return Ok(());
     }
     agent.checkpoint().map_err(|error| error.to_string())?;
@@ -308,13 +264,16 @@ pub fn persist_session(agent: &Agent, session: &ActiveSession, force: bool) -> R
         .context()
         .thread_id
         .clone()
-        .unwrap_or_else(|| session.snapshot().active_thread().id.clone());
+        .unwrap_or_else(|| session.with(|session| session.active_thread().id.clone()));
     session.persist_agent_state(&thread_id, agent.state(), force, None)
 }
 
-// Forks inherit a parent's stamp and need their own; resumes keep the existing one.
-fn needs_session_stamp(history: &[Message], forked: bool) -> bool {
-    !history.iter().any(Message::is_user_turn) || forked
+/// A session stamps its first user turn. A child that has not stamped its own
+/// identity yet (a fork inherits its parent's stamp) stamps the next one.
+/// Resumes keep the existing stamp, including one upgraded from a legacy file.
+fn needs_session_stamp(history: &[Message], session: &Session) -> bool {
+    !history.iter().any(Message::is_user_turn)
+        || session.parent_session_id.is_some() && !prompts::has_session_stamp(history, &session.id)
 }
 
 #[cfg(test)]
@@ -323,6 +282,7 @@ mod tests {
 
     use super::*;
     use crate::agent::NullEventSink;
+    use crate::chat::{SessionRunner, WorkflowEvent};
     use crate::generative_model::{GenerateError, GenerateOutput, TurnEndReason};
     use crate::harness::Harness;
     use crate::session::Session;
@@ -336,26 +296,42 @@ mod tests {
         )
     }
 
-    fn submit(
-        agent: &mut Agent,
+    fn runner(
+        executor: &tokio::runtime::Runtime,
+        model: Arc<ScriptedModel>,
         session: &ActiveSession,
+    ) -> SessionRunner {
+        let runtime = SessionRuntime::new(Harness::local_with_services(vec![]), session.clone());
+        let mut runner = executor
+            .block_on(SessionRunner::new(agent(model), runtime))
+            .unwrap();
+        runner.set_observer(Arc::new(|event| {
+            if let WorkflowEvent::Warning(warning) = event {
+                panic!("{warning}");
+            }
+        }));
+        runner
+    }
+
+    fn submit_text(
+        executor: &tokio::runtime::Runtime,
+        runner: &mut SessionRunner,
+        text: &str,
         cancel: CancelToken,
     ) -> SessionTurnOutcome {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(run_session_turn(
-                agent,
-                &SessionRuntime::new(Harness::local_with_services(vec![]), session.clone()),
-                vec![Content::Text {
-                    text: "task".into(),
-                }],
-                false,
-                cancel,
-                chrono::Utc::now(),
-                |warning| panic!("{warning}"),
-            ))
+        executor.block_on(runner.submit(
+            vec![Content::Text { text: text.into() }],
+            Utc::now(),
+            cancel,
+        ))
+    }
+
+    fn submit(
+        executor: &tokio::runtime::Runtime,
+        runner: &mut SessionRunner,
+        cancel: CancelToken,
+    ) -> SessionTurnOutcome {
+        submit_text(executor, runner, "task", cancel)
     }
 
     fn saved_messages(session: &ActiveSession) -> serde_json::Value {
@@ -367,27 +343,22 @@ mod tests {
     fn failed_input_save_stops_generation_and_preserves_input_for_the_live_runtime() {
         let home = temp_home("input-save-failure");
         let session = ActiveSession::new(Session::new("test"));
-        let runtime = SessionRuntime::new(Harness::local_with_services(vec![]), session.clone());
         let model = ScriptedModel::new(vec![GenerateOutput {
             content: vec![],
             tool_uses: vec![],
             turn_end_reason: TurnEndReason::EndTurn,
             usage: None,
         }]);
-        let mut agent = agent(model.clone());
-        std::fs::write(home.path().join("session"), "blocks writes").unwrap();
         let executor = tokio::runtime::Runtime::new().unwrap();
-        let outcome = executor.block_on(run_session_turn(
-            &mut agent,
-            &runtime,
-            vec![Content::Text {
-                text: "first accepted input".into(),
-            }],
-            false,
+        let mut runner = runner(&executor, model.clone(), &session);
+        runner.set_observer(Arc::new(|_| {}));
+        std::fs::write(home.path().join("session"), "blocks writes").unwrap();
+        let outcome = submit_text(
+            &executor,
+            &mut runner,
+            "first accepted input",
             CancelToken::new(),
-            Utc::now(),
-            |_| {},
-        ));
+        );
         assert!(matches!(
             outcome.result,
             Err(AgentInteractionError::Checkpoint(_))
@@ -396,20 +367,14 @@ mod tests {
         assert!(session.snapshot().active_thread().messages.is_empty());
         assert!(session.snapshot().title.is_none());
         std::fs::remove_file(home.path().join("session")).unwrap();
-        executor
-            .block_on(run_session_turn(
-                &mut agent,
-                &runtime,
-                vec![Content::Text {
-                    text: "continue after storage repair".into(),
-                }],
-                false,
-                CancelToken::new(),
-                Utc::now(),
-                |warning| panic!("{warning}"),
-            ))
-            .result
-            .unwrap();
+        submit_text(
+            &executor,
+            &mut runner,
+            "continue after storage repair",
+            CancelToken::new(),
+        )
+        .result
+        .unwrap();
         let saved = Session::load(&session.snapshot().json_path()).unwrap();
         let messages = &saved.active_thread().messages;
         assert_eq!(messages.len(), 3);
@@ -425,11 +390,14 @@ mod tests {
     fn user_turn_acceptance_times_survive_restart_and_context_forks() {
         let _home = temp_home("turn-timestamps");
         let session = ActiveSession::new(Session::new("test"));
-        let mut agent = agent(
+        let executor = tokio::runtime::Runtime::new().unwrap();
+        let mut runner = runner(
+            &executor,
             ScriptedModel::new(vec![]).then_fail(GenerateError::ExecutionError("offline".into())),
+            &session,
         );
         let before = Utc::now();
-        submit(&mut agent, &session, CancelToken::new());
+        submit(&executor, &mut runner, CancelToken::new());
         let after = Utc::now();
         let saved = Session::load(&session.snapshot().json_path()).unwrap();
         let time = saved.active_thread().user_turn_timestamps[&0];
@@ -459,16 +427,16 @@ mod tests {
             .user_turn_timestamps
             .insert(0, earlier_time);
         let expected = serde_json::to_value(&document.active_thread().messages).unwrap();
-        let mut agent = agent(
+        let session = ActiveSession::new(document);
+        let executor = tokio::runtime::Runtime::new().unwrap();
+        let mut runner = runner(
+            &executor,
             ScriptedModel::new(vec![])
                 .then_fail(GenerateError::RequestTooLargeError("oversized".into())),
+            &session,
         );
-        agent
-            .replace_context(document.active_thread().messages.clone(), None)
-            .unwrap();
-        let session = ActiveSession::new(document);
-        wire_checkpoint(&mut agent, &session);
-        let outcome = submit(&mut agent, &session, CancelToken::new());
+        let outcome = submit(&executor, &mut runner, CancelToken::new());
+        let agent = runner.agent();
         assert!(outcome.result.is_err());
         assert!(
             matches!(outcome.rewound.as_deref(), Some([Content::Text { text }]) if text == "task")
@@ -514,9 +482,10 @@ mod tests {
             usage: None,
         }]).then_fail(GenerateError::RequestTooLargeError("image dimensions".into()));
         let session = ActiveSession::new(Session::new("test"));
-        let mut agent = agent(model);
+        let executor = tokio::runtime::Runtime::new().unwrap();
+        let mut runner = runner(&executor, model, &session);
         assert!(
-            submit(&mut agent, &session, CancelToken::new())
+            submit(&executor, &mut runner, CancelToken::new())
                 .rewound
                 .is_some()
         );
@@ -541,7 +510,7 @@ mod tests {
         assert_eq!(saved.threads()[0].user_turn_timestamps.len(), 1);
         let original = serde_json::to_value(&saved.threads()[0]).unwrap();
         assert!(
-            submit(&mut agent, &session, CancelToken::new())
+            submit(&executor, &mut runner, CancelToken::new())
                 .rewound
                 .is_some()
         );
@@ -577,10 +546,11 @@ mod tests {
     fn cancellation_keeps_the_stamped_input_and_title_on_disk() {
         let _home = temp_home("chat-cancel");
         let session = ActiveSession::new(Session::new("test"));
-        let mut agent = agent(ScriptedModel::new(vec![]));
+        let executor = tokio::runtime::Runtime::new().unwrap();
+        let mut runner = runner(&executor, ScriptedModel::new(vec![]), &session);
         let cancel = CancelToken::new();
         cancel.cancel();
-        let outcome = submit(&mut agent, &session, cancel);
+        let outcome = submit(&executor, &mut runner, cancel);
         assert!(matches!(
             outcome.result,
             Err(AgentInteractionError::Cancelled)
@@ -594,7 +564,7 @@ mod tests {
         );
         assert_eq!(
             saved_messages(&session),
-            serde_json::to_value(agent.history()).unwrap()
+            serde_json::to_value(runner.agent().history()).unwrap()
         );
     }
 
@@ -602,7 +572,9 @@ mod tests {
     fn successful_and_failed_turns_both_persist_the_current_history() {
         let _home = temp_home("chat-completion");
         let session = ActiveSession::new(Session::new("test"));
-        let mut agent = agent(
+        let executor = tokio::runtime::Runtime::new().unwrap();
+        let mut runner = runner(
+            &executor,
             ScriptedModel::new(vec![GenerateOutput {
                 content: vec![Content::Text {
                     text: "answer".into(),
@@ -612,46 +584,38 @@ mod tests {
                 usage: None,
             }])
             .then_fail(GenerateError::ExecutionError("unavailable".into())),
+            &session,
         );
         for succeeds in [true, false] {
-            let outcome = submit(&mut agent, &session, CancelToken::new());
+            let outcome = submit(&executor, &mut runner, CancelToken::new());
             assert_eq!(outcome.result.is_ok(), succeeds);
             assert!(outcome.rewound.is_none());
             assert_eq!(
                 saved_messages(&session),
-                serde_json::to_value(agent.history()).unwrap()
+                serde_json::to_value(runner.agent().history()).unwrap()
             );
         }
-        assert_eq!(agent.history().len(), 3);
+        assert_eq!(runner.agent().history().len(), 3);
     }
 
     #[test]
     fn queued_turn_uses_the_successor_thread_after_compaction_finishes() {
         let _home = temp_home("thread-queued-turn");
         let executor = tokio::runtime::Runtime::new().unwrap();
+        let mut document = Session::new("m");
+        document.replace_context(vec![user("earlier"), assistant("answer")], None);
+        let session = ActiveSession::new(document);
+        let model = ScriptedModel::new(vec![GenerateOutput {
+            content: vec![],
+            tool_uses: vec![],
+            turn_end_reason: TurnEndReason::EndTurn,
+            usage: None,
+        }]);
+        let mut runner = runner(&executor, model, &session);
         executor.block_on(async {
-            let mut document = Session::new("m");
-            document.replace_context(vec![user("earlier"), assistant("answer")], None);
-            let session = ActiveSession::new(document);
             let writer = session.writer().await;
-            let mut agent = agent(ScriptedModel::new(vec![GenerateOutput {
-                content: vec![],
-                tool_uses: vec![],
-                turn_end_reason: TurnEndReason::EndTurn,
-                usage: None,
-            }]));
             {
-                let runtime =
-                    SessionRuntime::new(Harness::local_with_services(vec![]), session.clone());
-                let run = run_session_turn(
-                    &mut agent,
-                    &runtime,
-                    vec![],
-                    false,
-                    CancelToken::new(),
-                    chrono::Utc::now(),
-                    |warning| panic!("{warning}"),
-                );
+                let run = runner.submit(vec![], Utc::now(), CancelToken::new());
                 let mut run = std::pin::pin!(run);
                 assert!(futures::poll!(&mut run).is_pending());
                 let (next, _) =
@@ -663,11 +627,11 @@ mod tests {
             let saved = session.snapshot();
             assert_eq!(saved.threads().len(), 2);
             assert_eq!(
-                agent.context().thread_id.as_deref(),
+                runner.agent().context().thread_id.as_deref(),
                 Some(saved.active_thread().id.as_str())
             );
             assert!(
-                matches!(&agent.history()[0], Message::UserMessage { content }
+                matches!(&runner.agent().history()[0], Message::UserMessage { content }
                 if matches!(&content[1], Content::System { text, .. } if text.contains("compacted goal")))
             );
         });
@@ -677,22 +641,13 @@ mod tests {
     fn cancellation_while_waiting_for_the_writer_does_not_submit_input() {
         let _home = temp_home("thread-queued-cancel");
         let executor = tokio::runtime::Runtime::new().unwrap();
+        let session = ActiveSession::new(Session::new("m"));
+        let mut runner = runner(&executor, ScriptedModel::new(vec![]), &session);
         executor.block_on(async {
-            let session = ActiveSession::new(Session::new("m"));
             let _writer = session.writer().await;
-            let mut agent = agent(ScriptedModel::new(vec![]));
             let cancel = CancelToken::new();
             cancel.cancel();
-            let outcome = run_session_turn(
-                &mut agent,
-                &SessionRuntime::new(Harness::local_with_services(vec![]), session.clone()),
-                vec![],
-                false,
-                cancel,
-                chrono::Utc::now(),
-                |warning| panic!("{warning}"),
-            )
-            .await;
+            let outcome = runner.submit(vec![], Utc::now(), cancel).await;
             assert!(matches!(
                 outcome.result,
                 Err(AgentInteractionError::Cancelled)
@@ -704,16 +659,43 @@ mod tests {
 
     /// A session stamps its id on the first message of its own conversation:
     /// once on a fresh session, again on the first message a context fork adds
-    /// (the inherited one names the parent), never on a resumed turn.
+    /// (the inherited one names the parent), never on a resumed turn. A legacy
+    /// stamp names no session, so only a child restamps after one.
     #[test]
     fn session_stamp_covers_fresh_and_forked_runs_only() {
-        let seeded = [Message::UserMessage {
-            content: vec![Content::Text {
-                text: "inherited".into(),
-            }],
-        }];
-        assert!(needs_session_stamp(&[], /*forked*/ false));
-        assert!(needs_session_stamp(&seeded, /*forked*/ true));
-        assert!(!needs_session_stamp(&seeded, /*forked*/ false));
+        let parent = Session::new("test");
+        let stamped = |stamp: Content| {
+            vec![Message::UserMessage {
+                content: vec![
+                    stamp,
+                    Content::Text {
+                        text: "task".into(),
+                    },
+                ],
+            }]
+        };
+        let own = |session: &Session| {
+            stamped(prompts::thread_stamp_part(
+                &session.id,
+                &session.active_thread().id,
+                session.created_at,
+            ))
+        };
+        let legacy = stamped(Content::System {
+            kind: "session".into(),
+            text: "# Session".into(),
+            data: serde_json::json!({"legacy": true}),
+        });
+        let child = parent.fork_child("test");
+
+        assert!(needs_session_stamp(&[], &parent));
+        assert!(needs_session_stamp(&[], &child));
+        assert!(!needs_session_stamp(&own(&parent), &parent));
+        assert!(!needs_session_stamp(&legacy, &parent));
+        assert!(needs_session_stamp(&own(&parent), &child));
+        assert!(needs_session_stamp(&legacy, &child));
+        let mut forked = own(&parent);
+        forked.extend(own(&child));
+        assert!(!needs_session_stamp(&forked, &child));
     }
 }

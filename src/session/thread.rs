@@ -43,6 +43,15 @@ impl Thread {
             pending_operation: None,
         }
     }
+
+    /// An empty thread continuing `predecessor`. Nothing carries over
+    /// implicitly: measured usage and pending intent describe the predecessor.
+    pub(crate) fn successor_of(predecessor: &Thread) -> Self {
+        Self {
+            predecessor_id: Some(predecessor.id.clone()),
+            ..Self::new()
+        }
+    }
 }
 
 pub(super) fn deserialize_threads<'de, D: Deserializer<'de>>(

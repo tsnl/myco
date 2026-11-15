@@ -59,8 +59,6 @@ while `history()` retains the intervening tool rounds.
 When embedding a configured driver, propagate settings into the agent:
 
 - `set_retry_policy(backend.retry_policy())` for the gateway's retry policy.
-- `set_context_window_tokens(spec.context_window_tokens)` for the budget exposed
-  to callers; this setter does not enforce a limit or compact history.
 - `set_max_truncated_resumes(spec.max_truncated_resumes)` for bounded output
   continuation. This is not a cap on the number of tool rounds.
 

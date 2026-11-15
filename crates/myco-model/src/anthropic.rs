@@ -8,73 +8,30 @@
 
 use std::sync::Arc;
 
-use super::driver_core::{Slot, SlotMap, SseAccumulator};
+use super::driver_core::{ImageSource, Slot, SlotMap, SseAccumulator};
 use super::*;
-
-/// Anthropic Messages API settings ([`BackendConfig::Anthropic`]).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct AnthropicBackendConfig {
-    pub anthropic_base_url: String,
-    pub anthropic_auth_token: String,
-    pub max_tokens_per_generate: usize,
-    pub debug_dump_api_requests: bool,
-    /// Maximum serialized request body, including history, images, tools, and prompts.
-    #[serde(default = "default_max_request_bytes")]
-    pub max_request_bytes: usize,
-    /// Transient-failure retry for this endpoint (`[gateways.NAME.retry]`).
-    #[serde(default)]
-    pub retry: RetryPolicy,
-    /// When set, enables Anthropic extended thinking at this effort level.
-    ///
-    /// The request shape follows the model's [`ThinkingMode`]: `adaptive` sends
-    /// `thinking.type: "adaptive"` plus `output_config.effort`; `budget` sends
-    /// `thinking.type: "enabled"` with a mapped `budget_tokens`; `none` sends
-    /// no thinking fields regardless of this value.
-    ///
-    /// Defaults to [`Effort::DEFAULT`] so thinking is always on for interactive use.
-    pub effort: Option<Effort>,
-}
-
-impl Default for AnthropicBackendConfig {
-    fn default() -> Self {
-        Self {
-            // No built-in gateway: the catalog (config.toml) supplies base_url.
-            anthropic_base_url: String::new(),
-            anthropic_auth_token: String::new(),
-            max_tokens_per_generate: 8192,
-            debug_dump_api_requests: false,
-            max_request_bytes: MAX_REQUEST_BYTES,
-            retry: RetryPolicy::default(),
-            effort: Some(Effort::DEFAULT),
-        }
-    }
-}
 
 /// Stateless Anthropic driver. Conversation history is owned by the caller.
 pub struct AnthropicGenerativeModel {
     model: ModelSpec,
     system_prompt: String,
     tools: Vec<AnthropicTool>,
-    backend: AnthropicBackendConfig,
+    backend: BackendConfig,
     client: reqwest::Client,
 }
 
 impl AnthropicGenerativeModel {
-    pub fn new(
-        config: GenerativeModelConfig,
-        backend: AnthropicBackendConfig,
-    ) -> Result<Arc<Self>, ModelCreationError> {
+    pub fn new(config: GenerativeModelConfig) -> Result<Arc<Self>, ModelCreationError> {
+        let backend = config.backend_config.clone();
         // api.anthropic.com authenticates API keys (`sk-ant-…`) via the
         // `x-api-key` header and rejects them as `Authorization: Bearer`;
         // Bearer is the convention for gateway/OAuth tokens. Pick by token
         // shape so both work against the default base URL.
-        let token = &backend.anthropic_auth_token;
-        let auth = if token.is_empty() {
-            None
-        } else if token.starts_with("sk-ant-") {
+        let token = &backend.auth_token;
+        let auth = if token.starts_with("sk-ant-") {
             Some(("x-api-key", token.clone()))
         } else {
-            Some(("authorization", format!("Bearer {token}")))
+            driver_core::bearer(token)
         };
         let client = driver_core::build_client(auth, &[("anthropic-version", "2023-06-01")])?;
 
@@ -116,7 +73,7 @@ impl AnthropicGenerativeModel {
             thinking_request_fields(self.model.thinking, self.backend.effort);
         // Anthropic requires max_tokens > thinking.budget_tokens for non-adaptive
         // extended thinking (e.g. Haiku). Adaptive thinking has no budget field.
-        let mut max_tokens = self.backend.max_tokens_per_generate;
+        let mut max_tokens = self.backend.max_output_tokens;
         if let Some(AnthropicThinkingConfig::Enabled { budget_tokens }) = &thinking {
             let need = (*budget_tokens as usize).saturating_add(1024);
             if max_tokens <= *budget_tokens as usize {
@@ -135,24 +92,18 @@ impl AnthropicGenerativeModel {
         };
 
         self.client
-            .post(format!("{}/v1/messages", self.backend.anthropic_base_url))
+            .post(format!("{}/v1/messages", self.backend.base_url))
             .json(&request)
     }
 }
 
 impl GenerativeModel for AnthropicGenerativeModel {
     fn generate(&self, input: &[Message]) -> AsyncStream<GenerationEvent> {
-        if let Err(error) = validate_image_sizes(input, self.model.max_image_base64_bytes) {
-            return driver_core::error_stream(error);
-        }
-        let messages = match convert_messages(input) {
-            Ok(messages) => messages,
-            Err(e) => return driver_core::error_stream(e),
-        };
-        driver_core::spawn_generate(
-            self.message_request(&messages),
-            StreamAccumulator::default(),
+        driver_core::generate::<StreamAccumulator>(
             "Anthropic",
+            input,
+            self.model.max_image_base64_bytes,
+            |input| Ok(self.message_request(&convert_messages(input)?)),
             self.backend.debug_dump_api_requests,
             self.backend.max_request_bytes,
         )
@@ -172,9 +123,11 @@ struct MessageRun {
     content: Vec<AnthropicContent>,
 }
 
-/// Merge consecutive same-role turns into role-alternating runs. Anthropic
-/// requires alternating user/assistant roles, and tool-result blocks must lead
-/// the user turn they answer.
+/// Merge consecutive same-role turns into role-alternating runs, as Anthropic
+/// requires. Tool-result blocks must also lead the user turn they answer; that
+/// holds without reordering because [`wire_tool_ids`] admits `ToolResults` only
+/// directly after an assistant message with tool calls, which always opens
+/// its own assistant run.
 ///
 /// `wire_ids[i][j]` supplies the id for the `j`-th tool_use / tool_result of
 /// `input[i]` ([`wire_tool_ids`]); stored provider ids never reach the wire.
@@ -231,25 +184,10 @@ fn merge_same_role_turns(input: &[Message], wire_ids: &[Vec<String>]) -> Box<[Me
             }
         };
 
-        // Tool-result blocks must appear before any other content in a user turn.
         if let Some(last) = runs.last_mut()
             && last.role == role
         {
-            if role == AnthropicRole::User {
-                let new_is_only_tool_results = !content.is_empty()
-                    && content
-                        .iter()
-                        .all(|c| matches!(c, AnthropicContent::ToolResult { .. }));
-                if new_is_only_tool_results {
-                    let mut combined = content;
-                    combined.append(&mut last.content);
-                    last.content = combined;
-                } else {
-                    last.content.extend(content);
-                }
-            } else {
-                last.content.extend(content);
-            }
+            last.content.extend(content);
             continue;
         }
         runs.push(MessageRun { role, content });
@@ -291,7 +229,6 @@ fn convert_messages(input: &[Message]) -> Result<Vec<AnthropicMessage>, Generate
 #[derive(Default)]
 struct StreamAccumulator {
     slots: SlotMap,
-    stop_reason: Option<AnthropicStopReason>,
     finished: bool,
 }
 
@@ -307,10 +244,6 @@ impl SseAccumulator for StreamAccumulator {
 
     fn finished(&self) -> bool {
         self.finished
-    }
-
-    fn finish(self) -> Result<(), GenerateError> {
-        driver_core::validate_finish("Anthropic", self.stop_reason.is_some(), std::iter::empty())
     }
 }
 
@@ -488,7 +421,6 @@ impl StreamAccumulator {
                         )
                         .into());
                     }
-                    self.stop_reason = Some(stop_reason.clone());
                     out.push(MessagePart::TurnEndReason(TurnEndReason::from(stop_reason)));
                 }
             }
@@ -724,28 +656,12 @@ enum AnthropicImageSource {
 }
 
 fn anthropic_image_source(source: String) -> AnthropicImageSource {
-    if source.starts_with("http://") || source.starts_with("https://") {
-        return AnthropicImageSource::Url { url: source };
-    }
-    if let Some(rest) = source.strip_prefix("data:") {
-        // data:[<media_type>][;base64],<data>
-        if let Some((meta, data)) = rest.split_once(',') {
-            let media_type = meta
-                .split(';')
-                .next()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("image/png")
-                .to_string();
-            return AnthropicImageSource::Base64 {
-                media_type,
-                data: data.to_string(),
-            };
-        }
-    }
-    AnthropicImageSource::Base64 {
-        media_type: "image/png".into(),
-        data: source,
-    }
+    let (media_type, data) = match ImageSource::parse(&source) {
+        ImageSource::Url(_) => return AnthropicImageSource::Url { url: source },
+        ImageSource::DataUrl { media_type, data } => (media_type.into(), data.into()),
+        ImageSource::RawBase64(_) => ("image/png".into(), source),
+    };
+    AnthropicImageSource::Base64 { media_type, data }
 }
 
 /// Wire block for one history content item. History thinking is never re-sent
@@ -803,18 +719,14 @@ struct AnthropicOutputConfig {
     effort: Option<&'static str>,
 }
 
-/// Build `thinking` / `output_config` for the given model when effort is set.
+/// Build `thinking` / `output_config` for the model's thinking mode.
 fn thinking_request_fields(
     mode: ThinkingMode,
-    effort: Option<Effort>,
+    effort: Effort,
 ) -> (
     Option<AnthropicThinkingConfig>,
     Option<AnthropicOutputConfig>,
 ) {
-    let Some(effort) = effort else {
-        return (None, None);
-    };
-
     match mode {
         ThinkingMode::Adaptive => (
             Some(AnthropicThinkingConfig::Adaptive {
@@ -1131,7 +1043,7 @@ mod tests {
     #[test]
     fn adaptive_thinking_uses_effort_not_budget() {
         let (thinking, output_config) =
-            thinking_request_fields(ThinkingMode::Adaptive, Some(Effort::High));
+            thinking_request_fields(ThinkingMode::Adaptive, Effort::High);
         let request = AnthropicMessagesRequest {
             max_tokens: 128,
             model: "claude-opus-4-8",
@@ -1152,7 +1064,7 @@ mod tests {
     #[test]
     fn manual_thinking_uses_budget_tokens() {
         let (thinking, output_config) =
-            thinking_request_fields(ThinkingMode::Budget, Some(Effort::Medium));
+            thinking_request_fields(ThinkingMode::Budget, Effort::Medium);
         let request = AnthropicMessagesRequest {
             max_tokens: 128,
             model: "claude-haiku-4-5",
@@ -1196,16 +1108,8 @@ mod tests {
     }
 
     #[test]
-    fn thinking_omitted_when_effort_unset() {
-        let (thinking, output_config) = thinking_request_fields(ThinkingMode::Adaptive, None);
-        assert!(thinking.is_none());
-        assert!(output_config.is_none());
-    }
-
-    #[test]
     fn thinking_mode_none_sends_no_thinking_fields() {
-        let (thinking, output_config) =
-            thinking_request_fields(ThinkingMode::None, Some(Effort::High));
+        let (thinking, output_config) = thinking_request_fields(ThinkingMode::None, Effort::High);
         assert!(thinking.is_none());
         assert!(output_config.is_none());
     }
@@ -1398,6 +1302,5 @@ mod tests {
         })
         .unwrap();
         acc.handle_event(AnthropicStreamEvent::MessageStop).unwrap();
-        acc.finish().unwrap();
     }
 }

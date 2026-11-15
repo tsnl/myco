@@ -8,7 +8,7 @@ mod session_turn;
 
 #[cfg(test)]
 mod recovery_tests;
-pub use session_turn::{SessionTurnOutcome, persist_session, run_session_turn, wire_checkpoint};
+pub use session_turn::{SessionTurnOutcome, persist_session, wire_checkpoint};
 
 mod followup;
 pub use followup::{FollowupHandler, append_followup};
@@ -18,11 +18,12 @@ mod autonomy;
 mod runner;
 pub use runner::{Compactor, ModelCompactor, SessionRunner, WorkflowEvent};
 
+mod agent_model;
+pub use agent_model::AgentModel;
+
 mod auxiliary;
 mod compact_worker;
-pub use compact_worker::{
-    CompactWorkerError, compact_subagent_prompt, run_compact_worker, run_compact_worker_with_model,
-};
+pub(crate) use compact_worker::run_compact_worker;
 
 pub async fn interact(
     agent: &mut Agent,

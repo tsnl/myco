@@ -3,9 +3,10 @@
 //!
 //! Cross-*provider* scaffolding (client, SSE loop, slot remapping) lives in
 //! [`super::driver_core`]; this is the layer above it that only the OpenAI
-//! dialects share: identical backend settings, and the same rules for
-//! rendering history text, image sources, and tool results.
+//! dialects share: the reasoning-effort mapping, usage decoding, and the same
+//! rules for rendering history text, image sources, and tool results.
 
+use super::driver_core::ImageSource;
 use super::*;
 
 /// Only explicit transient codes permit replay; prose and unknown codes never do.
@@ -19,46 +20,6 @@ pub(super) fn stream_failure(code: Option<&str>, message: String) -> GenerationF
             Some("server_error" | "rate_limit_exceeded" | "slow_down" | "server_is_overloaded")
         ),
         retry_after: None,
-    }
-}
-
-/// Settings for either OpenAI dialect ([`BackendConfig::OpenAIResponses`] /
-/// [`BackendConfig::OpenAICompletions`]).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct OpenAIBackendConfig {
-    /// Base URL including any path prefix, e.g. `https://api.x.ai/v1` or
-    /// `http://localhost:11434/v1`.
-    pub base_url: String,
-    pub auth_token: String,
-    pub max_output_tokens: Option<usize>,
-    pub debug_dump_api_requests: bool,
-    /// Maximum serialized request body, including history, images, tools, and prompts.
-    #[serde(default = "default_max_request_bytes")]
-    pub max_request_bytes: usize,
-    /// Transient-failure retry for this endpoint (`[gateways.NAME.retry]`).
-    #[serde(default)]
-    pub retry: RetryPolicy,
-    /// When set, request provider reasoning at this effort.
-    ///
-    /// Sent as `reasoning.effort` (Responses) or `reasoning_effort` (Chat
-    /// Completions). Servers that predate the field ignore it; OpenAI rejects
-    /// it on non-reasoning models, so those need `thinking = "none"` in the
-    /// catalog. Defaults to [`Effort::DEFAULT`] so reasoning is always requested.
-    pub effort: Option<Effort>,
-}
-
-impl Default for OpenAIBackendConfig {
-    fn default() -> Self {
-        Self {
-            // No built-in gateway: the catalog (config.toml) supplies base_url.
-            base_url: String::new(),
-            auth_token: String::new(),
-            max_output_tokens: Some(8192),
-            debug_dump_api_requests: false,
-            max_request_bytes: MAX_REQUEST_BYTES,
-            retry: RetryPolicy::default(),
-            effort: Some(Effort::DEFAULT),
-        }
     }
 }
 
@@ -112,16 +73,13 @@ pub(super) fn text_of(content: &[Content]) -> String {
         .join("\n")
 }
 
-/// Image URL fields accept http(s) and `data:` URLs. Same source policy as the
-/// Anthropic driver: pass URLs through, treat anything else as raw base64 PNG.
+/// Image URL fields accept http(s) and `data:` URLs, so only raw base64
+/// ([`ImageSource::RawBase64`]) needs wrapping.
 pub(super) fn image_url(source: &str) -> String {
-    if source.starts_with("http://")
-        || source.starts_with("https://")
-        || source.starts_with("data:")
-    {
-        return source.to_string();
+    match ImageSource::parse(source) {
+        ImageSource::RawBase64(data) => format!("data:image/png;base64,{data}"),
+        ImageSource::Url(_) | ImageSource::DataUrl { .. } => source.to_string(),
     }
-    format!("data:image/png;base64,{source}")
 }
 
 /// Shared algorithm for a user message's content in either dialect: `None`
@@ -178,14 +136,11 @@ pub(super) fn tool_result_text(result: &ToolResult) -> String {
 /// Unknown *fields* are typically ignored by OpenAI-compatible servers, but an
 /// unknown *value* is a 400: `max` is Anthropic-only (both dialects take
 /// minimal|low|medium|high), so clamp it.
-pub(super) fn reasoning_effort(
-    model: &ModelSpec,
-    backend: &OpenAIBackendConfig,
-) -> Option<&'static str> {
+pub(super) fn reasoning_effort(model: &ModelSpec, backend: &BackendConfig) -> Option<&'static str> {
     if model.thinking != ThinkingMode::Effort {
         return None;
     }
-    backend.effort.map(|effort| match effort {
+    Some(match backend.effort {
         Effort::Max => Effort::High.as_str(),
         other => other.as_str(),
     })

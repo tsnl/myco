@@ -68,17 +68,8 @@ impl ToolService for PreludeTool {
         tool_use: generative_model::ToolUse,
         _ctx: HostDispatchContext,
     ) -> Async<generative_model::ToolResult> {
-        Box::pin(async move {
-            let input: Input = match serde_json::from_value(tool_use.input.clone()) {
-                Ok(v) => v,
-                Err(e) => return ToolResult::err(format!("invalid prelude input: {e}")),
-            };
-            // Off the executor: every action reads or writes entry files.
-            match tokio::task::spawn_blocking(move || self.execute(input)).await {
-                Ok(Ok(text)) => ToolResult::text(text),
-                Ok(Err(e)) => ToolResult::err(e),
-                Err(e) => ToolResult::err(format!("prelude join: {e}")),
-            }
+        super::blocking_tool(tool_use.input, "invalid prelude input", move |input| {
+            self.execute(input).map(ToolResult::text)
         })
     }
 }

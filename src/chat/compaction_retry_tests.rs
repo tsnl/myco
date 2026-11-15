@@ -9,8 +9,10 @@ use std::time::Duration;
 
 use super::*;
 use crate::agent::NullEventSink;
+use crate::core::Async;
+use crate::generative_model::Message;
 use crate::harness::Harness;
-use crate::session::{ActiveSession, compact_thread};
+use crate::session::{ActiveSession, Session, Thread, compact_thread};
 use crate::test_support::{ScriptedModel, temp_home};
 
 #[derive(Default)]
@@ -18,6 +20,7 @@ struct Summarizer {
     calls: AtomicUsize,
     failures: usize,
     sources: Mutex<Vec<Session>>,
+    single_attempts: Mutex<Vec<bool>>,
     successors: Mutex<Vec<String>>,
     break_store: Option<PathBuf>,
 }
@@ -26,13 +29,18 @@ impl Compactor for Summarizer {
     fn compact(
         self: Arc<Self>,
         predecessor: Session,
+        single_attempt: bool,
+        _: Arc<dyn Fn(WorkflowEvent) + Send + Sync>,
         _: CancelToken,
-    ) -> Async<Result<(Thread, CompactOutcome), CompactWorkerError>> {
+    ) -> Async<Result<(Thread, CompactOutcome), AgentInteractionError>> {
         Box::pin(async move {
             let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
             self.sources.lock().unwrap().push(predecessor.clone());
+            self.single_attempts.lock().unwrap().push(single_attempt);
             if attempt < self.failures {
-                return Err(CompactWorkerError::Failed("summarizer unavailable".into()));
+                return Err(AgentInteractionError::Compaction(
+                    "summarizer unavailable".into(),
+                ));
             }
             let result = compact_thread(&predecessor, "Retain the original task").unwrap();
             self.successors.lock().unwrap().push(result.0.id.clone());
@@ -240,7 +248,7 @@ fn manual_compaction_retains_bounded_policy_even_when_auto_continue_is_enabled()
             Err(AgentInteractionError::Compaction(_))
         ));
         assert_eq!(summarizer.calls.load(Ordering::SeqCst), 1);
-        assert!(!summarizer.sources.lock().unwrap()[0].auto_continue);
+        assert_eq!(*summarizer.single_attempts.lock().unwrap(), [false]);
         assert!(
             runner
                 .runtime

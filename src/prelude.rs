@@ -153,11 +153,11 @@ pub fn rendered_body(entries: &[PreludeEntry]) -> String {
 /// the write goes through a hidden temp name so a concurrently rendering
 /// process never sees a partial entry.
 ///
-/// The temp name is claimed with `create_new`, which is what makes the
-/// uniqueness real rather than probabilistic: two processes that mint the same
-/// name in the same second both try to create the same temp file, exactly one
-/// wins, and the loser retries under a fresh name instead of silently
-/// overwriting the winner's bytes and dropping an entry.
+/// Uniqueness is real rather than probabilistic: the temp is claimed with
+/// `create_new` and published with a hard link, and both fail on an existing
+/// name. Two processes that mint the same name in the same second cannot both
+/// hold the temp or both publish; the loser retries under a fresh name instead
+/// of overwriting the winner's bytes or replacing its entry.
 ///
 /// Refuses to write at all if the resulting prelude would render past
 /// `max_bytes`, so the cap holds by construction instead of being trimmed back
@@ -179,9 +179,6 @@ pub fn add_entry(
             chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
             &crate::core::uuid_simple_hex(uuid::Uuid::new_v4())[..4]
         );
-        if dir.join(&name).exists() {
-            continue;
-        }
         // Every candidate name is the same length, so a retry cannot change
         // this verdict — checking inside the loop just keeps it next to the
         // name it is measuring.
@@ -216,10 +213,10 @@ fn projected_bytes(dir: &Path, name: &str, text: &str, superseding: Option<&str>
 }
 
 /// Write `body` as entry `name`: claim a hidden temp exclusively, fill it,
-/// rename it into place. `Ok(false)` means another process already holds that
-/// temp name and the caller should retry under a fresh one — overwriting it
-/// would destroy bytes a concurrent add is mid-way through writing, and one of
-/// the two entries would vanish at rename time.
+/// hard-link it into place, drop the temp. `Ok(false)` means another process
+/// holds that temp or has already published `name`, and the caller should
+/// retry under a fresh name — overwriting either would lose that process's
+/// entry. Unlike a rename, the link refuses an existing name (as in maildir).
 fn write_entry(dir: &Path, name: &str, body: &str) -> Result<bool, String> {
     let tmp = dir.join(format!(".tmp-{name}"));
     let mut file = match std::fs::File::create_new(&tmp) {
@@ -232,12 +229,12 @@ fn write_entry(dir: &Path, name: &str, body: &str) -> Result<bool, String> {
         return Err(format!("write {}: {e}", tmp.display()));
     }
     drop(file);
-    match std::fs::rename(&tmp, dir.join(name)) {
+    let published = std::fs::hard_link(&tmp, dir.join(name));
+    let _ = std::fs::remove_file(&tmp);
+    match published {
         Ok(()) => Ok(true),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(format!("rename {} into place: {e}", tmp.display()))
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(format!("link {} into place: {e}", tmp.display())),
     }
 }
 
@@ -409,10 +406,23 @@ mod tests {
         std::fs::remove_file(&tmp).unwrap();
         assert_eq!(write_entry(&dir, name, "winner\n"), Ok(true));
         assert_eq!(std::fs::read_to_string(dir.join(name)).unwrap(), "winner\n");
-        assert!(
-            !tmp.exists(),
-            "temp should be renamed away, not left behind"
-        );
+        assert!(!tmp.exists(), "temp should be removed, not left behind");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A process that minted the same name may have published it already,
+    /// after its temp was gone: publishing must refuse the taken name rather
+    /// than replace the entry another process just added.
+    #[test]
+    fn a_published_name_is_refused_not_replaced() {
+        let dir = temp_dir("published-claim");
+        let name = "20260801T120000Z-abcd.md";
+        std::fs::write(dir.join(name), "winner\n").unwrap();
+
+        assert_eq!(write_entry(&dir, name, "loser\n"), Ok(false));
+        assert_eq!(std::fs::read_to_string(dir.join(name)).unwrap(), "winner\n");
+        assert!(!dir.join(format!(".tmp-{name}")).exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -12,8 +12,9 @@ use myco::generative_model::{
     TokenUsage, ToolUseDelta, ToolUseStart, TurnEndReason,
 };
 use myco::{
-    ActiveSession, Agent, CancelToken, CompactOutcome, CompactWorkerError, Compactor, Harness,
+    ActiveSession, Agent, AgentInteractionError, CancelToken, CompactOutcome, Compactor, Harness,
     ModelInfo, NullEventSink, RuntimeRecord, Session, SessionRunner, SessionRuntime, Thread,
+    WorkflowEvent,
 };
 use serde_json::json;
 
@@ -54,11 +55,13 @@ impl Compactor for Summarizer {
     fn compact(
         self: Arc<Self>,
         predecessor: Session,
+        _single_attempt: bool,
+        _observer: Arc<dyn Fn(WorkflowEvent) + Send + Sync>,
         _cancel: CancelToken,
-    ) -> Async<Result<(Thread, CompactOutcome), CompactWorkerError>> {
+    ) -> Async<Result<(Thread, CompactOutcome), AgentInteractionError>> {
         Box::pin(async move {
             myco::compact_thread(&predecessor, "Complete the arithmetic fixture and write its result. Keep the existing eval shell.")
-                .map_err(CompactWorkerError::Failed)
+                .map_err(AgentInteractionError::Compaction)
         })
     }
 }

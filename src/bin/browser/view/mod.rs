@@ -9,7 +9,6 @@ use myco::generative_model::{Content, Message, ToolResourceRef, ToolResult, Tool
 use myco::session::{Session, Thread};
 use serde::Serialize;
 
-#[path = "processes.rs"]
 mod processes;
 pub(super) use processes::{refresh_processes, retain_processes};
 

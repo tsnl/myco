@@ -51,29 +51,22 @@ impl BashService {
             buffer.stderr = render_capture(&stderr, EXEC_CAPTURE_CAP + 64 * 1024).into_bytes();
         }
         let id = format!("bg-{}", Uuid::new_v4().simple());
+        let session = Session {
+            owner,
+            cmdline: command.into(),
+            stdin: Arc::new(Mutex::new(None)),
+            shared,
+            created_at: Instant::now(),
+            last_used: Arc::new(Mutex::new(Instant::now())),
+            process,
+        };
+        let operation = session.operation(&id);
         // Promotion spawns no new process, so the admission limit for `start`
         // must not prevent retaining work that is already running.
-        self.sessions().insert(
-            id.clone(),
-            Session {
-                owner,
-                cmdline: command.into(),
-                stdin: Arc::new(Mutex::new(None)),
-                shared: shared.clone(),
-                created_at: Instant::now(),
-                last_used: Arc::new(Mutex::new(Instant::now())),
-                process,
-            },
-        );
-        let mut result = take_snapshot(
-            &shared,
-            &id,
-            owner,
-            command,
-            SnapshotStatus::Backgrounded(promotion.reason),
-            max_bytes,
-        )
-        .tool_result();
+        self.sessions().insert(id, session);
+        let mut result = operation
+            .take_snapshot(SnapshotStatus::Backgrounded(promotion.reason), max_bytes)
+            .tool_result();
         result.content.push(generative_model::Content::Text {
             text:
                 "The original exec had closed stdin; use read, signal, or close with this handle."

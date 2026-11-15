@@ -31,6 +31,8 @@ pub use prelude_service::PreludeTool;
 pub mod list_recent_service;
 pub use list_recent_service::ListRecentService;
 
+mod session_format;
+
 pub mod getlink_service;
 pub use getlink_service::GetLinkTool;
 
@@ -174,6 +176,34 @@ pub(crate) fn signal_process_group(pid: Option<u32>, signal: libc::c_int) -> std
 /// gone) are ignored — callers are teardown paths with nothing to report to.
 pub(crate) fn kill_process_group(pid: Option<u32>) {
     let _ = signal_process_group(pid, libc::SIGKILL);
+}
+
+/// Parse a tool's JSON input and run its body on Tokio's blocking pool.
+///
+/// For bodies that touch the filesystem: a remote worker serves the NDJSON
+/// reader, writer, and every other call from a two-thread runtime, so blocking
+/// IO on the executor would stall them all. `invalid_input` prefixes the
+/// parse error the model sees.
+pub(crate) fn blocking_tool<I>(
+    input: serde_json::Value,
+    invalid_input: &'static str,
+    body: impl FnOnce(I) -> Result<generative_model::ToolResult, String> + Send + 'static,
+) -> Async<generative_model::ToolResult>
+where
+    I: serde::de::DeserializeOwned + Send + 'static,
+{
+    Box::pin(async move {
+        let run = move || {
+            let input =
+                serde_json::from_value(input).map_err(|e| format!("{invalid_input}: {e}"))?;
+            body(input)
+        };
+        match tokio::task::spawn_blocking(run).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => generative_model::ToolResult::err(e),
+            Err(e) => generative_model::ToolResult::err(format!("tool task failed: {e}")),
+        }
+    })
 }
 
 /// A host-local notice for the model, plus facts a transcript may summarize

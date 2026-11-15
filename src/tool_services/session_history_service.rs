@@ -64,16 +64,11 @@ impl ToolService for SessionHistoryTool {
         tool_use: ToolUse,
         _ctx: HostDispatchContext,
     ) -> Async<ToolResult> {
-        Box::pin(async move {
-            let input: Input = match serde_json::from_value(tool_use.input.clone()) {
-                Ok(v) => v,
-                Err(e) => return ToolResult::err(format!("invalid session_history input: {e}")),
-            };
-            match self.execute(input) {
-                Ok(text) => ToolResult::text(text),
-                Err(e) => ToolResult::err(e),
-            }
-        })
+        super::blocking_tool(
+            tool_use.input,
+            "invalid session_history input",
+            move |input| self.execute(input).map(ToolResult::text),
+        )
     }
 }
 

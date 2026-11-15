@@ -74,20 +74,14 @@ impl ToolService for TextEditorService {
         tool_use: generative_model::ToolUse,
         ctx: HostDispatchContext,
     ) -> Async<generative_model::ToolResult> {
-        Box::pin(async move {
-            let input: Input = match serde_json::from_value(tool_use.input) {
-                Ok(input) => input,
-                Err(e) => {
-                    return generative_model::ToolResult::err(format!(
-                        "Error deserializing text editor input: {e}"
-                    ));
-                }
-            };
-            match self.execute(input, ctx.agent_id) {
-                Ok(text) => generative_model::ToolResult::text(text),
-                Err(e) => generative_model::ToolResult::err(e),
-            }
-        })
+        super::blocking_tool(
+            tool_use.input,
+            "Error deserializing text editor input",
+            move |input| {
+                self.execute(input, ctx.agent_id)
+                    .map(generative_model::ToolResult::text)
+            },
+        )
     }
 }
 
@@ -110,39 +104,51 @@ impl TextEditorService {
 
         // One guard across check + mutate + record: concurrent same-turn edits
         // of one file serialize here, so the stamp that authorized a write can
-        // never go stale between its check and the write it authorized, and
-        // the recorded fingerprint always describes the bytes this command
-        // left behind.
+        // never go stale between its check and the write it authorized.
         let mut owners = self.read_files.lock().unwrap_or_else(|e| e.into_inner());
         let read_files = owners.entry(owner).or_default();
 
-        let output = match command {
+        // A stamp is always the fingerprint of bytes this command itself read
+        // or wrote, never of a later re-read, which could approve content the
+        // agent never saw. Edits stamp what they wrote, so follow-up edits need
+        // no re-view while external changes still fail the guard.
+        let (output, fingerprint) = match command {
             Command::View => view_path(&path, view_range)?,
             Command::StrReplace => {
                 let old_str = require(old_str, "str_replace", "old_str")?;
                 let new_str = require(new_str, "str_replace", "new_str")?;
-                ensure_mutated_file_already_read(read_files, Path::new(&path))?;
-                str_replace_in_file(&path, &old_str, &new_str)?;
-                "Successfully replaced text at exactly one location.".to_string()
+                let content = read_stamped(read_files, &path)?;
+                let edited = str_replace(&content, &old_str, &new_str)?;
+                (
+                    "Successfully replaced text at exactly one location.".to_string(),
+                    Some(write_file(&path, &edited)?),
+                )
             }
             // No read-stamp check: new files cannot have been read.
             Command::Create => {
                 let file_text = require(file_text, "create", "file_text")?;
-                create_file(&path, &file_text)?
+                create_file(&path, &file_text)?;
+                (
+                    format!("Created file '{path}'."),
+                    Some(fingerprint(file_text.as_bytes())),
+                )
             }
             Command::Insert => {
                 let insert_line = require(insert_line, "insert", "insert_line")?;
                 let insert_text = require(insert_text, "insert", "insert_text")?;
-                ensure_mutated_file_already_read(read_files, Path::new(&path))?;
-                insert_in_file(&path, insert_line, &insert_text)?;
-                format!("Successfully inserted text after line {insert_line}.")
+                let content = read_stamped(read_files, &path)?;
+                if insert_line < 0 {
+                    return Err(format!("insert_line must be >= 0, got {insert_line}"));
+                }
+                let edited = insert_after_line(&content, insert_line, &insert_text)?;
+                (
+                    format!("Successfully inserted text after line {insert_line}."),
+                    Some(write_file(&path, &edited)?),
+                )
             }
         };
 
-        // On success, record the fingerprint so subsequent tool-driven edits
-        // don't require a re-view, while external on-disk changes still fail
-        // the guard. (A directory view has no fingerprint and is skipped.)
-        if let Ok(fingerprint) = file_fingerprint(Path::new(&path)) {
+        if let Some(fingerprint) = fingerprint {
             read_files.insert(PathBuf::from(path), fingerprint);
         }
         Ok(output)
@@ -163,46 +169,90 @@ fn require<T>(field: Option<T>, command: &str, name: &str) -> Result<T, String> 
 /// Content fingerprint for the read-stamp guard. Hashes the file bytes:
 /// mtime comparison misses external writes within the same filesystem clock
 /// granule, and byte identity is the property the guard actually promises.
-fn file_fingerprint(path: &Path) -> Result<Fingerprint, String> {
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| format!("Error opening file {path:?} to check if it was modified: {e}"))?;
-    fingerprint_reader(&mut file)
-        .map_err(|e| format!("Error reading file {path:?} to check if it was modified: {e}"))
+fn fingerprint(bytes: &[u8]) -> Fingerprint {
+    let mut digest = Context::new(&SHA256);
+    digest.update(bytes);
+    finish(digest)
 }
 
-/// A short ranged view still fingerprints all file bytes, including changes
-/// outside the viewed range, without allocating storage proportional to the file.
-fn fingerprint_reader(reader: &mut impl Read) -> io::Result<Fingerprint> {
-    let mut digest = Context::new(&SHA256);
-    let mut buffer = [0; 64 * 1024];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => return Ok(digest.finish().as_ref().try_into().expect("SHA-256 length")),
-            Ok(count) => digest.update(&buffer[..count]),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error),
+fn finish(digest: Context) -> Fingerprint {
+    digest.finish().as_ref().try_into().expect("SHA-256 length")
+}
+
+/// Fingerprints every byte read through it, so a streamed view stamps exactly
+/// the bytes it read without holding the whole file in memory.
+struct Fingerprinting<R> {
+    inner: R,
+    digest: Context,
+}
+
+impl<R: Read> Fingerprinting<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            digest: Context::new(&SHA256),
         }
+    }
+
+    fn finish(self) -> Fingerprint {
+        finish(self.digest)
     }
 }
 
-fn ensure_mutated_file_already_read(
-    read_files: &HashMap<PathBuf, Fingerprint>,
-    path: &Path,
-) -> Result<(), String> {
-    let Some(read_fingerprint) = read_files.get(path) else {
+impl<R: Read> Read for Fingerprinting<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let count = self.inner.read(buf)?;
+        self.digest.update(&buf[..count]);
+        Ok(count)
+    }
+}
+
+/// Read a file for mutation, failing unless its bytes match the owner's stamp.
+///
+/// A streamed pre-check rejects a changed file in bounded memory; the buffer
+/// that is then edited is fingerprinted as it is read, so the edit can only
+/// ever apply to exactly the stamped bytes.
+fn read_stamped(read_files: &HashMap<PathBuf, Fingerprint>, path: &str) -> Result<String, String> {
+    let Some(read_fingerprint) = read_files.get(Path::new(path)) else {
         return Err(format!(
             "File {path:?} was not read before being mutated. Read the file first."
         ));
     };
-    if file_fingerprint(path)? != *read_fingerprint {
-        return Err(format!(
+    let read_error = |e: io::Error| format!("Error reading file '{path}': {e}");
+    let modified = || {
+        format!(
             "File {path:?} was modified on disk after being read. Read the file again before mutating."
-        ));
+        )
+    };
+    let mut file = Fingerprinting::new(std::fs::File::open(path).map_err(read_error)?);
+    io::copy(&mut file, &mut io::sink()).map_err(read_error)?;
+    let Fingerprinting { mut inner, digest } = file;
+    if finish(digest) != *read_fingerprint {
+        return Err(modified());
     }
-    Ok(())
+    io::Seek::rewind(&mut inner).map_err(read_error)?;
+    let mut file = Fingerprinting::new(inner);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(read_error)?;
+    if file.finish() != *read_fingerprint {
+        return Err(modified());
+    }
+    String::from_utf8(bytes).map_err(|e| format!("Error reading file '{path}': {e}"))
 }
 
-fn view_path(path: &str, view_range: Option<[i64; 2]>) -> Result<String, String> {
+/// Write an edit; returns the fingerprint of the bytes written.
+fn write_file(path: &str, content: &str) -> Result<Fingerprint, String> {
+    atomically_write_file(Path::new(path), content.as_bytes())
+        .map_err(|e| format!("Error writing file '{path}': {e}"))?;
+    Ok(fingerprint(content.as_bytes()))
+}
+
+/// A view's text, with the fingerprint of the file bytes it read (none for
+/// a directory listing).
+fn view_path(
+    path: &str,
+    view_range: Option<[i64; 2]>,
+) -> Result<(String, Option<Fingerprint>), String> {
     let path_buf = PathBuf::from(path);
     let metadata = std::fs::metadata(&path_buf)
         .map_err(|e| format!("Error reading metadata for '{path}': {e}"))?;
@@ -213,14 +263,15 @@ fn view_path(path: &str, view_range: Option<[i64; 2]>) -> Result<String, String>
                 "view_range is only supported for files, not directories (path: '{path}')"
             ));
         }
-        return view_directory(&path_buf, path);
+        return Ok((view_directory(&path_buf, path)?, None));
     }
 
     if !metadata.is_file() {
         return Err(format!("Path '{path}' is neither a file nor a directory"));
     }
 
-    view_file(&path_buf, path, view_range)
+    let (text, fingerprint) = view_file(&path_buf, path, view_range)?;
+    Ok((text, Some(fingerprint)))
 }
 
 fn view_directory(path: &Path, path_display: &str) -> Result<String, String> {
@@ -245,31 +296,36 @@ fn view_directory(path: &Path, path_display: &str) -> Result<String, String> {
     Ok(entries.join("\n"))
 }
 
+/// One pass over the file. The fingerprint covers every byte, including
+/// lines outside `view_range`, so a ranged view still detects external
+/// changes anywhere in the file.
 fn view_file(
     path: &Path,
     path_display: &str,
     view_range: Option<[i64; 2]>,
-) -> Result<String, String> {
-    use std::io::{BufReader, Read};
+) -> Result<(String, Fingerprint), String> {
+    let read_error =
+        |e: &dyn std::fmt::Display| format!("Error reading file '{path_display}': {e}");
+    let file = std::fs::File::open(path).map_err(|e| read_error(&e))?;
+    let mut reader = io::BufReader::new(Fingerprinting::new(file));
 
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("Error reading file '{path_display}': {e}"))?;
-    let mut reader = BufReader::new(file);
-
-    let Some([start, end]) = view_range else {
-        let mut data = Vec::new();
-        reader
-            .take(MAX_VIEW_BYTES + 1)
-            .read_to_end(&mut data)
-            .map_err(|e| format!("Error reading file '{path_display}': {e}"))?;
-        if data.len() > MAX_VIEW_BYTES as usize {
-            return Err(view_limit_error(path_display));
+    let text = match view_range {
+        None => {
+            let mut data = Vec::new();
+            (&mut reader)
+                .take(MAX_VIEW_BYTES + 1)
+                .read_to_end(&mut data)
+                .map_err(|e| read_error(&e))?;
+            if data.len() > MAX_VIEW_BYTES as usize {
+                return Err(view_limit_error(path_display));
+            }
+            String::from_utf8(data).map_err(|e| read_error(&e))?
         }
-        return String::from_utf8(data)
-            .map_err(|e| format!("Error reading file '{path_display}': {e}"));
+        Some([start, end]) => read_lines_in_range(&mut reader, start, end, path_display)?,
     };
 
-    read_lines_in_range(&mut reader, start, end, path_display)
+    io::copy(&mut reader, &mut io::sink()).map_err(|e| read_error(&e))?;
+    Ok((text, reader.into_inner().finish()))
 }
 
 fn view_limit_error(path: &str) -> String {
@@ -366,61 +422,31 @@ fn read_lines_in_range<R: std::io::BufRead>(
     Ok(selected)
 }
 
-fn str_replace_in_file(path: &str, old_str: &str, new_str: &str) -> Result<(), String> {
-    enum SearchResult {
-        None,
-        One { offset: usize },
-        Multiple { match_count: usize },
-    }
-
-    impl SearchResult {
-        fn match_count(&self) -> usize {
-            match self {
-                SearchResult::None => 0,
-                SearchResult::One { .. } => 1,
-                SearchResult::Multiple { match_count } => *match_count,
-            }
+fn str_replace(content: &str, old_str: &str, new_str: &str) -> Result<String, String> {
+    // Exact substring matches (not regex) so agent-provided text is literal.
+    let mut matches = content.match_indices(old_str);
+    let offset = match (matches.next(), matches.count()) {
+        (Some((offset, _)), 0) => offset,
+        (first, rest) => {
+            return Err(format!(
+                concat!(
+                    "Expected to find exactly one occurrence of the old_str in the file, but ",
+                    "found {} occurrences. Please refine your `old_str` parameter accordingly so ",
+                    "there is exactly one match."
+                ),
+                usize::from(first.is_some()) + rest
+            ));
         }
-    }
-
-    let old_file_text =
-        std::fs::read_to_string(path).map_err(|e| format!("Error reading file '{path}': {e}"))?;
-
-    // Find exact substring matches (not regex) so agent-provided text is literal.
-    let search_result = old_file_text.match_indices(old_str).fold(
-        SearchResult::None,
-        |acc, (offset, _)| match acc {
-            SearchResult::None => SearchResult::One { offset },
-            SearchResult::One { .. } => SearchResult::Multiple { match_count: 2 },
-            SearchResult::Multiple { match_count } => SearchResult::Multiple {
-                match_count: match_count + 1,
-            },
-        },
-    );
-
-    let SearchResult::One { offset } = search_result else {
-        return Err(format!(
-            concat!(
-                "Expected to find exactly one occurrence of the old_str in the file, but ",
-                "found {} occurrences. Please refine your `old_str` parameter accordingly so ",
-                "there is exactly one match."
-            ),
-            search_result.match_count()
-        ));
     };
-
-    let new_file_text = format!(
+    Ok(format!(
         "{}{}{}",
-        &old_file_text[..offset],
+        &content[..offset],
         new_str,
-        &old_file_text[offset + old_str.len()..]
-    );
-
-    atomically_write_file(Path::new(path), new_file_text.as_bytes())
-        .map_err(|e| format!("Error writing file '{path}': {e}"))
+        &content[offset + old_str.len()..]
+    ))
 }
 
-fn create_file(path: &str, file_text: &str) -> Result<String, String> {
+fn create_file(path: &str, file_text: &str) -> Result<(), String> {
     let path_buf = PathBuf::from(path);
     if path_buf.exists() {
         return Err(format!(
@@ -437,24 +463,10 @@ fn create_file(path: &str, file_text: &str) -> Result<String, String> {
         ));
     }
     atomically_write_file(&path_buf, file_text.as_bytes())
-        .map_err(|e| format!("Error creating file '{path}': {e}"))?;
-    Ok(format!("Created file '{path}'."))
+        .map_err(|e| format!("Error creating file '{path}': {e}"))
 }
 
 /// Insert `insert_text` after line `insert_line` (0 = beginning of file).
-fn insert_in_file(path: &str, insert_line: i64, insert_text: &str) -> Result<(), String> {
-    if insert_line < 0 {
-        return Err(format!("insert_line must be >= 0, got {insert_line}"));
-    }
-
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("Error reading file '{path}': {e}"))?;
-
-    let new_content = insert_after_line(&content, insert_line, insert_text)?;
-    atomically_write_file(Path::new(path), new_content.as_bytes())
-        .map_err(|e| format!("Error writing file '{path}': {e}"))
-}
-
 fn insert_after_line(content: &str, insert_line: i64, insert_text: &str) -> Result<String, String> {
     if insert_line == 0 {
         return Ok(format!("{insert_text}{content}"));
@@ -566,6 +578,14 @@ pub struct Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dispatch needs a Tokio runtime: blocking tool bodies run on its pool.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
     use crate::host::HostWorker;
     use crate::test_support::{result_text, temp_dir};
     use serde_json::json;
@@ -590,7 +610,7 @@ mod tests {
         harness: &Arc<HostWorker>,
         input: serde_json::Value,
     ) -> generative_model::ToolResult {
-        futures::executor::block_on(harness.dispatch_tool_use(
+        block_on(harness.dispatch_tool_use(
             generative_model::ToolUse {
                 name: "str_replace_based_edit_tool".into(),
                 input,
@@ -616,7 +636,7 @@ mod tests {
         let first = uuid::Uuid::new_v4();
         let second = uuid::Uuid::new_v4();
         let call = |owner, input| {
-            futures::executor::block_on(service.clone().dispatch_tool_use(
+            block_on(service.clone().dispatch_tool_use(
                 generative_model::ToolUse {
                     name: "str_replace_based_edit_tool".into(),
                     input,
@@ -927,13 +947,49 @@ mod tests {
             }
         }
         let bytes = b"same content, different read boundaries";
-        let expected = fingerprint_reader(&mut bytes.as_slice()).unwrap();
-        let actual = fingerprint_reader(&mut Chunked {
+        let mut reader = Fingerprinting::new(Chunked {
             bytes,
             interrupted: false,
-        })
-        .unwrap();
-        assert_eq!(actual, expected);
+        });
+        io::copy(&mut reader, &mut io::sink()).unwrap();
+        assert_eq!(reader.finish(), fingerprint(bytes));
+    }
+
+    #[test]
+    fn ranged_view_fingerprints_every_byte_it_read() {
+        let tmp = temp_dir("editor-ranged-pass");
+        let content = "one\ntwo\nthree\n".repeat(10_000);
+        let path = write_file(tmp.path(), "file", &content);
+        let (text, stamp) = view_file(&path, "file", Some([2, 2])).unwrap();
+        assert_eq!(text, "two");
+        assert_eq!(stamp, fingerprint(content.as_bytes()));
+    }
+
+    /// An edit stamps the bytes it wrote: a follow-up edit needs no re-view,
+    /// and an external write after the edit still blocks the next one.
+    #[test]
+    fn edits_stamp_the_bytes_they_wrote() {
+        let tmp = temp_dir("editor-edit-stamp");
+        let path = write_file(tmp.path(), "file", "a\n");
+        let worker = harness();
+        assert!(!dispatch(&worker, json!({"command":"view", "path":path})).is_error);
+        let replace = |old: &str, new: &str| {
+            dispatch(
+                &worker,
+                json!({"command":"str_replace", "path":path, "old_str":old, "new_str":new}),
+            )
+        };
+        assert!(!replace("a", "b").is_error);
+        let insert = dispatch(
+            &worker,
+            json!({"command":"insert", "path":path, "insert_line":1, "insert_text":"c\n"}),
+        );
+        assert!(!insert.is_error, "{}", result_text(&insert));
+        assert!(!replace("c", "d").is_error);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "b\nd\n");
+
+        std::fs::write(&path, "b\nd\nexternal\n").unwrap();
+        assert!(result_text(&replace("b", "e")).contains("modified on disk"));
     }
 
     #[test]

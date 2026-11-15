@@ -3,33 +3,34 @@
 //! Two backends:
 //! - **In-process** ([`HostController::in_process`]): shares an in-memory
 //!   [`HostWorker`] with the agent process (used for the always-on `local` host).
-//! - **Subprocess** ([`HostController::with_timeout`]): lazy-spawn a remote
+//! - **Subprocess** ([`HostController::new`]): lazy-spawn a remote
 //!   `myco --mode host` (typically over SSH) and pipeline NDJSON calls.
 //!
 //! Concurrent `call`s share one pipe (subprocess) or the same worker (in-process).
 
 use std::collections::{HashMap, HashSet};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
-use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, oneshot};
 use tokio::time::Instant;
 
 use crate::core::{CancelToken, ToolResource};
 use crate::generative_model::{ToolResult, ToolSpec, ToolUse};
 use crate::host::HostWorker;
-use crate::host::protocol::{HOST_PROTOCOL_VERSION, Request, Response, read_line};
-use crate::tool_services::HostDispatchContext;
+use crate::host::protocol::{Request, Response};
+use crate::host::transport::{Conn, connect_with_timeout};
+use crate::tool_services::{BashService, HostDispatchContext};
 
 /// A remote tool gets its requested timeout plus this much time to return its
 /// result. This is a transport backstop, not a replacement for tool timeouts.
 const RESPONSE_GRACE_MS: u64 = 5_000;
 const DEFAULT_RESPONSE_TIMEOUT_MS: u64 = 60_000;
 const MAX_RESPONSE_TIMEOUT_MS: u64 = 1_800_000;
+/// After a cancel, how long to wait for the host's partial result before
+/// abandoning the waiter. Matches the agent's own cancel grace.
+const CANCEL_ACK_GRACE: Duration = Duration::from_secs(2);
 
 /// Configuration for one remote host endpoint (spawn argv).
 ///
@@ -65,17 +66,6 @@ pub struct HostController {
     /// Assumed tool catalog (`myco --mode host` standard set).
     tools: Vec<ToolSpec>,
     backend: Backend,
-}
-
-/// Live child + demux state. Drop aborts I/O tasks and kills the child.
-struct Conn {
-    child: Child,
-    write_tx: mpsc::Sender<Vec<u8>>,
-    pending: Arc<Mutex<HashMap<String, oneshot::Sender<Response>>>>,
-    dead: Arc<AtomicBool>,
-    activity: Arc<StdMutex<Activity>>,
-    reader_abort: tokio::task::AbortHandle,
-    writer_abort: tokio::task::AbortHandle,
 }
 
 //
@@ -124,7 +114,7 @@ impl HostFailure {
 
 /// Tool activity alone advances the idle clock; inventory polling is observational.
 /// An abandoned waiter does not mean its remote effect has finished.
-struct Activity {
+pub(super) struct Activity {
     last_used: Instant,
     revision: u64,
     calls: HashSet<String>,
@@ -150,7 +140,7 @@ impl Activity {
         self.revision += 1;
     }
 
-    fn finish(&mut self, id: &str) {
+    pub(super) fn finish(&mut self, id: &str) {
         if self.calls.remove(id) {
             self.touch();
         }
@@ -169,22 +159,6 @@ impl Drop for EnqueueGuard<'_> {
     fn drop(&mut self) {
         if !self.sent {
             self.activity.lock().unwrap().finish(self.id);
-        }
-    }
-}
-
-impl Drop for Conn {
-    fn drop(&mut self) {
-        self.reader_abort.abort();
-        self.writer_abort.abort();
-        let _ = self.child.start_kill();
-        if let Ok(mut pending) = self.pending.try_lock() {
-            for (_, tx) in pending.drain() {
-                let _ = tx.send(Response::Error {
-                    id: None,
-                    message: "host connection closed".into(),
-                });
-            }
         }
     }
 }
@@ -213,25 +187,17 @@ impl HostController {
         )
     }
 
-    /// Create a remote/subprocess controller. The worker is **not** started until
-    /// the first [`Self::call`].
+    /// Create a remote/subprocess controller with default timeouts. The worker
+    /// is **not** started until the first [`Self::call`].
     pub fn new(config: HostConfig, max_image_base64_bytes: u64) -> Arc<Self> {
-        Self::with_timeout(config, 10, max_image_base64_bytes)
+        Self::with_timeouts(config, 10, 1800, max_image_base64_bytes)
     }
 
-    /// Like [`Self::new`] with an explicit connect timeout (`0` disables it) and the
-    /// image cap the remote is spawned with — advertised before connecting, so
-    /// it must match the `--max-image-base64-bytes` in `config.command`.
-    pub fn with_timeout(
-        config: HostConfig,
-        connect_timeout_secs: u64,
-        max_image_base64_bytes: u64,
-    ) -> Arc<Self> {
-        Self::with_timeouts(config, connect_timeout_secs, 1800, max_image_base64_bytes)
-    }
-
-    /// Configure idle reaping in seconds (`0` disables it). Retained handles and
-    /// outstanding calls pin their worker, including between user turns.
+    /// Like [`Self::new`] with explicit connect and idle-reaping timeouts in
+    /// seconds (`0` disables either). Retained handles and outstanding calls
+    /// pin their worker, including between user turns. The image cap is the
+    /// one the remote is spawned with — advertised before connecting, so it
+    /// must match the `--max-image-base64-bytes` in `config.command`.
     pub fn with_timeouts(
         config: HostConfig,
         connect_timeout_secs: u64,
@@ -257,6 +223,14 @@ impl HostController {
 
     pub fn tool_specs(&self) -> &[ToolSpec] {
         &self.tools
+    }
+
+    /// Display command: `in-process` for local, the spawn argv for remotes.
+    pub fn command(&self) -> Vec<String> {
+        match &self.backend {
+            Backend::InProcess { .. } => vec!["in-process".into()],
+            Backend::Subprocess { config, .. } => config.command.clone(),
+        }
     }
 
     /// Whether this host is in-process (always "connected").
@@ -409,13 +383,20 @@ impl HostController {
         let deadline = tokio::time::sleep(response_timeout);
         tokio::pin!(deadline);
         let mut background_sent = false;
+        let mut cancel_sent = false;
         let reply = loop {
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => {
+                _ = cancel.cancelled(), if !cancel_sent => {
+                    // Keep awaiting the reply: a cancel-aware host tool answers
+                    // with its honest partial result (bash drains output after
+                    // killing the group), exactly as in-process dispatch does.
+                    cancel_sent = true;
                     self.cancel_remote(&id).await;
-                    self.abandon(&id).await;
-                    return ToolResult::err("cancelled while awaiting host acknowledgement; effects are unknown");
+                    let ack_deadline = tokio::time::Instant::now() + CANCEL_ACK_GRACE;
+                    if ack_deadline < deadline.deadline() {
+                        deadline.as_mut().reset(ack_deadline);
+                    }
                 }
                 r = &mut rx => break r,
                 result = &mut background_request, if !background_sent => {
@@ -426,6 +407,10 @@ impl HostController {
                     }
                 }
                 _ = &mut deadline => {
+                    if cancel_sent {
+                        self.abandon(&id).await;
+                        return ToolResult::err("cancelled; host did not acknowledge before the deadline; effects are unknown");
+                    }
                     self.cancel_remote(&id).await;
                     self.abandon(&id).await;
                     let message = format!(
@@ -456,39 +441,52 @@ impl HostController {
         } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let client = self.clone();
             handle.spawn(async move {
-                if let Err(error) = client.agent_finished(agent_id).await {
+                if let Err(error) = client.notify_remote_agent_finished(agent_id).await {
                     eprintln!("warning: agent_finished on host {:?}: {error}", client.name);
                 }
             });
         }
     }
 
-    /// Notify the worker that an agent session ended (reap sessions, …).
-    ///
-    /// In-process: runs immediately. Subprocess: fire-and-forget — the worker
-    /// reaps without replying, and a missing/dead connection is a quiet no-op
-    /// (worker process exit when the connection drops is the hard guarantee).
-    pub async fn agent_finished(&self, agent_id: uuid::Uuid) -> Result<(), String> {
-        match &self.backend {
-            Backend::InProcess { worker } => {
-                worker.notify_agent_finished(agent_id);
-                Ok(())
-            }
-            Backend::Subprocess { conn, .. } => {
-                let write_tx = {
-                    let slot = conn.lock().await;
-                    match slot.as_ref().filter(|c| !c.dead.load(Ordering::SeqCst)) {
-                        Some(c) => c.write_tx.clone(),
-                        // Not connected: nothing to reap on the worker.
-                        None => return Ok(()),
-                    }
-                };
-                let bytes = Request::AgentFinished { agent_id }.encode()?;
-                write_tx
-                    .send(bytes)
-                    .await
-                    .map_err(|_| format!("host {:?}: write: connection closed", self.name))
-            }
+    /// Fire-and-forget: the worker reaps without replying, and a missing or
+    /// dead connection is a quiet no-op (worker exit when the connection drops
+    /// is the hard guarantee). The worker reaps everything the owner retained,
+    /// so it stops pinning idle reaping and counting toward lost sessions.
+    async fn notify_remote_agent_finished(&self, agent_id: uuid::Uuid) -> Result<(), String> {
+        let write_tx = self
+            .with_live_conn(|c| {
+                let mut activity = c.activity.lock().unwrap();
+                activity.owners.remove(&agent_id);
+                activity.bash_sessions.remove(&agent_id);
+                c.write_tx.clone()
+            })
+            .await;
+        // Not connected: nothing to reap on the worker.
+        let Some(write_tx) = write_tx else {
+            return Ok(());
+        };
+        let bytes = Request::AgentFinished { agent_id }.encode()?;
+        write_tx
+            .send(bytes)
+            .await
+            .map_err(|_| format!("host {:?}: write: connection closed", self.name))
+    }
+
+    /// Read the live connection, if any. Never connects or reconnects.
+    async fn with_live_conn<T>(&self, read: impl FnOnce(&Conn) -> T) -> Option<T> {
+        let Backend::Subprocess { conn, .. } = &self.backend else {
+            return None;
+        };
+        conn.lock()
+            .await
+            .as_ref()
+            .filter(|c| !c.dead.load(Ordering::SeqCst))
+            .map(read)
+    }
+
+    fn record_failure(&self, message: String) {
+        if let Backend::Subprocess { last_error, .. } = &self.backend {
+            *last_error.lock().unwrap() = Some(HostFailure::new(message));
         }
     }
 
@@ -534,7 +532,7 @@ impl HostController {
                 c.dead.load(Ordering::SeqCst) || c.child.try_wait().ok().flatten().is_some()
             }) {
                 *slot = None;
-                *last_error.lock().unwrap() = Some(HostFailure::new("host connection lost".into()));
+                self.record_failure("host connection lost".into());
             }
             if slot.is_none() {
                 if !connect_if_needed {
@@ -545,15 +543,11 @@ impl HostController {
                 }
                 match connect_with_timeout(config, *connect_timeout_secs).await {
                     Ok(c) => {
-                        if let Ok(mut err) = last_error.lock() {
-                            *err = None;
-                        }
+                        *last_error.lock().unwrap() = None;
                         *slot = Some(c);
                     }
                     Err(e) => {
-                        if let Ok(mut err) = last_error.lock() {
-                            *err = Some(HostFailure::new(e.clone()));
-                        }
+                        self.record_failure(e.clone());
                         return Err(e);
                     }
                 }
@@ -566,9 +560,7 @@ impl HostController {
             }) {
                 *slot = None;
                 let msg = "host connection lost".to_string();
-                if let Ok(mut err) = last_error.lock() {
-                    *err = Some(HostFailure::new(msg.clone()));
-                }
+                self.record_failure(msg.clone());
                 return Err(msg);
             }
             let c = slot.as_ref().expect("connected");
@@ -610,9 +602,7 @@ impl HostController {
             let mut pending = pending.lock().await;
             pending.remove(id);
             let msg = "write: connection closed".to_string();
-            if let Ok(mut err) = last_error.lock() {
-                *err = Some(HostFailure::new(msg.clone()));
-            }
+            self.record_failure(msg.clone());
             return Err(msg);
         }
         guard.sent = true;
@@ -639,16 +629,7 @@ impl HostController {
     /// Best-effort remote cancellation. Keep the send bounded: cancellation
     /// must still return when the worker's stdin pipe is what wedged.
     async fn cancel_remote(&self, id: &str) {
-        let Backend::Subprocess { conn, .. } = &self.backend else {
-            return;
-        };
-        let write_tx = {
-            let slot = conn.lock().await;
-            slot.as_ref()
-                .filter(|c| !c.dead.load(Ordering::SeqCst))
-                .map(|c| c.write_tx.clone())
-        };
-        let Some(write_tx) = write_tx else {
+        let Some(write_tx) = self.with_live_conn(|c| c.write_tx.clone()).await else {
             return;
         };
         let Ok(bytes) = (Request::Cancel { id: id.to_string() }).encode() else {
@@ -658,15 +639,9 @@ impl HostController {
     }
 
     async fn background_remote(&self, id: &str) -> Result<(), String> {
-        let Backend::Subprocess { conn, .. } = &self.backend else {
-            unreachable!()
-        };
-        let write_tx = conn
-            .lock()
+        let write_tx = self
+            .with_live_conn(|c| c.write_tx.clone())
             .await
-            .as_ref()
-            .filter(|c| !c.dead.load(Ordering::SeqCst))
-            .map(|c| c.write_tx.clone())
             .ok_or_else(|| "host connection closed".to_string())?;
         let bytes = Request::Background { id: id.to_owned() }.encode()?;
         write_tx
@@ -683,9 +658,7 @@ impl HostController {
     }
 
     fn transport_error(&self, message: &str) -> ToolResult {
-        if let Backend::Subprocess { last_error, .. } = &self.backend {
-            *last_error.lock().unwrap() = Some(HostFailure::new(message.to_string()));
-        }
+        self.record_failure(message.to_string());
         ToolResult::err(format!(
             "host {:?}: {message}. {}",
             self.name,
@@ -798,257 +771,23 @@ impl HostController {
     }
 }
 
-/// Wait until exec should finish or yield, plus transport grace. Background
-/// waiting does not impose a kill deadline; the host validates both parameters.
-/// Invalid values cannot make the transport wait indefinitely.
+/// How long the tool may take to reply, plus transport grace. Bash reports
+/// its own ceiling; other tools and invalid bash input (which the host
+/// rejects at once) get the default, so no input can make the transport
+/// wait indefinitely.
 fn response_timeout(tool_use: &ToolUse) -> Duration {
-    let timeout = tool_use
-        .input
-        .get("timeout_ms")
-        .and_then(serde_json::Value::as_u64);
-    let background = (tool_use.name == "bash"
-        && tool_use
-            .input
-            .get("action")
-            .and_then(serde_json::Value::as_str)
-            .is_none_or(|action| action == "exec")
-        && tool_use
-            .input
-            .get("command")
-            .and_then(serde_json::Value::as_str)
-            .is_some())
-    .then(|| {
-        tool_use
-            .input
-            .get("background_after")
-            .and_then(serde_json::Value::as_u64)
-    })
-    .flatten()
-    .filter(|millis| (1..=MAX_RESPONSE_TIMEOUT_MS).contains(millis));
-    let tool_ms = match (timeout, background) {
-        (Some(timeout), Some(background)) => timeout.min(background),
-        (Some(timeout), None) => timeout,
-        (None, Some(background)) => background,
-        (None, None) => DEFAULT_RESPONSE_TIMEOUT_MS,
-    }
-    .min(MAX_RESPONSE_TIMEOUT_MS);
+    let tool_ms = (tool_use.name == "bash")
+        .then(|| BashService::reply_ceiling_ms(&tool_use.input))
+        .flatten()
+        .unwrap_or(DEFAULT_RESPONSE_TIMEOUT_MS)
+        .min(MAX_RESPONSE_TIMEOUT_MS);
     Duration::from_millis(tool_ms.saturating_add(RESPONSE_GRACE_MS.max(tool_ms / 10)))
-}
-
-impl Drop for HostController {
-    fn drop(&mut self) {
-        if let Backend::Subprocess { conn, .. } = &self.backend
-            && let Ok(mut slot) = conn.try_lock()
-        {
-            *slot = None;
-        }
-    }
-}
-
-//
-// Pipe transport
-//
-
-async fn connect_with_timeout(
-    config: &HostConfig,
-    connect_timeout_secs: u64,
-) -> Result<Conn, String> {
-    let fut = connect(config);
-    match connect_timeout_secs {
-        0 => fut.await,
-        secs => match tokio::time::timeout(Duration::from_secs(secs), fut).await {
-            Ok(r) => r,
-            Err(_) => Err(format!("connect timed out after {secs}s")),
-        },
-    }
-}
-
-async fn connect(config: &HostConfig) -> Result<Conn, String> {
-    if config.command.is_empty() {
-        return Err(format!("host {:?}: empty command", config.name));
-    }
-    let program = &config.command[0];
-    let args = &config.command[1..];
-
-    let mut child = tokio::process::Command::new(program)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("spawn {:?}: {e}", config.command))?;
-
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| format!("host {:?}: missing stdin", config.name))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| format!("host {:?}: missing stdout", config.name))?;
-    let mut stdout = BufReader::new(stdout);
-
-    // Hello before demux tasks.
-    let hello = Request::Hello.encode()?;
-    write_all(&mut stdin, &hello).await?;
-    let line = read_line(&mut stdout).await?;
-    let reply = Response::decode(&line)?;
-
-    let (version, protocol) = match reply {
-        Response::HelloOk { version, protocol } => (version, protocol),
-        Response::Error { message, .. } => {
-            let _ = child.start_kill();
-            return Err(format!("hello error: {message}"));
-        }
-        other => {
-            let _ = child.start_kill();
-            return Err(format!("unexpected hello reply: {other:?}"));
-        }
-    };
-
-    // Same-version lockstep: the assumed tool catalog and the NDJSON protocol
-    // are only sound when both ends run the same build, so skew is a connect
-    // error — not a latent tool failure hours later.
-    let local_version = env!("CARGO_PKG_VERSION");
-    if version != local_version {
-        let _ = child.start_kill();
-        return Err(format!(
-            "remote myco {version} does not match local {local_version}; \
-             rebuild myco on host {:?} (see harness-ops.md in the manual)",
-            config.name
-        ));
-    }
-    if protocol != HOST_PROTOCOL_VERSION {
-        let _ = child.start_kill();
-        return Err(format!(
-            "remote host protocol {protocol} does not match local {HOST_PROTOCOL_VERSION}; rebuild myco on host {:?}",
-            config.name
-        ));
-    }
-
-    let pending: Arc<Mutex<HashMap<String, oneshot::Sender<Response>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let pending_reader = Arc::clone(&pending);
-    let activity = Arc::new(StdMutex::new(Activity::default()));
-    let reader_activity = Arc::clone(&activity);
-    let pending_writer = Arc::clone(&pending);
-    let dead = Arc::new(AtomicBool::new(false));
-    let writer_dead = Arc::clone(&dead);
-    let reader_dead = Arc::clone(&dead);
-    let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(64);
-
-    let writer = tokio::spawn(async move {
-        run_writer(stdin, write_rx, pending_writer, writer_dead).await;
-    });
-    let reader = tokio::spawn(async move {
-        run_reader(stdout, pending_reader, reader_dead, reader_activity).await;
-    });
-
-    let conn = Conn {
-        child,
-        write_tx,
-        pending,
-        dead,
-        activity,
-        reader_abort: reader.abort_handle(),
-        writer_abort: writer.abort_handle(),
-    };
-    Ok(conn)
-}
-
-async fn write_all(w: &mut ChildStdin, bytes: &[u8]) -> Result<(), String> {
-    w.write_all(bytes)
-        .await
-        .map_err(|e| format!("write: {e}"))?;
-    w.flush().await.map_err(|e| format!("flush: {e}"))?;
-    Ok(())
-}
-
-async fn run_writer(
-    mut stdin: ChildStdin,
-    mut rx: mpsc::Receiver<Vec<u8>>,
-    pending: Arc<Mutex<HashMap<String, oneshot::Sender<Response>>>>,
-    dead: Arc<AtomicBool>,
-) {
-    let exit_message = loop {
-        let Some(bytes) = rx.recv().await else {
-            break "host write channel closed".to_string();
-        };
-        if write_all(&mut stdin, &bytes).await.is_err() {
-            break "host write failed".to_string();
-        }
-    };
-    // Same contract as run_reader: poison first, then drain. A waiter that
-    // registered after the reader already drained (host died mid-hello) but
-    // before this write failed must still be failed, not left hanging.
-    dead.store(true, Ordering::SeqCst);
-    let mut pending = pending.lock().await;
-    for (_, tx) in pending.drain() {
-        let _ = tx.send(Response::Error {
-            id: None,
-            message: exit_message.clone(),
-        });
-    }
-}
-
-/// Demux loop. Exits on EOF or on a connection-fatal `Error{id:None}` from
-/// the worker (undecodable request — agent/worker version skew); either way
-/// the connection is poisoned: `dead` is set *before* draining `pending`
-/// (see `submit` for the pairing), then every waiter gets an error instead
-/// of hanging on a reply that can no longer come.
-async fn run_reader(
-    mut stdout: BufReader<ChildStdout>,
-    pending: Arc<Mutex<HashMap<String, oneshot::Sender<Response>>>>,
-    dead: Arc<AtomicBool>,
-    activity: Arc<StdMutex<Activity>>,
-) {
-    let exit_message = loop {
-        let line = match read_line(&mut stdout).await {
-            Ok(l) => l,
-            Err(_) => break "host closed stdout".to_string(),
-        };
-        let msg = match Response::decode(&line) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        match &msg {
-            Response::ToolResult { id, .. } | Response::Resources { id, .. } => {
-                activity.lock().unwrap().finish(id);
-                let mut pending = pending.lock().await;
-                if let Some(tx) = pending.remove(id) {
-                    let _ = tx.send(msg);
-                }
-            }
-            Response::Error { id: Some(id), .. } => {
-                activity.lock().unwrap().finish(id);
-                let mut pending = pending.lock().await;
-                if let Some(tx) = pending.remove(id) {
-                    let _ = tx.send(msg);
-                }
-            }
-            Response::Error { id: None, message } => {
-                break format!("host protocol error: {message}");
-            }
-            Response::HelloOk { .. } => {}
-        }
-    };
-
-    dead.store(true, Ordering::SeqCst);
-    let mut pending = pending.lock().await;
-    for (_, tx) in pending.drain() {
-        let _ = tx.send(Response::Error {
-            id: None,
-            message: exit_message.clone(),
-        });
-    }
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn response_watchdog_accounts_for_timed_exec_backgrounding() {
+    fn response_watchdog_follows_the_bash_wait_ceiling() {
         for (input, expected_ms) in [
             (
                 serde_json::json!({"command":"sleep 100", "background_after":90000}),
@@ -1079,6 +818,18 @@ mod tests {
                 serde_json::json!({"action":"read", "session_id":"x", "background_after":90000}),
                 66000,
             ),
+            (
+                serde_json::json!({"action":"read", "session_id":"x"}),
+                35000,
+            ),
+            (
+                serde_json::json!({"action":"write", "session_id":"x", "stdin":"y", "timeout_ms":1000}),
+                11000,
+            ),
+            (
+                serde_json::json!({"action":"close", "session_id":"x"}),
+                6000,
+            ),
         ] {
             let tool = ToolUse {
                 name: "bash".into(),
@@ -1100,6 +851,7 @@ mod tests {
     /// these tests are about routing and connection state, not the cap.
     const TEST_IMAGE_CAP: u64 = crate::config::DEFAULT_MAX_IMAGE_BASE64_BYTES;
     use crate::generative_model::ToolUse;
+    use crate::host::protocol::HOST_PROTOCOL_VERSION;
     use crate::test_support::text_parts;
     use serde_json::json;
     use std::time::{Duration, Instant};
@@ -1398,5 +1150,51 @@ mod tests {
             "{result:?}"
         );
         assert!(ctl.is_connected());
+    }
+
+    /// A finished owner can retain nothing on the worker, so it must stop
+    /// pinning idle reaping and stop counting toward lost sessions.
+    #[tokio::test]
+    async fn finished_owner_is_pruned_from_connection_bookkeeping() {
+        let result_line = String::from_utf8(
+            Response::ToolResult {
+                id: "1".into(),
+                result: ToolResult::text("done"),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+        let ctl = scripted_host(
+            "prune",
+            format!(
+                "read -r _hello; printf '%s\\n' '{}'; read -r _request; printf '%s\\n' '{}'; read -r _finished; read -r _done",
+                hello_line(env!("CARGO_PKG_VERSION")),
+                result_line.trim_end(),
+            ),
+        );
+        let owner = uuid::Uuid::new_v4();
+        let tool = ToolUse {
+            name: "bash".into(),
+            input: json!({"command": "true"}),
+            thought_signature: None,
+        };
+        assert!(!ctl.call(owner, tool, CancelToken::new()).await.is_error);
+        async fn tracked(ctl: &HostController, owner: uuid::Uuid) -> Option<(bool, bool)> {
+            ctl.with_live_conn(|c| {
+                let activity = c.activity.lock().unwrap();
+                (
+                    activity.owners.contains(&owner),
+                    activity.bash_sessions.contains_key(&owner),
+                )
+            })
+            .await
+        }
+        ctl.with_live_conn(|c| c.activity.lock().unwrap().bash_sessions.insert(owner, 2))
+            .await;
+        assert_eq!(tracked(&ctl, owner).await, Some((true, true)));
+
+        ctl.notify_remote_agent_finished(owner).await.unwrap();
+        assert_eq!(tracked(&ctl, owner).await, Some((false, false)));
     }
 }

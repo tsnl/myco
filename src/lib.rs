@@ -7,7 +7,7 @@
 //! [`SessionRuntime`] binds an agent to persistent context and owns live tool
 //! resources through [`Harness`]. Its lifetime is independent of any one
 //! [`Agent`] or [`Thread`], so compaction can replace context while shells stay
-//! alive. [`chat::run_session_turn`] coordinates input submission and saving.
+//! alive. [`SessionRunner`] coordinates input submission, saving, and compaction.
 //!
 //! Read the [Myco Book](https://tsnl.github.io/myco/) for setup and reuse guides,
 //! or the [code tour](https://github.com/tsnl/myco/blob/main/TOUR.md) for source
@@ -37,22 +37,18 @@ pub use agent::{
     Agent, AgentEvent, AgentInteractionError, EventSink, NullEventSink, RunOutcome, ToolExecutor,
     TraceContext,
 };
-pub use chat::{
-    CompactWorkerError, Compactor, ModelCompactor, SessionRunner, WorkflowEvent,
-    compact_subagent_prompt, run_compact_worker,
-};
-pub use config::{Config, ConfigUserSettings, load_file_config};
+pub use chat::{Compactor, ModelCompactor, SessionRunner, WorkflowEvent};
+pub use config::{Config, ConfigUserSettings};
 pub use core::{CancelToken, HostResources, ModelInfo, ToolResource, uuid_simple_hex};
 pub use harness::{
-    ExecutableCheckReport, Harness, HarnessConfig, HostConfig, HostController, HostFailure,
-    HostStatus, SshAgentPreflightReport, StartupPreflight, default_ssh_config_path,
-    ensure_remote_ssh_identities, load_ssh_host_aliases, ssh_config_host_aliases,
+    Harness, HarnessConfig, HostConfig, HostController, HostFailure, HostStatus, StartupPreflight,
+    load_ssh_host_aliases,
 };
 pub use host::HostWorker;
 pub use manual::Article as ManualArticle;
 pub use session::{
     ActiveSession, CompactOutcome, SESSION_FILE_VERSION, Session, SessionKind, SessionLink,
-    SessionListEntry, Thread, compact_thread, select_tail,
+    SessionListEntry, Thread, compact_thread,
 };
 pub use session_runtime::{RuntimeRecord, SessionRuntime};
 pub use tool_services::{

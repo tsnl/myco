@@ -24,8 +24,8 @@ use std::sync::Arc;
 
 use super::driver_core::{Slot, SlotMap, SseAccumulator};
 use super::openai_common::{
-    OpenAIBackendConfig, OpenAIUsage, image_url, images_of, reasoning_effort, text_of,
-    tool_result_text, user_content_parts,
+    OpenAIUsage, image_url, images_of, reasoning_effort, text_of, tool_result_text,
+    user_content_parts,
 };
 use super::*;
 
@@ -34,18 +34,14 @@ pub struct OpenAICompletionsGenerativeModel {
     model: ModelSpec,
     system_prompt: String,
     tools: Vec<ChatTool>,
-    backend: OpenAIBackendConfig,
+    backend: BackendConfig,
     client: reqwest::Client,
 }
 
 impl OpenAICompletionsGenerativeModel {
-    pub fn new(
-        config: GenerativeModelConfig,
-        backend: OpenAIBackendConfig,
-    ) -> Result<Arc<Self>, ModelCreationError> {
-        let auth = (!backend.auth_token.is_empty())
-            .then(|| ("authorization", format!("Bearer {}", backend.auth_token)));
-        let client = driver_core::build_client(auth, &[])?;
+    pub fn new(config: GenerativeModelConfig) -> Result<Arc<Self>, ModelCreationError> {
+        let backend = config.backend_config.clone();
+        let client = driver_core::build_client(driver_core::bearer(&backend.auth_token), &[])?;
 
         let tools = config
             .tools
@@ -75,7 +71,7 @@ impl OpenAICompletionsGenerativeModel {
             model: &self.model.api_id,
             messages,
             tools: (!self.tools.is_empty()).then_some(self.tools.as_slice()),
-            max_completion_tokens: self.backend.max_output_tokens,
+            max_completion_tokens: Some(self.backend.max_output_tokens),
             reasoning_effort: reasoning_effort(&self.model, &self.backend),
             stream: true,
             // Usage is omitted from streamed responses unless asked for.
@@ -93,17 +89,11 @@ impl OpenAICompletionsGenerativeModel {
 
 impl GenerativeModel for OpenAICompletionsGenerativeModel {
     fn generate(&self, input: &[Message]) -> AsyncStream<GenerationEvent> {
-        if let Err(error) = validate_image_sizes(input, self.model.max_image_base64_bytes) {
-            return driver_core::error_stream(error);
-        }
-        let messages = match convert_messages(&self.system_prompt, input) {
-            Ok(messages) => messages,
-            Err(e) => return driver_core::error_stream(e),
-        };
-        driver_core::spawn_generate(
-            self.completion_request(&messages),
-            StreamAccumulator::default(),
+        driver_core::generate::<StreamAccumulator>(
             "OpenAI Chat Completions",
+            input,
+            self.model.max_image_base64_bytes,
+            |input| Ok(self.completion_request(&convert_messages(&self.system_prompt, input)?)),
             self.backend.debug_dump_api_requests,
             self.backend.max_request_bytes,
         )
@@ -256,10 +246,7 @@ const TOOL_SLOT_BASE: usize = 2;
 #[derive(Default)]
 struct StreamAccumulator {
     slots: SlotMap,
-    /// Arguments accumulated per tool-use index, for the JSON check at finish.
-    tool_arguments: Vec<String>,
     saw_tool_call: bool,
-    stop_reason: Option<TurnEndReason>,
 }
 
 impl StreamAccumulator {
@@ -339,7 +326,6 @@ impl StreamAccumulator {
                     "stop" => TurnEndReason::EndTurn,
                     other => TurnEndReason::Other(format!("OpenAICompletions::{other}")),
                 };
-                self.stop_reason = Some(reason.clone());
                 out.push(MessagePart::TurnEndReason(reason));
             }
         }
@@ -402,10 +388,6 @@ impl StreamAccumulator {
 
         let arguments = call.function.and_then(|f| f.arguments).unwrap_or_default();
         if !arguments.is_empty() {
-            while self.tool_arguments.len() <= index {
-                self.tool_arguments.push(String::new());
-            }
-            self.tool_arguments[index].push_str(&arguments);
             out.push(MessagePart::ToolUseDelta(ToolUseDelta {
                 index,
                 input_json_delta: arguments,
@@ -431,17 +413,6 @@ impl SseAccumulator for StreamAccumulator {
     /// loop must read to end of stream.
     fn finished(&self) -> bool {
         false
-    }
-
-    fn finish(self) -> Result<(), GenerateError> {
-        driver_core::validate_finish(
-            "OpenAI Chat Completions",
-            self.stop_reason.is_some(),
-            self.tool_arguments
-                .iter()
-                .enumerate()
-                .map(|(i, args)| (i, args.as_str())),
-        )
     }
 }
 
@@ -839,7 +810,6 @@ mod tests {
             MessagePart::Usage(usage) => assert_eq!(usage.input_tokens, 12),
             ref other => panic!("expected usage, got {other:?}"),
         }
-        acc.finish().unwrap();
     }
 
     #[test]
@@ -888,7 +858,6 @@ mod tests {
             })))
             .unwrap();
         expect_turn_end(&items[0], TurnEndReason::ToolUse);
-        acc.finish().unwrap();
     }
 
     #[test]
@@ -1045,31 +1014,25 @@ mod tests {
     }
 
     #[test]
-    fn stream_without_finish_reason_is_malformed() {
-        let mut acc = StreamAccumulator::default();
-        acc.handle_chunk(chunk(serde_json::json!({
-            "choices": [{"delta": {"content": "truncated"}}]
-        })))
-        .unwrap();
-        let err = acc.finish().unwrap_err();
-        assert!(matches!(err, GenerateError::MalformedResponseError(_)));
-    }
-
-    #[test]
-    fn invalid_tool_arguments_fail_at_finish() {
-        let mut acc = StreamAccumulator::default();
-        acc.handle_chunk(chunk(serde_json::json!({
-            "choices": [{"delta": {"tool_calls": [
+    fn truncated_streams_assemble_into_malformed_messages() {
+        for chunks in [
+            vec![serde_json::json!({"choices": [{"delta": {"content": "truncated"}}]})],
+            vec![serde_json::json!({"choices": [{"delta": {"tool_calls": [
                 {"index": 0, "id": "call_1", "function": {"name": "bash", "arguments": "{\"a\":"}}
-            ]}, "finish_reason": "tool_calls"}]
-        })))
-        .unwrap();
-        let err = acc.finish().unwrap_err();
-        match err {
-            GenerateError::MalformedResponseError(msg) => {
-                assert!(msg.contains("arguments at index 0"), "{msg}");
+            ]}, "finish_reason": "tool_calls"}]})],
+        ] {
+            let mut acc = StreamAccumulator::default();
+            let mut message = MessageAccumulator::default();
+            message.push(&MessagePart::MessageStart).unwrap();
+            for json in chunks {
+                for part in acc.handle_chunk(chunk(json)).unwrap() {
+                    message.push(&part).unwrap();
+                }
             }
-            other => panic!("expected MalformedResponseError, got {other:?}"),
+            assert!(matches!(
+                message.finish(),
+                Err(GenerateError::MalformedResponseError(_))
+            ));
         }
     }
 }

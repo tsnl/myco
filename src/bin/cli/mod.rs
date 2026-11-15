@@ -27,8 +27,7 @@ async fn boot<S: EventSink + 'static>(args: &Args, sink: Arc<S>) -> Result<Boot,
         None => Session::new(model.spec.key.clone()),
     };
     if args.resume.is_some() && args.model.is_none() {
-        let key = myco::RuntimeRecord::latest(&session.active_thread().messages)
-            .map_or_else(|| session.model.clone(), |record| record.model.key);
+        let key = myco::RuntimeRecord::saved_model_key(&session);
         model = config
             .models
             .get(&key)

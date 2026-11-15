@@ -19,7 +19,7 @@
 use std::io::Write;
 
 use super::HostConfig;
-use super::ssh::{SshAgentPreflightReport, ensure_remote_ssh_identities, ssh_host_targets};
+use super::ssh::{SshAgentPreflightReport, ensure_remote_ssh_identities};
 use crate::external_command::{ExternalCommand, StartupCheck, expected_at_startup};
 use crate::prompts::prelude_oversize;
 
@@ -64,7 +64,8 @@ impl ExecutableCheckReport {
 
 /// Probe the agent machine for every expected executable.
 pub fn check_expected_executables(hosts: &[HostConfig]) -> ExecutableCheckReport {
-    let need_ssh = !ssh_host_targets(hosts).is_empty();
+    // Every remote is SSH-backed.
+    let need_ssh = !hosts.is_empty();
     ExecutableCheckReport {
         missing: missing_executables(need_ssh, |c| c.is_installed()),
     }

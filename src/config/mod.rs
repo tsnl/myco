@@ -36,16 +36,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::generative_model::{
-    AnthropicBackendConfig, BackendConfig, CatalogModel, ModelCatalog, ModelSpec,
-    OpenAIBackendConfig, Protocol, RetryPolicy, ThinkingMode,
+    BackendConfig, CatalogModel, ModelCatalog, ModelSpec, RetryPolicy, ThinkingMode,
 };
 use crate::harness::{HarnessConfig, load_ssh_host_aliases};
 
 pub mod file;
-pub use file::{
-    AuthEntry, FileConfig, GatewayEntry, ModelEntry, RetryEntry, load_file_config,
-    parse_file_config_str,
-};
+use file::{AuthEntry, FileConfig, RetryEntry, load_file_config};
 
 /// Default per-generate output token cap when a model entry sets none.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: usize = 8192;
@@ -401,31 +397,13 @@ fn resolve_catalog(
             });
         let retry = resolve_retry(entry.retry.or_else(|| gateway.and_then(|g| g.retry)))
             .map_err(|error| format!("model `{key}` retry: {error}"))?;
-        let backend = match protocol {
-            Protocol::AnthropicMessages => BackendConfig::Anthropic(AnthropicBackendConfig {
-                anthropic_base_url: base_url,
-                anthropic_auth_token: token,
-                max_tokens_per_generate: max_output,
-                max_request_bytes,
-                retry,
-                ..Default::default()
-            }),
-            // Both OpenAI dialects take the same settings; the variant only
-            // records which wire format the gateway serves.
-            Protocol::OpenAIResponses | Protocol::OpenAICompletions => {
-                let openai = OpenAIBackendConfig {
-                    base_url,
-                    auth_token: token,
-                    max_output_tokens: Some(max_output),
-                    max_request_bytes,
-                    retry,
-                    ..Default::default()
-                };
-                match protocol {
-                    Protocol::OpenAICompletions => BackendConfig::OpenAICompletions(openai),
-                    _ => BackendConfig::OpenAIResponses(openai),
-                }
-            }
+        let backend = BackendConfig {
+            base_url,
+            auth_token: token,
+            max_output_tokens: max_output,
+            max_request_bytes,
+            retry,
+            ..Default::default()
         };
 
         entries.insert(
@@ -506,7 +484,8 @@ fn resolve_default_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use file::model_toml;
+    use crate::generative_model::Protocol;
+    use file::{model_toml, parse_file_config_str};
 
     fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |key| {
@@ -587,14 +566,10 @@ context_window = 200_000
         assert_eq!(kimi.spec.protocol, Protocol::OpenAIResponses);
         assert_eq!(kimi.spec.thinking, ThinkingMode::Effort);
         assert_eq!(kimi.spec.context_window_tokens, 1_000_000);
-        match &kimi.backend {
-            BackendConfig::OpenAIResponses(b) => {
-                assert_eq!(b.base_url, "https://openrouter.ai/api/v1");
-                assert_eq!(b.auth_token, "or-key");
-                assert_eq!(b.max_output_tokens, Some(DEFAULT_MAX_OUTPUT_TOKENS));
-            }
-            other => panic!("expected OpenAI Responses backend, got {other:?}"),
-        }
+        let b = &kimi.backend;
+        assert_eq!(b.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(b.auth_token, "or-key");
+        assert_eq!(b.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
     }
 
     #[test]
@@ -603,13 +578,9 @@ context_window = 200_000
         let local = cfg.models.get("haiku-local").unwrap();
         assert_eq!(local.spec.protocol, Protocol::AnthropicMessages);
         assert_eq!(local.spec.thinking, ThinkingMode::Budget);
-        match &local.backend {
-            BackendConfig::Anthropic(b) => {
-                assert_eq!(b.anthropic_base_url, "http://localhost:8080");
-                assert_eq!(b.anthropic_auth_token, "");
-            }
-            other => panic!("expected Anthropic backend, got {other:?}"),
-        }
+        let b = &local.backend;
+        assert_eq!(b.base_url, "http://localhost:8080");
+        assert_eq!(b.auth_token, "");
     }
 
     #[test]
@@ -675,12 +646,7 @@ context_window = 1000
                 ("inline", 2_000_000),
                 ("default", 30_000_000),
             ] {
-                let limit = match &cfg.models.get(key).unwrap().backend {
-                    BackendConfig::Anthropic(b) => b.max_request_bytes,
-                    BackendConfig::OpenAIResponses(b) | BackendConfig::OpenAICompletions(b) => {
-                        b.max_request_bytes
-                    }
-                };
+                let limit = cfg.models.get(key).unwrap().backend.max_request_bytes;
                 assert_eq!(limit, expected, "{protocol}/{key}");
             }
         }
@@ -784,24 +750,20 @@ max_output_tokens = 4096
         let entry = cfg.models.get("local-qwen").unwrap();
         assert_eq!(entry.spec.protocol, Protocol::OpenAICompletions);
         assert_eq!(entry.spec.thinking, ThinkingMode::None);
-        match &entry.backend {
-            BackendConfig::OpenAICompletions(b) => {
-                assert_eq!(b.base_url, "http://localhost:11434/v1");
-                assert_eq!(b.auth_token, "");
-                assert_eq!(b.max_output_tokens, Some(4096));
-            }
-            other => panic!("expected OpenAI Chat Completions backend, got {other:?}"),
-        }
+        let b = &entry.backend;
+        assert_eq!(b.base_url, "http://localhost:11434/v1");
+        assert_eq!(b.auth_token, "");
+        assert_eq!(b.max_output_tokens, 4096);
     }
 
     #[test]
     fn literal_auth_string_is_the_token() {
         let toml_text = model_toml("proxy", &[r#"auth = "sk-inline-secret""#]);
         let cfg = resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).unwrap();
-        match &cfg.models.get("proxy").unwrap().backend {
-            BackendConfig::OpenAIResponses(b) => assert_eq!(b.auth_token, "sk-inline-secret"),
-            other => panic!("unexpected backend {other:?}"),
-        }
+        assert_eq!(
+            cfg.models.get("proxy").unwrap().backend.auth_token,
+            "sk-inline-secret"
+        );
     }
 
     #[test]
@@ -820,10 +782,10 @@ max_output_tokens = 4096
             },
         )
         .unwrap();
-        match &cfg.models.get("proxy").unwrap().backend {
-            BackendConfig::OpenAIResponses(b) => assert_eq!(b.auth_token, "sekrit"),
-            other => panic!("unexpected backend {other:?}"),
-        }
+        assert_eq!(
+            cfg.models.get("proxy").unwrap().backend.auth_token,
+            "sekrit"
+        );
 
         // Unreadable file: resolve succeeds, use-time error names the path.
         let cfg = resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).unwrap();
@@ -852,14 +814,11 @@ auth = { source = "none" }
 context_window = 1000
 "#;
         let cfg = resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).unwrap();
-        match &cfg.models.get("inherits").unwrap().backend {
-            BackendConfig::OpenAIResponses(b) => assert_eq!(b.auth_token, "sk-gateway-token"),
-            other => panic!("unexpected backend {other:?}"),
-        }
-        match &cfg.models.get("opts-out").unwrap().backend {
-            BackendConfig::OpenAIResponses(b) => assert_eq!(b.auth_token, ""),
-            other => panic!("unexpected backend {other:?}"),
-        }
+        assert_eq!(
+            cfg.models.get("inherits").unwrap().backend.auth_token,
+            "sk-gateway-token"
+        );
+        assert_eq!(cfg.models.get("opts-out").unwrap().backend.auth_token, "");
     }
 
     #[test]
@@ -1130,10 +1089,7 @@ base_url = "https://h"
 context_window = 1000
 "#;
         let cfg = resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).unwrap();
-        let retry_of = |key: &str| match &cfg.models.get(key).unwrap().backend {
-            BackendConfig::OpenAIResponses(b) => b.retry,
-            other => panic!("unexpected backend {other:?}"),
-        };
+        let retry_of = |key: &str| cfg.models.get(key).unwrap().backend.retry;
         let default = crate::generative_model::RetryPolicy::default();
 
         // Gateway values apply; fields it left unset keep their defaults.
@@ -1174,10 +1130,7 @@ context_window = 1000
 max_attempts = 0
 "#;
         let cfg = resolve_toml(toml_text, ConfigUserSettings::default(), env_of(&[])).unwrap();
-        match &cfg.models.get("x").unwrap().backend {
-            BackendConfig::OpenAIResponses(b) => assert_eq!(b.retry.max_attempts, 1),
-            other => panic!("unexpected backend {other:?}"),
-        }
+        assert_eq!(cfg.models.get("x").unwrap().backend.retry.max_attempts, 1);
     }
 
     #[test]

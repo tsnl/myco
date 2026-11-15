@@ -44,6 +44,12 @@ impl Identity {
     }
 }
 
+/// Service requests name a session by its full id, never a prefix: the
+/// 32 lowercase hex digits of a simple UUID.
+pub fn is_full_session_id(id: &str) -> bool {
+    id.len() == 32 && id.to_ascii_lowercase() == id && Uuid::parse_str(id).is_ok()
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Submit {
@@ -83,5 +89,19 @@ mod tests {
         changed = identity;
         changed.build.push_str("-other");
         assert!(changed.validate().is_err());
+    }
+
+    #[test]
+    fn only_full_lowercase_simple_ids_name_a_service_session() {
+        let id = Uuid::new_v4();
+        assert!(is_full_session_id(&id.as_simple().to_string()));
+        for other in [
+            id.as_simple().to_string().to_uppercase(),
+            id.as_hyphenated().to_string(),
+            id.as_simple().to_string()[..8].to_string(),
+            "g".repeat(32),
+        ] {
+            assert!(!is_full_session_id(&other), "{other}");
+        }
     }
 }

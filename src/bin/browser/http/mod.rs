@@ -23,7 +23,6 @@ use super::{
     weather::{Coordinates, Weather},
 };
 
-#[path = "service_http.rs"]
 mod service;
 
 impl IntoResponse for Error {

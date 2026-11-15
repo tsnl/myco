@@ -8,10 +8,12 @@ use std::sync::Arc;
 use crate::core::Async;
 use crate::generative_model::{self, ToolResult};
 use crate::session::{
-    ActiveSession, Session, SessionLink, format_link_one_line, format_session_detail,
-    format_session_list_line, normalize_pr_url, parse_pr_fields, search_sessions,
+    ActiveSession, Session, SessionLink, normalize_pr_url, parse_pr_fields, search_sessions,
 };
 
+use super::session_format::{
+    format_link_one_line, format_session_detail, format_session_list_line,
+};
 use super::{HostDispatchContext, ToolService};
 
 const TOOL_DESCRIPTION: &str = r#"
@@ -199,14 +201,12 @@ impl SessionMetaTool {
                         an empty string clears it"
                 .into());
         };
-        self.active.with_mut(|session| {
+        self.active.update(|session| {
             if title.trim().is_empty() {
                 session.set_title(None)?;
             } else {
                 session.set_title(Some(title))?;
             }
-            session.touch();
-            session.save()?;
             Ok(format!(
                 "title set to {}\npath={}\n",
                 session
@@ -220,10 +220,8 @@ impl SessionMetaTool {
     }
 
     fn action_set_scratchpad(&self, text: String) -> Result<String, String> {
-        self.active.with_mut(|session| {
+        self.active.update(|session| {
             session.set_scratchpad(text)?;
-            session.touch();
-            session.save()?;
             Ok(format!(
                 "scratchpad updated ({} bytes)\npath={}\n",
                 session.scratchpad.len(),
@@ -269,10 +267,8 @@ impl SessionMetaTool {
             }
         };
 
-        self.active.with_mut(|session| {
+        self.active.update(|session| {
             session.upsert_link(link.clone())?;
-            session.touch();
-            session.save()?;
             Ok(format!(
                 "link upserted: {}\nlinks={}\npath={}\n",
                 format_link_one_line(&link),
@@ -283,7 +279,7 @@ impl SessionMetaTool {
     }
 
     fn action_remove_link(&self, input: Input) -> Result<String, String> {
-        self.active.with_mut(|session| {
+        self.active.update(|session| {
             let removed = if let Some(index) = input.index {
                 session.remove_link_at(index)?
             } else if input.url.is_some() || input.host.is_some() {
@@ -295,8 +291,6 @@ impl SessionMetaTool {
             } else {
                 return Err("remove_link requires index, or url, or host (+ optional path)".into());
             };
-            session.touch();
-            session.save()?;
             Ok(format!(
                 "removed: {}\nlinks remaining={}\npath={}\n",
                 format_link_one_line(&removed),
@@ -584,6 +578,68 @@ mod tests {
             .await;
         assert!(missing.is_error, "{missing:?}");
         assert!(result_text(&missing).contains("action"), "{missing:?}");
+    }
+
+    /// A mutation the model was told failed must not reach disk with the next
+    /// checkpoint, which saves the live session as a whole.
+    #[tokio::test]
+    async fn failed_saves_leave_live_metadata_unchanged() {
+        let home = temp_home("meta-failed-save");
+        let mut document = Session::new("claude-haiku-4-5");
+        document.title = Some("Original".into());
+        document.scratchpad = "original notes".into();
+        document
+            .upsert_link(SessionLink::Worktree {
+                host: "local".into(),
+                path: "/original".into(),
+                branch: None,
+                note: None,
+            })
+            .unwrap();
+        document.save().unwrap();
+        let (tool, active) = tool_with_session(document);
+        let tool = Arc::new(tool);
+        let before = serde_json::to_value(active.snapshot()).unwrap();
+
+        let store = home.path().join("session");
+        std::fs::rename(&store, home.path().join("saved-store")).unwrap();
+        std::fs::write(&store, "storage unavailable").unwrap();
+        for input in [
+            serde_json::json!({"action": "set_title", "title": "Changed"}),
+            serde_json::json!({"action": "set_scratchpad", "scratchpad": "changed"}),
+            serde_json::json!({"action": "add_link", "link_kind": "worktree",
+                "host": "local", "path": "/changed"}),
+            serde_json::json!({"action": "remove_link", "index": 0}),
+        ] {
+            let result = tool
+                .clone()
+                .dispatch_tool_use(
+                    generative_model::ToolUse {
+                        name: "session_meta".into(),
+                        input: input.clone(),
+                        thought_signature: None,
+                    },
+                    HostDispatchContext::new(uuid::Uuid::nil(), CancelToken::new()),
+                )
+                .await;
+            assert!(result.is_error, "{input}: {result:?}");
+            assert_eq!(
+                serde_json::to_value(active.snapshot()).unwrap(),
+                before,
+                "{input}"
+            );
+        }
+        std::fs::remove_file(&store).unwrap();
+        std::fs::rename(home.path().join("saved-store"), &store).unwrap();
+
+        let thread = active.with(|session| session.active_thread().id.clone());
+        active
+            .persist_agent_state(&thread, &crate::agent::AgentState::default(), true, None)
+            .unwrap();
+        let saved = Session::load(&active.snapshot().json_path()).unwrap();
+        assert_eq!(saved.title.as_deref(), Some("Original"));
+        assert_eq!(saved.scratchpad, "original notes");
+        assert_eq!(saved.links.len(), 1);
     }
 
     #[tokio::test]

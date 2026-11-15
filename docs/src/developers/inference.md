@@ -10,11 +10,12 @@ and [`Message`](../api/myco_model/enum.Message.html).
 
 ## Construct a driver
 
-`myco_model::new` takes a `ModelSpec`, matching `BackendConfig`, system prompt,
-and tool catalog. `ModelSpec::key` is your application's name for a model;
-`api_id` is what the endpoint receives. The backend variant must match the
-spec's protocol. Credentials and endpoint settings are supplied directly;
-the library does not read `~/.myco` or load `.env` for you.
+`myco_model::new` takes a `ModelSpec`, a `BackendConfig`, system prompt, and
+tool catalog. `ModelSpec::key` is your application's name for a model;
+`api_id` is what the endpoint receives, and `protocol` picks the driver. The
+`BackendConfig` holds the endpoint, credential, and request limits for any
+protocol. Credentials and endpoint settings are supplied directly; the
+library does not read `~/.myco` or load `.env` for you.
 
 This complete example sends one prompt to a Chat Completions compatible
 endpoint, streams text, and validates the completed response:

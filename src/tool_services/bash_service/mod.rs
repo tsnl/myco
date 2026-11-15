@@ -15,13 +15,27 @@ use crate::external_command::BASH;
 use uuid::Uuid;
 
 mod background;
+mod capture;
 mod command_policy;
+mod input;
 mod operation;
 mod process;
+mod snapshot;
 
 use background::{BackgroundReason, Promotion};
+use capture::{
+    CappedCapture, EXEC_CAPTURE_CAP, cap_session_stream, drain_capture, kill_and_capture,
+    render_capture, render_exec_capture, spawn_reader,
+};
+#[cfg(test)]
+use capture::{SESSION_STREAM_CAP, truncate_middle_lossy};
+pub(crate) use command_policy::effective_commands;
+use input::{
+    Action, EMPTY_INPUT_ERROR, Input, SignalKind, Step, Wait, json_type_name, resolve_action,
+};
 use operation::SessionOperation;
 use process::ProcessOwner;
+use snapshot::{SessionSnapshot, SnapshotStatus, process_status};
 
 /// Default hard wait ceiling for a single session start/write/read.
 ///
@@ -49,6 +63,12 @@ const DEFAULT_IDLE_MS: u64 = 300;
 const DEFAULT_MAX_BYTES: usize = 4_096;
 /// Soft cap on concurrent sessions per harness.
 const MAX_SESSIONS: usize = 8;
+/// Final drain when a session is closed.
+const CLOSE_DRAIN: Wait = Wait {
+    timeout_ms: 1_000,
+    idle_ms: 100,
+    max_bytes: DEFAULT_MAX_BYTES,
+};
 
 /// Executes bash commands on behalf of the agent.
 ///
@@ -75,83 +95,7 @@ impl BashService {
     pub fn specs() -> Vec<generative_model::ToolSpec> {
         vec![generative_model::ToolSpec {
             name: "bash".to_string(),
-            description: format!(
-                "Executes bash commands and manages long-lived interactive sessions \
-                (shells, Python REPLs, SSH, etc.).\n\n\
-                Actions:\n\
-                - exec (default): one-shot `bash -c <command>`; waits for process exit \
-                or `background_after`. Without background_after, `timeout_ms` defaults to \
-                {DEFAULT_EXEC_TIMEOUT_MS} ms / {exec_default_s}s; an explicit timeout is \
-                capped at {MAX_EXEC_TIMEOUT_MS} ms / {exec_max_min} min. \
-                Returns exit code, signal, stdout, stderr. Each stream is capped at \
-                `max_bytes` (default {DEFAULT_MAX_BYTES}): over the cap, the head and tail \
-                are kept and the middle is elided with a `[... N bytes omitted ...]` marker. \
-                Elided exec output is unrecoverable — pipe through grep/head/tail or \
-                redirect to a file when you expect a flood, or raise `max_bytes` when you \
-                truly need more. Prefer `exec` for finite commands (builds, tests, \
-                installs). Use `background_after` in milliseconds (1..={MAX_EXEC_TIMEOUT_MS}) \
-                to return a session_id after waiting while the same command keeps running. \
-                Prefer this over adding shell timeout wrappers or `timeout_ms` merely to \
-                stop waiting: inspect later with read and decide whether to wait or close. \
-                With background_after, an omitted timeout imposes no kill deadline. \
-                An explicitly supplied `timeout_ms` remains a hard kill deadline after \
-                automatic backgrounding. If timeout expires before or at background_after, it kills \
-                the command as usual. Without background_after, exec keeps its existing \
-                foreground timeout. A user can background a running call from the browser; it then returns \
-                a session_id for read/signal/close, and its original timeout no longer \
-                applies. Continue other work instead of immediately waiting on it again.\n\
-                - start: spawn a long-lived process **in the background**. Requires \
-                `session_id`. `command` is the program line (default: `bash -i`). Optional \
-                `stdin` is written after spawn. Returns a snapshot; the process keeps \
-                running.\n\
-                - write: write `stdin` to a session, then collect a snapshot (process stays \
-                alive).\n\
-                - read: collect more output without writing (process stays alive).\n\
-                - signal: deliver a signal to the session's **process group**, then return \
-                a snapshot like `write`. `signal` is `int` (default), `term`, or `hup`; \
-                SIGKILL is `close`. `int` is a terminal Ctrl-C: a child that handles SIGINT \
-                survives and stays writable — a nested `myco` cancels its in-flight turn and \
-                returns to its prompt, so this interrupts a child without losing its \
-                session. A child with **no** handler dies instead (`exit_signal: 2`); \
-                sessions have no job control, so there is no separate foreground group to \
-                signal and the whole group gets it. Either way the session is not reaped — \
-                that is still `close`.\n\
-                - close: kill and reap a session.\n\
-                - list: list live sessions. The `start` admission limit ({MAX_SESSIONS} \
-                retained sessions) is shared by every agent on the host while `list` shows \
-                only yours. Promoting an already-running exec can exceed that limit. If \
-                `start` reports too many sessions, close your own unused sessions and retry.\n\n\
-                For start/write/read, the child runs in the background. `start` without initial \
-                stdin returns after an idle gap even when the child is silent; `write` / `read` \
-                wait for output first. Calls otherwise return after the output goes idle \
-                (`idle_ms`, default {DEFAULT_IDLE_MS}), a hard timeout \
-                (`timeout_ms`, default {DEFAULT_TIMEOUT_MS} ms / {session_default_s}s; max \
-                {MAX_TIMEOUT_MS} ms / {session_max_min} min), a byte cap (`max_bytes`, \
-                default {DEFAULT_MAX_BYTES}), or completion of the process and its output \
-                streams — then returns partial output \
-                with status timed_out / truncated / running while the session stays live. \
-                Raise `timeout_ms` when you need to wait longer for quiet interactive \
-                programs. `exit_code` / `exit_signal` describe the launched process; \
-                `status: exited` means that process exited and both output streams closed. \
-                Descendants may keep output open; use `read` for later output or `close` \
-                to stop the process group.\n\n\
-                **Managed jobs:** recognized nohup invocations in exec/start command fields are rejected \
-                before execution. Run the program in the foreground of the command and let \
-                background_after or start retain it. Avoid nohup, disown, and shell `&` for \
-                detached work: managed handles keep status, output, ownership, and stop controls \
-                visible. Use list to rediscover handles and read to collect later output.\n\n\
-                **Terminal:** sessions use pipes, with no TTY or job control. Prefer \
-                `host=<alias>` with a plain shell (`command: \"bash\"` or `\"bash -l\"`) \
-                for long-lived remote work. Check whether a program supports noninteractive \
-                operation before using raw `ssh -tt`; many programs work without a terminal.\n\n\
-                **Working directory:** use `cd /path && command` in `exec` / `start`. \
-                A directory change in an exec call affects only that call; a live shell \
-                session keeps directory changes made through `write`.",
-                exec_default_s = DEFAULT_EXEC_TIMEOUT_MS / 1000,
-                exec_max_min = MAX_EXEC_TIMEOUT_MS / 60_000,
-                session_default_s = DEFAULT_TIMEOUT_MS / 1000,
-                session_max_min = MAX_TIMEOUT_MS / 60_000,
-            ),
+            description: input::tool_description(),
             input_schema: super::tool_input_schema::<Input>(),
         }]
     }
@@ -206,10 +150,7 @@ impl ToolService for BashService {
     ) -> Option<std::path::PathBuf> {
         let input: Input = serde_json::from_value(tool_use.input.clone()).ok()?;
         let session_id = match resolve_action(&input).ok()? {
-            Action::Start { session_id, .. }
-            | Action::Write { session_id, .. }
-            | Action::Read { session_id, .. }
-            | Action::Signal { session_id, .. } => session_id,
+            Action::Start { session_id, .. } | Action::Interact { session_id, .. } => session_id,
             _ => return None,
         };
         let sessions = self.sessions();
@@ -276,67 +217,16 @@ impl BashService {
                 session_id,
                 command,
                 stdin,
-                timeout_ms,
-                idle_ms,
-                max_bytes,
+                wait,
             } => {
-                self.session_start(
-                    &session_id,
-                    owner,
-                    command.as_deref(),
-                    stdin.as_deref(),
-                    timeout_ms,
-                    idle_ms,
-                    max_bytes,
-                    ctx,
-                )
-                .await
-            }
-            Action::Write {
-                session_id,
-                stdin,
-                timeout_ms,
-                idle_ms,
-                max_bytes,
-            } => {
-                self.session_write(
-                    &session_id,
-                    owner,
-                    &stdin,
-                    timeout_ms,
-                    idle_ms,
-                    max_bytes,
-                    ctx,
-                )
-                .await
-            }
-            Action::Read {
-                session_id,
-                timeout_ms,
-                idle_ms,
-                max_bytes,
-            } => {
-                self.session_read(&session_id, owner, timeout_ms, idle_ms, max_bytes, ctx)
+                self.session_start(&session_id, command.as_deref(), stdin.as_deref(), wait, ctx)
                     .await
             }
-            Action::Signal {
+            Action::Interact {
                 session_id,
-                signal,
-                timeout_ms,
-                idle_ms,
-                max_bytes,
-            } => {
-                self.session_signal(
-                    &session_id,
-                    owner,
-                    signal,
-                    timeout_ms,
-                    idle_ms,
-                    max_bytes,
-                    ctx,
-                )
-                .await
-            }
+                step,
+                wait,
+            } => self.session_interact(&session_id, step, wait, ctx).await,
             Action::Close { session_id } => self.session_close(&session_id, owner).await,
             Action::List => self.session_list(owner),
         }
@@ -399,8 +289,10 @@ impl BashService {
             notify: Notify::new(),
             generation: AtomicU64::new(0),
         });
-        let stdout_task = spawn_reader(stdout, StreamKind::Stdout, shared.clone());
-        let stderr_task = spawn_reader(stderr, StreamKind::Stderr, shared.clone());
+        let readers = [
+            spawn_reader(stdout, StreamKind::Stdout, shared.clone()),
+            spawn_reader(stderr, StreamKind::Stderr, shared.clone()),
+        ];
 
         // When cancel/timeout wins, select drops the wait future so we can
         // kill the process group + wait without a conflicting &mut Child borrow.
@@ -432,11 +324,8 @@ impl BashService {
                 self.background_exec(command, ctx.agent_id, child, shared, max_bytes, promotion)
             }
             Outcome::Cancelled => {
-                kill_process_group(child_pid);
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                drain_capture(stdout_task, stderr_task).await;
-                let (out, err) = render_exec_capture(&shared, max_bytes);
+                let (out, err) =
+                    kill_and_capture(&mut child, child_pid, readers, &shared, max_bytes).await;
                 generative_model::ToolResult::err(format!(
                     "exec cancelled\n\
                      stdout:\n{out}\n\
@@ -446,11 +335,8 @@ impl BashService {
             Outcome::TimedOut => {
                 let timeout_ms =
                     timeout_ms.expect("no deadline without an explicit or legacy timeout");
-                kill_process_group(child_pid);
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                drain_capture(stdout_task, stderr_task).await;
-                let (out, err) = render_exec_capture(&shared, max_bytes);
+                let (out, err) =
+                    kill_and_capture(&mut child, child_pid, readers, &shared, max_bytes).await;
                 generative_model::ToolResult::text(format!(
                     "Exit code: None\n\
                      Termination signal: None\n\
@@ -465,7 +351,7 @@ impl BashService {
                 ))
             }
             Outcome::Status(status) => {
-                drain_capture(stdout_task, stderr_task).await;
+                drain_capture(readers).await;
                 let (out, err) = render_exec_capture(&shared, max_bytes);
                 match status {
                     Ok(status) => generative_model::ToolResult::text(format!(
@@ -488,22 +374,14 @@ impl BashService {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn session_start(
         &self,
         session_id: &str,
-        owner: Uuid,
         command: Option<&str>,
         stdin: Option<&str>,
-        timeout_ms: u64,
-        idle_ms: u64,
-        max_bytes: usize,
+        wait: Wait,
         ctx: HostDispatchContext,
     ) -> generative_model::ToolResult {
-        if session_id.is_empty() {
-            return generative_model::ToolResult::err("session_id must be non-empty");
-        }
-
         // Reject duplicates and enforce session cap before spawning.
         {
             let sessions = self.sessions();
@@ -538,27 +416,9 @@ impl BashService {
             }
         };
 
-        let child_stdin = match child.stdin.take() {
-            Some(s) => s,
-            None => {
-                let _ = child.kill().await;
-                return generative_model::ToolResult::err("child stdin missing after spawn");
-            }
-        };
-        let stdout = match child.stdout.take() {
-            Some(s) => s,
-            None => {
-                let _ = child.kill().await;
-                return generative_model::ToolResult::err("child stdout missing after spawn");
-            }
-        };
-        let stderr = match child.stderr.take() {
-            Some(s) => s,
-            None => {
-                let _ = child.kill().await;
-                return generative_model::ToolResult::err("child stderr missing after spawn");
-            }
-        };
+        let child_stdin = child.stdin.take().expect("stdin piped");
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
 
         let shared = Arc::new(SessionShared {
             instance_id: Uuid::new_v4().to_string(),
@@ -575,7 +435,7 @@ impl BashService {
         let process = ProcessOwner::retain(child, Arc::clone(&shared));
 
         let session = Session {
-            owner,
+            owner: ctx.agent_id,
             cmdline: cmdline.to_string(),
             stdin: Arc::new(Mutex::new(Some(child_stdin))),
             shared,
@@ -611,41 +471,8 @@ impl BashService {
             ));
         }
 
-        let snapshot = operation
-            .collect(
-                timeout_ms,
-                idle_ms,
-                max_bytes,
-                stdin.is_none_or(str::is_empty),
-                ctx,
-            )
-            .await;
-        match snapshot {
-            Ok(s) => s.tool_result(),
-            Err(e) => generative_model::ToolResult::err(e),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn session_write(
-        &self,
-        session_id: &str,
-        owner: Uuid,
-        stdin: &str,
-        timeout_ms: u64,
-        idle_ms: u64,
-        max_bytes: usize,
-        ctx: HostDispatchContext,
-    ) -> generative_model::ToolResult {
-        let operation = match self.operation(session_id, owner) {
-            Ok(operation) => operation,
-            Err(error) => return generative_model::ToolResult::err(error),
-        };
-        if let Err(e) = operation.write(stdin).await {
-            return generative_model::ToolResult::err(e);
-        }
         match operation
-            .collect(timeout_ms, idle_ms, max_bytes, false, ctx)
+            .collect(wait, stdin.is_none_or(str::is_empty), &ctx)
             .await
         {
             Ok(s) => s.tool_result(),
@@ -653,66 +480,42 @@ impl BashService {
         }
     }
 
-    async fn session_read(
+    /// Write, read, or signal a live session, then collect a snapshot. A
+    /// signal's interesting output is the child's *reaction*, so it is
+    /// collected like a write's instead of costing the caller a round trip.
+    async fn session_interact(
         &self,
         session_id: &str,
-        owner: Uuid,
-        timeout_ms: u64,
-        idle_ms: u64,
-        max_bytes: usize,
+        step: Step,
+        wait: Wait,
         ctx: HostDispatchContext,
     ) -> generative_model::ToolResult {
-        let operation = match self.operation(session_id, owner) {
+        let operation = match self.operation(session_id, ctx.agent_id) {
             Ok(operation) => operation,
             Err(error) => return generative_model::ToolResult::err(error),
         };
-        match operation
-            .collect(timeout_ms, idle_ms, max_bytes, false, ctx)
-            .await
-        {
-            Ok(s) => s.tool_result(),
-            Err(e) => generative_model::ToolResult::err(e),
-        }
-    }
-
-    /// Deliver `signal` to a session's process group, then collect a snapshot
-    /// like `write` does — the interesting output is the child's *reaction*, so
-    /// making the caller `read` separately would just cost a round trip.
-    #[allow(clippy::too_many_arguments)]
-    async fn session_signal(
-        &self,
-        session_id: &str,
-        owner: Uuid,
-        signal: SignalKind,
-        timeout_ms: u64,
-        idle_ms: u64,
-        max_bytes: usize,
-        ctx: HostDispatchContext,
-    ) -> generative_model::ToolResult {
-        let operation = match self.operation(session_id, owner) {
-            Ok(operation) => operation,
-            Err(error) => return generative_model::ToolResult::err(error),
+        let acted = match &step {
+            Step::Write(stdin) => operation.write(stdin).await,
+            Step::Read => Ok(()),
+            Step::Signal(signal) => operation.signal(*signal),
         };
-        if let Err(error) = operation.signal(signal) {
+        if let Err(error) = acted {
             return generative_model::ToolResult::err(error);
         }
-
-        match operation
-            .collect(timeout_ms, idle_ms, max_bytes, false, ctx)
-            .await
-        {
-            Ok(s) => {
-                let mut text = s.format();
-                text.push_str(&format!(
-                    "\n(sent {} to the session process group)\n",
-                    signal.name()
-                ));
-                let mut result = s.tool_result();
-                result.content = vec![generative_model::Content::Text { text }];
-                result
-            }
-            Err(e) => generative_model::ToolResult::err(e),
+        let snapshot = match operation.collect(wait, false, &ctx).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return generative_model::ToolResult::err(error),
+        };
+        let mut result = snapshot.tool_result();
+        if let Step::Signal(signal) = step {
+            let text = format!(
+                "{}\n(sent {} to the session process group)\n",
+                snapshot.format(),
+                signal.name()
+            );
+            result.content = vec![generative_model::Content::Text { text }];
         }
+        result
     }
 
     async fn session_close(&self, session_id: &str, owner: Uuid) -> generative_model::ToolResult {
@@ -740,19 +543,10 @@ impl BashService {
         *lock_unpoisoned(&session.stdin) = None;
 
         // Drain any final buffered output (short wait).
-        let snapshot = collect_output(
-            &session.shared,
-            session_id,
-            session.owner,
-            &session.cmdline,
-            1_000,
-            100,
-            DEFAULT_MAX_BYTES,
-            false,
-            &crate::core::CancelToken::new(),
-            &crate::core::CancelToken::new(),
-        )
-        .await;
+        let snapshot = session
+            .operation(session_id)
+            .collect_output(CLOSE_DRAIN, false, &CancelToken::new(), &CancelToken::new())
+            .await;
 
         drop(session);
 
@@ -770,29 +564,15 @@ impl BashService {
         let mut lines = Vec::new();
         lines.push(format!("sessions: {}", mine.len()));
         for (id, s) in mine {
-            let exited = s
-                .shared
-                .buffer
-                .lock()
-                .ok()
-                .and_then(|b| {
-                    if b.exited {
-                        let output = if b.is_finished() {
-                            ""
-                        } else {
-                            "; output still open"
-                        };
-                        Some(format!("exited({:?}){output}", b.exit_code))
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_else(|| "running".into());
-            let last_used = s
-                .last_used
-                .lock()
-                .map(|t| t.elapsed().as_secs())
-                .unwrap_or(0);
+            let exited = {
+                let b = lock_unpoisoned(&s.shared.buffer);
+                match (b.exited, b.is_finished()) {
+                    (false, _) => "running".into(),
+                    (true, true) => format!("exited({:?})", b.exit_code),
+                    (true, false) => format!("exited({:?}); output still open", b.exit_code),
+                }
+            };
+            let last_used = lock_unpoisoned(&s.last_used).elapsed().as_secs();
             lines.push(format!(
                 "- id={id} owner={} cmdline={:?} status={exited} last_used_s_ago={last_used} created_s_ago={}",
                 crate::core::uuid_simple_hex(s.owner),
@@ -895,898 +675,6 @@ impl OutputBuffer {
 enum StreamKind {
     Stdout,
     Stderr,
-}
-
-struct SessionSnapshot {
-    instance_id: String,
-    session_id: String,
-    owner: Uuid,
-    cmdline: String,
-    status: SnapshotStatus,
-    exit_code: Option<i32>,
-    exit_signal: Option<i32>,
-    background_output: bool,
-    exec_timeout_ms: Option<u64>,
-    stdout: String,
-    stderr: String,
-    bytes_returned: usize,
-    /// Oldest buffered bytes dropped (stream over the in-memory cap) since
-    /// the previous read.
-    bytes_dropped: usize,
-}
-
-#[derive(Clone, Copy)]
-enum SnapshotStatus {
-    Running,
-    Backgrounded(BackgroundReason),
-    Exited,
-    TimedOut,
-    Truncated,
-}
-
-impl SnapshotStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            SnapshotStatus::Running => "running",
-            SnapshotStatus::Backgrounded(_) => "backgrounded",
-            SnapshotStatus::Exited => "exited",
-            SnapshotStatus::TimedOut => "timed_out",
-            SnapshotStatus::Truncated => "truncated",
-        }
-    }
-}
-
-fn process_status(code: Option<i32>, signal: Option<i32>) -> Option<String> {
-    signal
-        .map(|signal| format!("signal {signal}"))
-        .or_else(|| code.map(|code| format!("exit {code}")))
-}
-
-impl SessionSnapshot {
-    fn tool_result(&self) -> generative_model::ToolResult {
-        let mut result = generative_model::ToolResult::text(self.format());
-        result.resource = Some(generative_model::ToolResourceRef {
-            id: self.session_id.clone(),
-            instance_id: self.instance_id.clone(),
-        });
-        result.status = if let Some(timeout_ms) = self.exec_timeout_ms {
-            Some(format!(
-                "timed out after {timeout_ms}ms; process group killed"
-            ))
-        } else if matches!(self.status, SnapshotStatus::Backgrounded(_)) {
-            Some("backgrounded".into())
-        } else {
-            process_status(self.exit_code, self.exit_signal)
-        };
-        result
-    }
-
-    fn format(&self) -> String {
-        let mut out = String::new();
-        if let SnapshotStatus::Backgrounded(reason) = self.status {
-            match reason {
-                BackgroundReason::User => out.push_str("User backgrounded this call. "),
-                BackgroundReason::AfterMillis(millis) => out.push_str(&format!(
-                    "background_after={millis}ms elapsed; command continues in the background. "
-                )),
-            }
-            out.push_str("Continue with other work; use bash read on this session_id and the same host for later output, or bash close to stop it.\n");
-        }
-        out.push_str(&format!("session_id: {}\n", self.session_id));
-        out.push_str(&format!(
-            "owner: {}\n",
-            crate::core::uuid_simple_hex(self.owner)
-        ));
-        out.push_str(&format!("cmdline: {:?}\n", self.cmdline));
-        out.push_str(&format!("status: {}\n", self.status.as_str()));
-        out.push_str(&format!("exit_code: {:?}\n", self.exit_code));
-        out.push_str(&format!("exit_signal: {:?}\n", self.exit_signal));
-        out.push_str(&format!("bytes_returned: {}\n", self.bytes_returned));
-        if self.bytes_dropped > 0 {
-            out.push_str(&format!(
-                "(oldest {} buffered bytes dropped: output exceeded the in-memory session cap; read more often or filter at the source)\n",
-                self.bytes_dropped
-            ));
-        }
-        out.push_str("stdout:\n");
-        out.push_str(&self.stdout);
-        if !self.stdout.ends_with('\n') && !self.stdout.is_empty() {
-            out.push('\n');
-        }
-        out.push_str("stderr:\n");
-        out.push_str(&self.stderr);
-        if !self.stderr.ends_with('\n') && !self.stderr.is_empty() {
-            out.push('\n');
-        }
-        if self.background_output {
-            out.push_str("(process exited; output still open, descendants may still be running — call read/close)\n");
-        }
-        if let Some(timeout_ms) = self.exec_timeout_ms {
-            out.push_str(&format!("(exec reached its explicit timeout_ms={timeout_ms}; process group killed; read remaining output or close the session)\n"));
-            return out;
-        }
-        match self.status {
-            SnapshotStatus::TimedOut => {
-                out.push_str(
-                    "(timed out waiting for more output; session still live — call read/write/close)\n",
-                );
-            }
-            SnapshotStatus::Truncated => {
-                out.push_str("(output truncated at max_bytes; more may be buffered — call read)\n");
-            }
-            SnapshotStatus::Running | SnapshotStatus::Backgrounded(_) => {
-                out.push_str("(session still running; call read/write/close as needed)\n");
-            }
-            SnapshotStatus::Exited => {
-                out.push_str("(process exited; call close to reap the session)\n");
-            }
-        }
-        out
-    }
-}
-
-/// How long exec waits for its pipe readers after the child is gone. The
-/// readers only EOF when *every* write end closes, so a backgrounded
-/// grandchild (`sleep 300 & echo hi`) would otherwise stall the result for
-/// its whole lifetime — or forever, for a daemon.
-const EXEC_DRAIN_GRACE: Duration = Duration::from_millis(500);
-
-/// In-memory accumulation cap per exec stream. `max_bytes` caps what a call
-/// *returns*; without this a flooding child (`yes`, a verbose build) grows
-/// the capture buffer without bound for the exec's whole lifetime. Head and
-/// rolling tail are kept so the final middle-elision still sees both ends.
-const EXEC_CAPTURE_CAP: usize = 512 * 1024;
-
-/// One exec stream captured under the accumulation cap: the first
-/// `EXEC_CAPTURE_CAP / 2` bytes, a rolling tail of the same size, and a count
-/// of bytes dropped at the seam between them.
-#[derive(Default)]
-struct CappedCapture {
-    head: Vec<u8>,
-    tail: Vec<u8>,
-    omitted: usize,
-}
-
-impl CappedCapture {
-    fn push(&mut self, chunk: &[u8]) {
-        let head_cap = EXEC_CAPTURE_CAP / 2;
-        let tail_cap = EXEC_CAPTURE_CAP - head_cap;
-        let mut rest = chunk;
-        if self.head.len() < head_cap {
-            let take = (head_cap - self.head.len()).min(rest.len());
-            self.head.extend_from_slice(&rest[..take]);
-            rest = &rest[take..];
-        }
-        if rest.is_empty() {
-            return;
-        }
-        self.tail.extend_from_slice(rest);
-        // Drop-oldest in blocks (not per chunk) so a flood costs a few
-        // memmoves, not one per 4 KiB read.
-        if self.tail.len() > tail_cap + 64 * 1024 {
-            let excess = self.tail.len() - tail_cap;
-            self.tail.drain(..excess);
-            self.omitted += excess;
-        }
-    }
-}
-
-fn render_exec_capture(shared: &SessionShared, max_bytes: usize) -> (String, String) {
-    let buffer = lock_unpoisoned(&shared.buffer);
-    let (stdout, stderr) = buffer
-        .exec_capture
-        .as_ref()
-        .expect("foreground exec capture");
-    (
-        render_capture(stdout, max_bytes),
-        render_capture(stderr, max_bytes),
-    )
-}
-
-/// The shared middle-elision shape: verbatim head, one honest marker, tail.
-fn middle_elision(
-    head: &[u8],
-    tail: &[u8],
-    omitted: usize,
-    total: usize,
-    max_bytes: usize,
-) -> String {
-    format!(
-        "{}\n[... {omitted} bytes omitted ({total} bytes total, max_bytes={max_bytes}); \
-         filter with grep/head/tail, redirect to a file, or raise max_bytes ...]\n{}",
-        String::from_utf8_lossy(head),
-        String::from_utf8_lossy(tail),
-    )
-}
-
-/// Render a captured exec stream under the *return* cap `max_bytes`, folding
-/// any capture-time loss into the same middle-elision marker.
-///
-/// Unlike session output (buffered; the agent can `read` the rest later),
-/// exec output is gone once the call returns, so the cut must keep the most
-/// informative parts — and those are the ends: build/test tools print the
-/// root-cause error first and the failure summary last. Cuts are byte-exact;
-/// a split UTF-8 char renders as U+FFFD at the seam.
-fn render_capture(capture: &CappedCapture, max_bytes: usize) -> String {
-    if capture.omitted == 0 {
-        let mut all = Vec::with_capacity(capture.head.len() + capture.tail.len());
-        all.extend_from_slice(&capture.head);
-        all.extend_from_slice(&capture.tail);
-        return truncate_middle_lossy(&all, max_bytes);
-    }
-    let total = capture.head.len() + capture.omitted + capture.tail.len();
-    let head_keep = max_bytes.div_ceil(2).min(capture.head.len());
-    let tail_keep = (max_bytes / 2).min(capture.tail.len());
-    let omitted = total - head_keep - tail_keep;
-    middle_elision(
-        &capture.head[..head_keep],
-        &capture.tail[capture.tail.len() - tail_keep..],
-        omitted,
-        total,
-        max_bytes,
-    )
-}
-
-/// Cap contiguous bytes at `max_bytes`, keeping the head and tail halves and
-/// eliding the middle with a marker (see [`render_capture`]).
-fn truncate_middle_lossy(bytes: &[u8], max_bytes: usize) -> String {
-    if bytes.len() <= max_bytes {
-        return String::from_utf8_lossy(bytes).into_owned();
-    }
-    let head_len = max_bytes.div_ceil(2);
-    let tail_len = max_bytes / 2;
-    let omitted = bytes.len() - head_len - tail_len;
-    middle_elision(
-        &bytes[..head_len],
-        &bytes[bytes.len() - tail_len..],
-        omitted,
-        bytes.len(),
-        max_bytes,
-    )
-}
-
-/// Wait up to `EXEC_DRAIN_GRACE` per exec pipe reader, then abort it. Reached
-/// with the child already dead, so anything still holding the pipes open is a
-/// stray grandchild whose future output we deliberately give up on.
-async fn drain_capture(
-    stdout_task: tokio::task::JoinHandle<()>,
-    stderr_task: tokio::task::JoinHandle<()>,
-) {
-    for mut task in [stdout_task, stderr_task] {
-        if tokio::time::timeout(EXEC_DRAIN_GRACE, &mut task)
-            .await
-            .is_err()
-        {
-            task.abort();
-        }
-    }
-}
-
-/// Per-stream in-memory cap for session output. A long-lived session nobody
-/// `read`s (a dev server left running for hours) must not grow resident
-/// memory without bound; the newest output is what a late reader wants, so
-/// the oldest is dropped — in blocks, so a flood costs a few memmoves.
-const SESSION_STREAM_CAP: usize = 2 * 1024 * 1024;
-
-/// Enforce [`SESSION_STREAM_CAP`] on one stream; returns bytes dropped.
-fn cap_session_stream(stream: &mut Vec<u8>) -> usize {
-    if stream.len() <= SESSION_STREAM_CAP {
-        return 0;
-    }
-    // Drop down to 3/4 of the cap so the next overflows are amortized.
-    let excess = stream.len() - (SESSION_STREAM_CAP - SESSION_STREAM_CAP / 4);
-    stream.drain(..excess);
-    excess
-}
-
-fn spawn_reader<R>(
-    mut reader: R,
-    kind: StreamKind,
-    shared: Arc<SessionShared>,
-) -> tokio::task::JoinHandle<()>
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 4096];
-        loop {
-            match reader.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if let Ok(mut b) = shared.buffer.lock() {
-                        let dropped = if let Some((stdout, stderr)) = &mut b.exec_capture {
-                            match kind {
-                                StreamKind::Stdout => stdout,
-                                StreamKind::Stderr => stderr,
-                            }
-                            .push(&buf[..n]);
-                            0
-                        } else {
-                            match kind {
-                                StreamKind::Stdout => {
-                                    b.stdout.extend_from_slice(&buf[..n]);
-                                    cap_session_stream(&mut b.stdout)
-                                }
-                                StreamKind::Stderr => {
-                                    b.stderr.extend_from_slice(&buf[..n]);
-                                    cap_session_stream(&mut b.stderr)
-                                }
-                            }
-                        };
-                        b.dropped_bytes = b.dropped_bytes.saturating_add(dropped);
-                        b.total_bytes = b.total_bytes.saturating_add(n);
-                    }
-                    shared.notify.notify_waiters();
-                }
-                Err(_) => break,
-            }
-        }
-        if let Ok(mut b) = shared.buffer.lock() {
-            b.eof_streams += 1;
-            b.record_completion();
-        }
-        shared.notify.notify_waiters();
-    })
-}
-
-/// Drain the shared buffer until idle / timeout / exit / byte cap / cancel.
-///
-/// Bytes returned are removed from the buffer so subsequent reads only see new data.
-/// On cancel, returns whatever is buffered with `TimedOut` status (session stays live).
-#[allow(clippy::too_many_arguments)]
-async fn collect_output(
-    shared: &Arc<SessionShared>,
-    session_id: &str,
-    owner: Uuid,
-    cmdline: &str,
-    timeout_ms: u64,
-    idle_ms: u64,
-    max_bytes: usize,
-    return_on_empty_idle: bool,
-    cancel: &crate::core::CancelToken,
-    background: &crate::core::CancelToken,
-) -> SessionSnapshot {
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
-    let idle = Duration::from_millis(idle_ms.max(1));
-    let max_bytes = max_bytes.max(1);
-
-    let mut last_activity = Instant::now();
-    let mut last_total = shared.buffer.lock().map(|b| b.total_bytes).unwrap_or(0);
-    let already_pending = shared
-        .buffer
-        .lock()
-        .map(|b| !b.stdout.is_empty() || !b.stderr.is_empty() || b.is_finished())
-        .unwrap_or(false);
-    if already_pending {
-        last_activity = Instant::now();
-    }
-
-    // Track generation so a concurrent write resets idle.
-    let mut seen_gen = shared.generation.load(Ordering::SeqCst);
-
-    let status;
-
-    loop {
-        if cancel.is_cancelled() {
-            status = SnapshotStatus::TimedOut;
-            break;
-        }
-
-        let (total, finished, pending_len) = {
-            let b = shared.buffer.lock().ok();
-            match b {
-                Some(b) => (
-                    b.total_bytes,
-                    b.is_finished(),
-                    b.stdout.len().saturating_add(b.stderr.len()),
-                ),
-                None => (last_total, false, 0),
-            }
-        };
-
-        if background.is_cancelled() {
-            status = SnapshotStatus::Backgrounded(BackgroundReason::User);
-            break;
-        }
-        if total > last_total {
-            last_total = total;
-            last_activity = Instant::now();
-        }
-
-        let current_gen = shared.generation.load(Ordering::SeqCst);
-        if current_gen != seen_gen {
-            seen_gen = current_gen;
-            last_activity = Instant::now();
-        }
-
-        if pending_len >= max_bytes {
-            status = SnapshotStatus::Truncated;
-            break;
-        }
-        if finished {
-            status = SnapshotStatus::Exited;
-            break;
-        }
-        // Idle with data (or we entered with pending and it settled).
-        if last_activity.elapsed() >= idle && pending_len > 0 {
-            status = SnapshotStatus::Running;
-            break;
-        }
-        // A plain start returns once the child has been quiet even if it has
-        // emitted nothing. Reads and writes long-poll for their first byte.
-        if last_activity.elapsed() >= idle
-            && pending_len == 0
-            && (already_pending || return_on_empty_idle)
-        {
-            // Entered with pending that was drained by a concurrent collector, or exited
-            // flag raced; treat as settled running/empty.
-            status = SnapshotStatus::Running;
-            break;
-        }
-        if Instant::now() >= deadline {
-            status = SnapshotStatus::TimedOut;
-            break;
-        }
-
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let slice = remaining.min(Duration::from_millis(50)).min(idle);
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                status = SnapshotStatus::TimedOut;
-                break;
-            }
-            _ = background.cancelled() => {
-                status = SnapshotStatus::Backgrounded(BackgroundReason::User);
-                break;
-            }
-            _ = tokio::time::timeout(slice, shared.notify.notified()) => {}
-        }
-    }
-
-    take_snapshot(shared, session_id, owner, cmdline, status, max_bytes)
-}
-
-fn take_snapshot(
-    shared: &SessionShared,
-    session_id: &str,
-    owner: Uuid,
-    cmdline: &str,
-    mut status: SnapshotStatus,
-    max_bytes: usize,
-) -> SessionSnapshot {
-    // Drain up to max_bytes from the buffer (stdout first, then stderr).
-    let (stdout, stderr, exit_code, exit_signal, background_output, bytes_dropped, exec_timeout_ms) = {
-        let mut b = match shared.buffer.lock() {
-            Ok(g) => g,
-            Err(_) => {
-                return SessionSnapshot {
-                    instance_id: shared.instance_id.clone(),
-                    session_id: session_id.to_string(),
-                    owner,
-                    cmdline: cmdline.to_string(),
-                    status: SnapshotStatus::TimedOut,
-                    exit_code: None,
-                    exit_signal: None,
-                    background_output: false,
-                    exec_timeout_ms: None,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    bytes_returned: 0,
-                    bytes_dropped: 0,
-                };
-            }
-        };
-
-        let mut budget = max_bytes;
-        let mut out_stdout = Vec::new();
-        let mut out_stderr = Vec::new();
-
-        let take_stdout = b.stdout.len().min(budget);
-        out_stdout.extend_from_slice(&b.stdout[..take_stdout]);
-        b.stdout.drain(..take_stdout);
-        budget = budget.saturating_sub(take_stdout);
-
-        let take_stderr = b.stderr.len().min(budget);
-        out_stderr.extend_from_slice(&b.stderr[..take_stderr]);
-        b.stderr.drain(..take_stderr);
-
-        if !b.stdout.is_empty() || !b.stderr.is_empty() {
-            if !matches!(status, SnapshotStatus::Backgrounded(_)) {
-                status = SnapshotStatus::Truncated;
-            }
-        } else if b.is_finished() {
-            status = SnapshotStatus::Exited;
-        }
-
-        (
-            String::from_utf8_lossy(&out_stdout).into_owned(),
-            String::from_utf8_lossy(&out_stderr).into_owned(),
-            b.exit_code,
-            b.exit_signal,
-            b.exited && !b.is_finished(),
-            std::mem::take(&mut b.dropped_bytes),
-            b.exec_timeout_ms,
-        )
-    };
-
-    let bytes_returned = stdout.len().saturating_add(stderr.len());
-    SessionSnapshot {
-        instance_id: shared.instance_id.clone(),
-        session_id: session_id.to_string(),
-        owner,
-        cmdline: cmdline.to_string(),
-        status,
-        exit_code,
-        exit_signal,
-        background_output,
-        exec_timeout_ms,
-        stdout,
-        stderr,
-        bytes_returned,
-        bytes_dropped,
-    }
-}
-
-// --- input schema ------------------------------------------------------------
-
-/// Wire input for the `bash` tool (flat object for Anthropic-friendly JSON Schema).
-///
-/// `deny_unknown_fields` keeps this struct honest about the schema it advertises:
-/// [`crate::tool_services::tool_input_schema`] declares
-/// `additionalProperties: false`, so a gateway that does not enforce the schema
-/// must not be the only thing standing between a typo'd field and a half-executed
-/// call. The harness strips the routing `host` before dispatch, so it never
-/// reaches here.
-#[derive(
-    Clone, Debug, schemars::JsonSchema, serde::Deserialize, serde::Serialize, PartialEq, Eq,
-)]
-#[serde(deny_unknown_fields)]
-pub struct Input {
-    /// Action to perform. Defaults to `exec` when omitted (or when only `command` is set).
-    #[serde(default)]
-    action: Option<ActionKind>,
-    /// Command line. For `exec`: run via `bash -c`. For `start`: program line (default `bash -i`).
-    #[serde(default)]
-    command: Option<String>,
-    /// Agent-chosen session name for start/write/read/close.
-    #[serde(default)]
-    session_id: Option<String>,
-    /// Bytes to write to the session's stdin (`start` / `write`).
-    #[serde(default)]
-    stdin: Option<String>,
-    /// Signal to deliver for `signal`. Default `int`.
-    #[serde(default)]
-    signal: Option<SignalKind>,
-    /// Hard wait ceiling in milliseconds.
-    /// - start/write/read: default 30000 (30s), max 1800000 (30 min); early return on idle/byte cap.
-    /// - exec: default 60000 (60s) unless background_after is set, max 1800000 (30 min); kills the process group on expiry.
-    ///
-    /// Prefer background_after for choosing when to stop waiting without killing work.
-    #[serde(default)]
-    timeout_ms: Option<u64>,
-    /// Exec only: yield the same command as a background session after this many milliseconds.
-    /// Positive, at most 1800000 (30 min). Omit to keep waiting in the foreground.
-    /// Prefer this over shell timeout wrappers or timeout_ms for deciding when to stop waiting.
-    /// An explicit timeout_ms still kills the process group at its original deadline after yielding.
-    #[serde(default)]
-    #[schemars(range(min = 1, max = 1_800_000))]
-    background_after: Option<u64>,
-    /// Idle gap in milliseconds with no new output before returning (start/write/read). Default 300.
-    #[serde(default)]
-    idle_ms: Option<u64>,
-    /// Max bytes of output to return. Default 4096.
-    /// - start/write/read: combined stdout+stderr drain cap; excess stays buffered — `read` again for more.
-    /// - exec: per-stream cap; head and tail are kept, the middle elided. Elided bytes are unrecoverable.
-    #[serde(default)]
-    max_bytes: Option<usize>,
-}
-
-#[derive(
-    Clone, Debug, schemars::JsonSchema, serde::Deserialize, serde::Serialize, PartialEq, Eq,
-)]
-#[serde(rename_all = "snake_case")]
-enum ActionKind {
-    Exec,
-    Start,
-    Write,
-    Read,
-    Signal,
-    Close,
-    List,
-}
-
-/// Signals a supervisor may deliver to a session. Deliberately small: SIGKILL
-/// is `close` (which also reaps the session), and anything outside this set has
-/// no established use against a session's process group.
-#[derive(
-    Clone, Copy, Debug, schemars::JsonSchema, serde::Deserialize, serde::Serialize, PartialEq, Eq,
-)]
-#[serde(rename_all = "snake_case")]
-enum SignalKind {
-    /// Interrupt, as a terminal Ctrl-C. A nested `myco` cancels its in-flight
-    /// turn and stays at the prompt.
-    Int,
-    /// Ask the process to terminate.
-    Term,
-    /// Hangup.
-    Hup,
-}
-
-impl SignalKind {
-    fn as_libc(self) -> libc::c_int {
-        match self {
-            SignalKind::Int => libc::SIGINT,
-            SignalKind::Term => libc::SIGTERM,
-            SignalKind::Hup => libc::SIGHUP,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            SignalKind::Int => "SIGINT",
-            SignalKind::Term => "SIGTERM",
-            SignalKind::Hup => "SIGHUP",
-        }
-    }
-}
-
-/// Internal validated action after parsing [`Input`].
-#[derive(Debug)]
-enum Action {
-    Exec {
-        command: String,
-        timeout_ms: Option<u64>,
-        background_after: Option<u64>,
-        max_bytes: usize,
-    },
-    Start {
-        session_id: String,
-        command: Option<String>,
-        stdin: Option<String>,
-        timeout_ms: u64,
-        idle_ms: u64,
-        max_bytes: usize,
-    },
-    Write {
-        session_id: String,
-        stdin: String,
-        timeout_ms: u64,
-        idle_ms: u64,
-        max_bytes: usize,
-    },
-    Read {
-        session_id: String,
-        timeout_ms: u64,
-        idle_ms: u64,
-        max_bytes: usize,
-    },
-    Signal {
-        session_id: String,
-        signal: SignalKind,
-        timeout_ms: u64,
-        idle_ms: u64,
-        max_bytes: usize,
-    },
-    Close {
-        session_id: String,
-    },
-    List,
-}
-
-/// Message for a `bash` tool use whose input object carries nothing at all.
-///
-/// Every [`Input`] field is optional (the tool infers `exec` from a bare
-/// `command`), so `{}` deserializes cleanly and only surfaces later as a
-/// missing action. Name the actual problem, and show what a usable call
-/// looks like.
-const EMPTY_INPUT_ERROR: &str = "empty bash input: the tool use carried no parameters. \
-     Pass `command` for a one-shot run (e.g. {\"command\": \"cd /repo && ls -la\"}), \
-     or `action` with its parameters (exec/start/write/read/signal/close/list; every \
-     session action but `list` also needs `session_id`).";
-
-/// JSON type name for error messages (`null`, `string`, `array`, …).
-fn json_type_name(value: &serde_json::Value) -> &'static str {
-    match value {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "a boolean",
-        serde_json::Value::Number(_) => "a number",
-        serde_json::Value::String(_) => "a string",
-        serde_json::Value::Array(_) => "an array",
-        serde_json::Value::Object(_) => "an object",
-    }
-}
-
-/// True when no field of `input` was set (`{}`, or explicit nulls).
-fn is_empty_object(input: &Input) -> bool {
-    // Destructured so a new field cannot silently fall out of this check.
-    let Input {
-        action,
-        command,
-        session_id,
-        stdin,
-        signal,
-        timeout_ms,
-        background_after,
-        idle_ms,
-        max_bytes,
-    } = input;
-    action.is_none()
-        && command.is_none()
-        && session_id.is_none()
-        && stdin.is_none()
-        && signal.is_none()
-        && timeout_ms.is_none()
-        && background_after.is_none()
-        && idle_ms.is_none()
-        && max_bytes.is_none()
-}
-
-/// Reject blank strings where a value is required: `bash -c ""` exits 0 with no
-/// output, and a blank `session_id` would name an unreachable session — both
-/// look like the tool did nothing rather than like a malformed call.
-fn require_non_blank(field: &str, value: &str) -> Result<(), String> {
-    if value.trim().is_empty() {
-        return Err(format!("`{field}` must be a non-empty string"));
-    }
-    Ok(())
-}
-
-fn resolve_action(input: &Input) -> Result<Action, String> {
-    let idle_ms = input.idle_ms.unwrap_or(DEFAULT_IDLE_MS);
-    let max_bytes = input.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
-
-    let kind = match &input.action {
-        Some(k) => k.clone(),
-        None => {
-            // Backward compatible: bare `{command: ...}` ⇒ exec.
-            if input.command.is_some() {
-                ActionKind::Exec
-            } else if input.session_id.is_some() && input.stdin.is_some() {
-                ActionKind::Write
-            } else if input.session_id.is_some() {
-                ActionKind::Read
-            } else if is_empty_object(input) {
-                // A tool use with `input: {}` (or only null fields) carries no
-                // work at all. Say so explicitly instead of leaving the agent to
-                // guess which of the six actions it forgot to name.
-                return Err(EMPTY_INPUT_ERROR.into());
-            } else {
-                return Err(
-                    "missing action (and no command/session_id to infer one from); \
-                            pass `action` (exec/start/write/read/close/list)"
-                        .into(),
-                );
-            }
-        }
-    };
-
-    let background_after = match input.background_after {
-        Some(_) if !matches!(kind, ActionKind::Exec) => {
-            return Err("background_after is only supported for exec; session actions already keep the process running".into());
-        }
-        Some(millis) if millis == 0 || millis > MAX_EXEC_TIMEOUT_MS => {
-            return Err(format!(
-                "background_after must be 1..={MAX_EXEC_TIMEOUT_MS} milliseconds"
-            ));
-        }
-        Some(millis) => Some(millis),
-        None => None,
-    };
-
-    // Explicit timeout_ms above the safety ceiling is rejected (not silently
-    // clamped). Defaults are generous enough for normal interactive work;
-    // background_after yields longer exec jobs; an explicit timeout remains a
-    // hard ceiling. Cancel still aborts mid-wait.
-    fn session_timeout(input: &Input) -> Result<u64, String> {
-        match input.timeout_ms {
-            None => Ok(DEFAULT_TIMEOUT_MS),
-            Some(t) if t > MAX_TIMEOUT_MS => Err(format!(
-                "session timeout_ms={t} exceeds max {MAX_TIMEOUT_MS}ms (30 min); pass ≤{MAX_TIMEOUT_MS}"
-            )),
-            Some(t) => Ok(t.max(1)),
-        }
-    }
-    fn exec_timeout(input: &Input) -> Result<Option<u64>, String> {
-        match input.timeout_ms {
-            None if input.background_after.is_some() => Ok(None),
-            None => Ok(Some(DEFAULT_EXEC_TIMEOUT_MS)),
-            Some(t) if t > MAX_EXEC_TIMEOUT_MS => Err(format!(
-                "exec timeout_ms={t} exceeds max {MAX_EXEC_TIMEOUT_MS}ms (30 min); pass ≤{MAX_EXEC_TIMEOUT_MS}"
-            )),
-            Some(t) => Ok(Some(t.max(1))),
-        }
-    }
-
-    match kind {
-        ActionKind::Exec => {
-            let command = input
-                .command
-                .clone()
-                .ok_or_else(|| "exec requires `command`".to_string())?;
-            require_non_blank("command", &command)?;
-            command_policy::validate(&command)?;
-            Ok(Action::Exec {
-                command,
-                timeout_ms: exec_timeout(input)?,
-                background_after,
-                max_bytes,
-            })
-        }
-        ActionKind::Start => {
-            let session_id = input
-                .session_id
-                .clone()
-                .ok_or_else(|| "start requires `session_id`".to_string())?;
-            require_non_blank("session_id", &session_id)?;
-            if let Some(command) = input.command.as_deref() {
-                require_non_blank("command", command)?;
-                command_policy::validate(command)?;
-            }
-            Ok(Action::Start {
-                session_id,
-                command: input.command.clone(),
-                stdin: input.stdin.clone(),
-                timeout_ms: session_timeout(input)?,
-                idle_ms,
-                max_bytes,
-            })
-        }
-        ActionKind::Write => {
-            let session_id = input
-                .session_id
-                .clone()
-                .ok_or_else(|| "write requires `session_id`".to_string())?;
-            require_non_blank("session_id", &session_id)?;
-            let stdin = input
-                .stdin
-                .clone()
-                .ok_or_else(|| "write requires `stdin`".to_string())?;
-            Ok(Action::Write {
-                session_id,
-                stdin,
-                timeout_ms: session_timeout(input)?,
-                idle_ms,
-                max_bytes,
-            })
-        }
-        ActionKind::Read => {
-            let session_id = input
-                .session_id
-                .clone()
-                .ok_or_else(|| "read requires `session_id`".to_string())?;
-            require_non_blank("session_id", &session_id)?;
-            Ok(Action::Read {
-                session_id,
-                timeout_ms: session_timeout(input)?,
-                idle_ms,
-                max_bytes,
-            })
-        }
-        ActionKind::Signal => {
-            let session_id = input
-                .session_id
-                .clone()
-                .ok_or_else(|| "signal requires `session_id`".to_string())?;
-            require_non_blank("session_id", &session_id)?;
-            Ok(Action::Signal {
-                session_id,
-                signal: input.signal.unwrap_or(SignalKind::Int),
-                timeout_ms: session_timeout(input)?,
-                idle_ms,
-                max_bytes,
-            })
-        }
-        ActionKind::Close => {
-            let session_id = input
-                .session_id
-                .clone()
-                .ok_or_else(|| "close requires `session_id`".to_string())?;
-            require_non_blank("session_id", &session_id)?;
-            Ok(Action::Close { session_id })
-        }
-        ActionKind::List => Ok(Action::List),
-    }
 }
 
 #[cfg(test)]

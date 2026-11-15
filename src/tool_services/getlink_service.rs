@@ -46,18 +46,10 @@ impl ToolService for GetLinkTool {
         tool: ToolUse,
         _ctx: HostDispatchContext,
     ) -> Async<ToolResult> {
-        Box::pin(async move {
-            let input: Input = match serde_json::from_value(tool.input) {
-                Ok(input) => input,
-                Err(error) => return ToolResult::err(format!("Invalid getlink input: {error}")),
-            };
-            let result =
-                tokio::task::spawn_blocking(move || self.files.link(Path::new(&input.path))).await;
-            match result {
-                Ok(Ok(url)) => ToolResult::text(url),
-                Ok(Err(error)) => ToolResult::err(error),
-                Err(error) => ToolResult::err(format!("Cannot resolve workspace file: {error}")),
-            }
+        super::blocking_tool(tool.input, "Invalid getlink input", move |input: Input| {
+            self.files
+                .link(Path::new(&input.path))
+                .map(ToolResult::text)
         })
     }
 }

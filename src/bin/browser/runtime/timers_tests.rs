@@ -1,13 +1,20 @@
+use std::time::Duration;
+
+use super::queue::MAX_QUEUED_MESSAGES;
+use super::tests::app;
 use super::*;
-use crate::browser::runtime::tests::app;
 use myco::generative_model::{Content, Message, ToolUse};
 use myco::tool_services::{HostDispatchContext, ToolService};
 
 async fn tool(app: &Arc<App>, input: Value) -> myco::generative_model::ToolResult {
+    call(app, "timer", input).await
+}
+
+async fn call(app: &Arc<App>, name: &str, input: Value) -> myco::generative_model::ToolResult {
     app.clone()
         .dispatch_tool_use(
             ToolUse {
-                name: "timer".into(),
+                name: name.into(),
                 input,
 
                 thought_signature: None,
@@ -20,7 +27,7 @@ async fn tool(app: &Arc<App>, input: Value) -> myco::generative_model::ToolResul
 #[tokio::test(start_paused = true)]
 async fn stable_timer_ids_preserve_exact_absolute_times_and_retry_after_the_due_time() {
     let (app, _work) = app();
-    app.live.lock().unwrap().snapshot.busy = true;
+    app.live.lock().unwrap().snapshot.meta.cancel = Some(CancelToken::new());
     let id = Uuid::new_v4();
     let at = (app.clock.now() + chrono::Duration::seconds(1)).to_rfc3339();
     let input = json!({"action":"set", "event_id":id, "at":at, "message":"Once"});
@@ -74,7 +81,7 @@ async fn timer_wakes_an_idle_session_once_without_a_browser_connection() {
 #[tokio::test(start_paused = true)]
 async fn due_timers_queue_behind_user_input_and_can_be_cancelled_before_delivery() {
     let (app, _work) = app();
-    app.live.lock().unwrap().snapshot.busy = true;
+    app.live.lock().unwrap().snapshot.meta.cancel = Some(CancelToken::new());
     app.accept(
         serde_json::from_value(json!({"request_id":Uuid::new_v4(),"session_id":"session",
         "action":{"kind":"submit","text":"User followup"}}))
@@ -111,7 +118,7 @@ async fn due_timers_queue_behind_user_input_and_can_be_cancelled_before_delivery
 #[tokio::test(start_paused = true)]
 async fn full_queue_retains_due_timers_and_delivery_respects_deadline_order() {
     let (app, _work) = app();
-    app.live.lock().unwrap().snapshot.busy = true;
+    app.live.lock().unwrap().snapshot.meta.cancel = Some(CancelToken::new());
     for _ in 0..MAX_QUEUED_MESSAGES {
         app.accept(
             serde_json::from_value(json!({"request_id":Uuid::new_v4(), "session_id":"session",
@@ -131,7 +138,7 @@ async fn full_queue_retains_due_timers_and_delivery_respects_deadline_order() {
             .len(),
         2
     );
-    app.live.lock().unwrap().snapshot.queued.clear();
+    app.live.lock().unwrap().snapshot.meta.queued.clear();
     app.fire_timers();
     let first = app.claim_followup().unwrap().unwrap();
     assert_eq!(first.timer.unwrap().id, early.id);
@@ -148,7 +155,7 @@ async fn full_queue_retains_due_timers_and_delivery_respects_deadline_order() {
 async fn shutdown_and_cancellation_do_not_start_timer_work() {
     let (app, mut work) = app();
     app.set_timer(Some(1.0), None, "Later".into()).unwrap();
-    app.live.lock().unwrap().snapshot.status = "Cancelling".into();
+    app.live.lock().unwrap().snapshot.meta.status = Status::Cancelling;
     tokio::time::advance(Duration::from_secs(2)).await;
     app.fire_timers();
     assert!(work.try_recv().is_err());
@@ -159,7 +166,7 @@ async fn shutdown_and_cancellation_do_not_start_timer_work() {
             .len(),
         1
     );
-    app.live.lock().unwrap().snapshot.status = "Ready".into();
+    app.live.lock().unwrap().snapshot.meta.status = Status::Ready;
     app.stop();
     app.fire_timers();
     assert!(work.try_recv().is_err());
@@ -213,7 +220,7 @@ async fn timer_tool_validates_deadlines_and_arguments_without_mutating_the_queue
 #[tokio::test(start_paused = true)]
 async fn timer_followups_are_labeled_system_messages_live_and_after_reload() {
     let (app, _work) = app();
-    app.live.lock().unwrap().snapshot.busy = true;
+    app.live.lock().unwrap().snapshot.meta.cancel = Some(CancelToken::new());
     app.set_timer(Some(0.1), None, "Check build".into())
         .unwrap();
     tokio::time::advance(Duration::from_secs(1)).await;
@@ -241,7 +248,7 @@ async fn timer_ownership_and_limits_include_fired_messages_waiting_for_delivery(
     for _ in 1..20 {
         first.set_timer(Some(1.0), None, "Pending".into()).unwrap();
     }
-    first.live.lock().unwrap().snapshot.busy = true;
+    first.live.lock().unwrap().snapshot.meta.cancel = Some(CancelToken::new());
     tokio::time::advance(Duration::from_secs(1)).await;
     first.fire_timers();
     assert_eq!(
@@ -278,4 +285,105 @@ async fn timer_ownership_and_limits_include_fired_messages_waiting_for_delivery(
             .unwrap()
             .is_empty()
     );
+}
+
+/// Providers reject a top-level `oneOf`, so each tool is one flat object that
+/// names only its own actions and identifiers.
+#[test]
+fn timer_and_inbox_schemas_are_flat_and_offer_only_their_own_actions() {
+    let (app, _work) = app();
+    let specs = app.tool_specs();
+    let schema = |name: &str| {
+        let spec = specs.iter().find(|spec| spec.name == name).unwrap();
+        spec.input_schema.clone()
+    };
+    let (timer, inbox) = (schema("timer"), schema("inbox"));
+    for schema in [&timer, &inbox] {
+        assert_eq!(schema["type"], "object", "{schema}");
+        assert!(schema.get("oneOf").is_none() && schema.get("anyOf").is_none());
+    }
+    assert_eq!(
+        timer["properties"]["action"]["enum"],
+        json!(["set", "list", "cancel"])
+    );
+    assert_eq!(
+        inbox["properties"]["action"]["enum"],
+        json!(["post", "list", "cancel"])
+    );
+    assert!(timer["properties"].get("timer_id").is_some());
+    assert!(inbox["properties"].get("timer_id").is_none());
+}
+
+#[tokio::test]
+async fn timer_and_inbox_calls_accept_their_own_shapes_and_reject_the_other_tool_s() {
+    let (app, _work) = app();
+    let at = (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+    for (name, input) in [
+        (
+            "timer",
+            json!({"action":"post", "after_seconds":1, "message":"Wrong tool"}),
+        ),
+        (
+            "inbox",
+            json!({"action":"set", "after_seconds":1, "message":"Wrong tool"}),
+        ),
+        (
+            "timer",
+            json!({"action":"set", "after_seconds":1, "message":"Id", "timer_id":Uuid::new_v4()}),
+        ),
+        ("timer", json!({"action":"list", "timer_id":Uuid::new_v4()})),
+        (
+            "timer",
+            json!({"action":"cancel", "event_id":Uuid::new_v4()}),
+        ),
+        ("timer", json!({"action":"cancel"})),
+        (
+            "inbox",
+            json!({"action":"post", "message":"Id", "timer_id":Uuid::new_v4()}),
+        ),
+        ("inbox", json!({"action":"list", "event_id":Uuid::new_v4()})),
+        (
+            "inbox",
+            json!({"action":"cancel", "event_id":Uuid::new_v4(), "message":"Extra"}),
+        ),
+        ("inbox", json!({"action":"cancel"})),
+        (
+            "inbox",
+            json!({"action":"post", "event_id":Uuid::new_v4(), "after_seconds":1, "message":"Relative retry"}),
+        ),
+    ] {
+        assert!(
+            call(&app, name, input.clone()).await.is_error,
+            "{name} {input}"
+        );
+    }
+    assert!(app.inbox_entries().is_empty());
+
+    let event_id = Uuid::new_v4();
+    let posted = json!({"action":"post", "event_id":event_id, "at":at, "message":"Scheduled",
+        "priority":"urgent", "expires_at":(Utc::now() + chrono::Duration::hours(1)).to_rfc3339()});
+    assert!(!call(&app, "inbox", posted).await.is_error);
+    let immediate = call(&app, "inbox", json!({"action":"post", "message":"Now"})).await;
+    assert!(!immediate.is_error, "{immediate:?}");
+    let timer = call(
+        &app,
+        "timer",
+        json!({"action":"set", "after_seconds":60, "message":"Later"}),
+    )
+    .await;
+    assert!(!timer.is_error, "{timer:?}");
+    let listed = |result: myco::generative_model::ToolResult| match &result.content[..] {
+        [Content::Text { text }] => serde_json::from_str::<Vec<Value>>(text).unwrap().len(),
+        _ => panic!("{result:?}"),
+    };
+    assert_eq!(
+        listed(call(&app, "inbox", json!({"action":"list"})).await),
+        3
+    );
+    assert_eq!(
+        listed(call(&app, "timer", json!({"action":"list"})).await),
+        1
+    );
+    let cancelled = json!({"action":"cancel", "event_id":event_id});
+    assert!(!call(&app, "inbox", cancelled).await.is_error);
 }

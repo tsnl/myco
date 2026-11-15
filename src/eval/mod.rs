@@ -11,7 +11,7 @@ mod workspace;
 pub use case::{
     Case, CaseSource, CreateOptions, Workspace, create_case, discover_cases, load_case,
 };
-pub use run::{RunOptions, execute_job, report, report_with_interventions, run};
+pub use run::{RunOptions, execute_job, report_with_interventions, run};
 
 use serde::{Serialize, de::DeserializeOwned};
 use std::path::Path;

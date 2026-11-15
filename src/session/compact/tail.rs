@@ -10,16 +10,22 @@ const MAX_TAIL_BYTES: usize = 64 * 1024;
 // Complete turn selection
 //
 
-/// Select up to `user_turns` recent turns, bounded by 64 messages and 64 KiB.
-/// A turn that exceeds either limit is represented by the compaction summary.
-/// Image sidecars count at their resolved size; unknown-size images omit a turn.
-pub fn select_tail(messages: &[Message], user_turns: usize, tool_body_max: usize) -> Vec<Message> {
+#[cfg(test)]
+pub(super) fn select_tail(
+    messages: &[Message],
+    user_turns: usize,
+    tool_body_max: usize,
+) -> Vec<Message> {
     select_tail_indexed(messages, user_turns, tool_body_max)
         .into_iter()
         .map(|(_, message)| message)
         .collect()
 }
 
+/// Select up to `user_turns` recent turns, bounded by 64 messages and 64 KiB,
+/// with each message's index in `messages`. A turn that exceeds either limit
+/// is represented by the compaction summary. Image sidecars count at their
+/// resolved size; unknown-size images omit a turn.
 pub(super) fn select_tail_indexed(
     messages: &[Message],
     user_turns: usize,

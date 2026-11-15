@@ -9,10 +9,9 @@ use std::sync::Arc;
 
 use crate::core::Async;
 use crate::generative_model::{self, ToolResult, ToolUse};
-use crate::session::{
-    ArchiveFilter, SessionListEntry, format_session_list_line, list_sessions_with_filter,
-};
+use crate::session::{ArchiveFilter, SessionListEntry, list_sessions_with_filter};
 
+use super::session_format::format_session_list_line;
 use super::{HostDispatchContext, ToolService};
 
 const DEFAULT_LIMIT: usize = 10;

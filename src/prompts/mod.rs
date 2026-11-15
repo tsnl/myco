@@ -51,7 +51,7 @@ agent in the system prompt, including nested ones.
 # Myco Runtime Manual
 
 You are running inside **myco**: a mycelial agent runtime. The same agent pattern repeats at every
-scale — supervisors drive **nested myco agents** as ordinary commands (see Nested Agents below),
+scale — supervisors drive **nested myco agents** through the local server API (see Nested Agents),
 and tools run on **hosts** (hands) spanning local and remote machines. The **local** host is always
 enabled **in-process** (no subprocess). Remotes use `ssh … myco --mode host` over NDJSON. Local
 tools (`session_meta`, `prelude`) stay in the agent process; host tools (`bash`, editor) run on
@@ -59,7 +59,7 @@ a host worker (local in-process or remote).
 
 **Runtime docs are markdown files on disk** — see *Manual* below for the directory this build
 exported them to. Read and search them with the tools you already have (`rg`, the editor);
-`index.md` names the articles: `overview.md`, `cli.md`, `harness-ops.md`, `evals.md`.
+`index.md` lists the articles and what each covers.
 
 Quick map (details in the manual):
 - Hosts: every concrete `Host` alias in `~/.ssh/config` is a remote host (`Include`s followed);
@@ -108,24 +108,12 @@ Quick map (details in the manual):
 
 # Nested Agents
 
-For independent work, an authenticated client can create hidden child sessions
-through `POST /api/sessions` with `parent_session` set to your session ID. Optional
-`fork: true` seeds the child with your conversation. Select the model key stamped
-at the end of this prompt before submitting when prompt-cache reuse matters.
-
-Use the server on the **local host only**. The server owns model access, config,
-keys, and the session store; children have independent tools and can reach remotes
-through their host pools. Remote hosts stay tool workers without model credentials.
-
-Read `browser.md` § Server API and automation and `overview.md` § Nested agents
-before delegating. An operator must configure the client's launch credential;
-do not put it in model context. Poll snapshots or consume server events for
-completion and cancel through the child's API when needed.
-
-Give each child a bounded task, constraints, expected result, and whether it may
-delegate further. Ask for completion evidence or a specific blocker; keep bulk
-output in files and return paths. Verify the answer and artifacts against the task.
-A completed turn alone does not prove the task is complete.
+For independent work, create a hidden child session with `POST /api/sessions` on the local
+server's loopback API, setting `parent_session` to your session ID. `fork: true`
+seeds the child with your conversation; for prompt-cache reuse, select the model key
+stamped at the end of this prompt. Follow `overview.md` § Nested agents before delegating,
+and verify the child's result against the task: a completed turn alone does not prove it is
+complete.
 
 ---
 "#,
@@ -219,6 +207,33 @@ pub fn thread_stamp(session_id: &str, thread_id: &str, started_at: DateTime<Utc>
         "{}- Thread id: `{thread_id}`. Use `session_history` with `session_id` and `thread_id` to read this thread or older threads.\n",
         session_stamp(session_id, started_at)
     )
+}
+
+/// The `session` part that opens a session's own conversation in a thread.
+pub fn thread_stamp_part(
+    session_id: &str,
+    thread_id: &str,
+    started_at: DateTime<Utc>,
+) -> crate::generative_model::Content {
+    crate::generative_model::Content::System {
+        kind: "session".into(),
+        text: thread_stamp(session_id, thread_id, started_at),
+        data: serde_json::json!({
+            "session_id": session_id, "thread_id": thread_id, "created_at": started_at,
+        }),
+    }
+}
+
+/// Whether `history` carries a stamp naming `session_id`. A fork's inherited
+/// stamp names its parent, and a stamp upgraded from a legacy file names none.
+pub fn has_session_stamp(history: &[crate::generative_model::Message], session_id: &str) -> bool {
+    use crate::generative_model::{Content, Message};
+    history.iter().any(|message| {
+        matches!(message, Message::UserMessage { content } if content.iter().any(|part| {
+            matches!(part, Content::System { kind, data, .. }
+                if kind == "session" && data["session_id"].as_str() == Some(session_id))
+        }))
+    })
 }
 
 /// Cap used when `config.toml` sets no `max_prelude_bytes`.
@@ -677,6 +692,14 @@ mod tests {
         // search, and must not advertise a `manual` tool any more.
         assert!(!DEFAULT_AGENT_PROMPT_EPILOGUE.contains("`manual` tool"));
         assert!(!DEFAULT_AGENT_PROMPT_EPILOGUE.contains("indexed_exact_text_search"));
+    }
+
+    /// The loopback API takes no credential (`browser.md` § Server API and
+    /// automation), so the prompt must not send agents looking for one.
+    #[test]
+    fn nested_agent_guidance_matches_the_credential_free_api() {
+        assert!(!DEFAULT_AGENT_PROMPT_EPILOGUE.contains("credential"));
+        assert!(!DEFAULT_AGENT_PROMPT_EPILOGUE.contains("authenticated client"));
     }
 
     /// The nearest project guidance through the repository root is appended at

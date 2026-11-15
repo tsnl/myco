@@ -4,12 +4,12 @@ mod test_utils;
 
 use std::sync::Arc;
 
-use myco::chat::{CompactWorkerError, Compactor, SessionRunner};
+use myco::chat::{Compactor, SessionRunner, WorkflowEvent};
 use myco::core::{Async, CancelToken};
 use myco::generative_model::{Content, GenerateOutput, ToolUse, TurnEndReason};
 use myco::harness::{Harness, HarnessConfig, HostConfig};
 use myco::session::{ActiveSession, CompactOutcome, Session, Thread, compact_thread};
-use myco::{Agent, NullEventSink, SessionRuntime};
+use myco::{Agent, AgentInteractionError, NullEventSink, SessionRuntime};
 use serde_json::json;
 
 struct Summarizer {
@@ -21,14 +21,16 @@ impl Compactor for Summarizer {
     fn compact(
         self: Arc<Self>,
         session: Session,
+        _single_attempt: bool,
+        _observer: Arc<dyn Fn(WorkflowEvent) + Send + Sync>,
         cancel: CancelToken,
-    ) -> Async<Result<(Thread, CompactOutcome), CompactWorkerError>> {
+    ) -> Async<Result<(Thread, CompactOutcome), AgentInteractionError>> {
         Box::pin(async move {
             if self.fail {
-                return Err(CompactWorkerError::Failed("scripted failure".into()));
+                return Err(AgentInteractionError::Compaction("scripted failure".into()));
             }
             let result = compact_thread(&session, "Keep working in the retained remote shell")
-                .map_err(CompactWorkerError::Failed)?;
+                .map_err(AgentInteractionError::Compaction)?;
             if self.cancel {
                 cancel.cancel();
             }

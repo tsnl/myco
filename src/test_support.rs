@@ -10,9 +10,8 @@ use futures::stream;
 
 use crate::core::AsyncStream;
 use crate::generative_model::{
-    Content, ContentDelta, ContentStart, GenerateError, GenerateOutput, GenerationEvent,
-    GenerationFailure, GenerativeModel, Message, MessagePart, ToolResult, ToolUse, ToolUseDelta,
-    ToolUseStart, TurnEndReason,
+    Content, GenerateError, GenerateOutput, GenerationEvent, GenerationFailure, GenerativeModel,
+    Message, ToolResult, ToolUse, TurnEndReason,
 };
 
 // ---------------------------------------------------------------------------
@@ -73,62 +72,9 @@ impl GenerativeModel for ScriptedModel {
             }
         };
 
-        let mut parts = vec![MessagePart::MessageStart];
-        for (i, c) in output.content.iter().enumerate() {
-            match c {
-                Content::System { .. } => {
-                    panic!("system parts are runtime input, not model output")
-                }
-                Content::Text { text } => {
-                    parts.push(MessagePart::ContentStart(ContentStart::Text { index: i }));
-                    parts.push(MessagePart::ContentDelta(ContentDelta::Text {
-                        index: i,
-                        delta: text.clone(),
-                    }));
-                }
-                Content::Image { source } => {
-                    parts.push(MessagePart::ContentStart(ContentStart::Image { index: i }));
-                    parts.push(MessagePart::ContentDelta(ContentDelta::Image {
-                        index: i,
-                        delta: source.clone(),
-                    }));
-                }
-                Content::Thinking {
-                    text,
-                    signature,
-                    redacted,
-                } => {
-                    parts.push(MessagePart::ContentStart(ContentStart::Thinking {
-                        index: i,
-                        signature: signature.clone(),
-                        redacted: *redacted,
-                    }));
-                    if !text.is_empty() && !*redacted {
-                        parts.push(MessagePart::ContentDelta(ContentDelta::Thinking {
-                            index: i,
-                            delta: text.clone(),
-                        }));
-                    }
-                }
-            }
-        }
-        for (i, tu) in output.tool_uses.iter().enumerate() {
-            parts.push(MessagePart::ToolUseStart(ToolUseStart {
-                index: i,
-                name: tu.name.clone(),
-                thought_signature: None,
-            }));
-            parts.push(MessagePart::ToolUseDelta(ToolUseDelta {
-                index: i,
-                input_json_delta: tu.input.to_string(),
-            }));
-        }
-        if let Some(usage) = output.usage {
-            parts.push(MessagePart::Usage(usage));
-        }
-        parts.push(MessagePart::TurnEndReason(output.turn_end_reason));
-
-        Box::pin(stream::iter(parts.into_iter().map(GenerationEvent::Part)))
+        Box::pin(stream::iter(
+            output.into_parts().into_iter().map(GenerationEvent::Part),
+        ))
     }
 }
 
@@ -216,7 +162,7 @@ pub(crate) fn temp_dir(tag: &str) -> TempDir {
 }
 
 /// Points `MYCO_HOME` at a fresh temp dir for the guard's lifetime, holding
-/// [`crate::session::lock_myco_home_for_test`] so mutating tests serialize.
+/// [`lock_myco_home_for_test`] so mutating tests serialize.
 /// Cleanup is RAII so a panicking test cannot leak the override to the next.
 pub(crate) struct TempHome {
     dir: PathBuf,
@@ -242,8 +188,17 @@ impl Drop for TempHome {
     }
 }
 
+/// Serialize tests that mutate `MYCO_HOME` (process-global env).
+fn lock_myco_home_for_test() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 pub(crate) fn temp_home(tag: &str) -> TempHome {
-    let lock = crate::session::lock_myco_home_for_test();
+    let lock = lock_myco_home_for_test();
     let dir = std::env::temp_dir().join(format!("myco-{tag}-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     // SAFETY: test-only env override; held under the myco-home lock.
@@ -257,6 +212,19 @@ pub(crate) fn temp_home(tag: &str) -> TempHome {
         profile_dir,
         _lock: lock,
     }
+}
+
+/// Save `messages` and `usage` to `thread_id` as an agent checkpoint would.
+pub(crate) fn persist_messages(
+    session: &crate::session::ActiveSession,
+    thread_id: &str,
+    messages: &[Message],
+    usage: Option<crate::generative_model::TokenUsage>,
+    force: bool,
+) -> Result<(), String> {
+    let mut state = crate::agent::AgentState::default();
+    state.replace_context(messages.to_vec(), usage).unwrap();
+    session.persist_agent_state(thread_id, &state, force, None)
 }
 
 pub(crate) fn tool_runtime(harness: Arc<crate::harness::Harness>) -> Arc<crate::SessionRuntime> {
