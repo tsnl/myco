@@ -6,33 +6,28 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use crate::SessionRuntime;
-use crate::agent::{Agent, AgentEvent, AgentInteractionError, EventSink, RunOutcome, StateError};
+use crate::agent::{Agent, AgentInteractionError, RunOutcome, StateError};
 use crate::core::{Async, CancelToken, ModelInfo};
 use crate::generative_model::{CatalogModel, Content, GenerateError, GenerativeModel, Message};
 use crate::prompts;
 use crate::session::{CompactOutcome, Session, SessionWriter, Thread};
 
+use super::compact_worker::run_compact_worker;
 use super::session_turn::{Submission, finish_turn, run_turn, settle_stopped_run};
-use super::{
-    CompactWorkerError, SessionTurnOutcome, persist_session, run_compact_worker, wire_checkpoint,
-};
+use super::{SessionTurnOutcome, persist_session, wire_checkpoint};
 
+/// Builds a successor for the saved active thread of `predecessor`. The runner
+/// commits it under the session writer and owns retries between calls.
 pub trait Compactor: Send + Sync {
+    /// `single_attempt` asks for one model attempt, leaving retry timing to an
+    /// auto-continuing runner. `observer` receives recovery warnings.
     fn compact(
         self: Arc<Self>,
         predecessor: Session,
+        single_attempt: bool,
+        observer: Arc<dyn Fn(WorkflowEvent) + Send + Sync>,
         cancel: CancelToken,
-    ) -> Async<Result<(Thread, CompactOutcome), CompactWorkerError>>;
-
-    /// Observe recovery while preserving the same worker's request budget.
-    fn compact_observed(
-        self: Arc<Self>,
-        predecessor: Session,
-        cancel: CancelToken,
-        _observer: Arc<dyn Fn(WorkflowEvent) + Send + Sync>,
-    ) -> Async<Result<(Thread, CompactOutcome), CompactWorkerError>> {
-        self.compact(predecessor, cancel)
-    }
+    ) -> Async<Result<(Thread, CompactOutcome), AgentInteractionError>>;
 }
 
 pub struct ModelCompactor {
@@ -44,52 +39,22 @@ impl Compactor for ModelCompactor {
     fn compact(
         self: Arc<Self>,
         predecessor: Session,
-        cancel: CancelToken,
-    ) -> Async<Result<(Thread, CompactOutcome), CompactWorkerError>> {
-        Box::pin(async move {
-            run_compact_worker(&predecessor, &self.model, self.max_requests, cancel).await
-        })
-    }
-
-    fn compact_observed(
-        self: Arc<Self>,
-        predecessor: Session,
-        cancel: CancelToken,
+        single_attempt: bool,
         observer: Arc<dyn Fn(WorkflowEvent) + Send + Sync>,
-    ) -> Async<Result<(Thread, CompactOutcome), CompactWorkerError>> {
+        cancel: CancelToken,
+    ) -> Async<Result<(Thread, CompactOutcome), AgentInteractionError>> {
         Box::pin(async move {
-            super::compact_worker::run_compact_worker_with_sink(
+            run_compact_worker(
                 &predecessor,
                 &self.model,
                 self.max_requests,
+                single_attempt,
+                observer,
                 cancel,
-                Arc::new(CompactionObserver(observer)),
+                |model| model,
             )
             .await
         })
-    }
-}
-
-struct CompactionObserver(Arc<dyn Fn(WorkflowEvent) + Send + Sync>);
-
-impl EventSink for CompactionObserver {
-    fn emit(&self, event: AgentEvent) {
-        if let AgentEvent::Failure {
-            failure,
-            attempt,
-            max_attempts,
-            retry_in: Some(delay),
-            ..
-        } = event
-        {
-            (self.0)(WorkflowEvent::Warning(format!(
-                "compaction response interrupted; retrying {}/{} in {:.1}s: {}",
-                attempt + 1,
-                max_attempts,
-                delay.as_secs_f64(),
-                failure.cause
-            )));
-        }
     }
 }
 
@@ -726,15 +691,15 @@ impl Workflow {
         progress.tick().await;
         let mut retry = super::autonomy::Retry::default();
         loop {
-            let mut source = predecessor.clone();
-            // Keep the original task while observing mode changes between
-            // attempts. Explicit manual compaction retains configured retries.
-            source.auto_continue =
+            // Explicit manual compaction retains the worker's configured retries.
+            let single_attempt =
                 automatic && runtime.session().with(|session| session.auto_continue);
-            let mut work =
-                compactor
-                    .clone()
-                    .compact_observed(source, cancel.clone(), self.observer.clone());
+            let mut work = compactor.clone().compact(
+                predecessor.clone(),
+                single_attempt,
+                self.observer.clone(),
+                cancel.clone(),
+            );
             let result = loop {
                 tokio::select! {
                     biased;
@@ -749,19 +714,11 @@ impl Workflow {
             }
             match result {
                 Ok(successor) => return Ok(successor),
+                Err(error) if !automatic => return Err(error),
                 Err(error) => {
-                    let error = match error {
-                        CompactWorkerError::Cancelled => AgentInteractionError::Cancelled,
-                        CompactWorkerError::Failed(message) => {
-                            AgentInteractionError::Compaction(message)
-                        }
-                    };
-                    if !automatic {
-                        return Err(error);
-                    }
                     retry
                         .wait(error, runtime.session(), cancel, &*self.observer)
-                        .await?;
+                        .await?
                 }
             }
         }
@@ -848,17 +805,19 @@ mod tests {
         fn compact(
             self: Arc<Self>,
             predecessor: Session,
+            _single_attempt: bool,
+            _observer: Arc<dyn Fn(WorkflowEvent) + Send + Sync>,
             cancel: CancelToken,
-        ) -> Async<Result<(Thread, CompactOutcome), CompactWorkerError>> {
+        ) -> Async<Result<(Thread, CompactOutcome), AgentInteractionError>> {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 crate::agent::validate_context(&predecessor.active_thread().messages).unwrap();
                 self.sources.lock().unwrap().push(predecessor.clone());
                 if self.transient_failure.swap(false, Ordering::SeqCst) {
-                    return Err(CompactWorkerError::Failed("temporary outage".into()));
+                    return Err(AgentInteractionError::Compaction("temporary outage".into()));
                 }
                 if let Some(reason) = self.failure {
-                    return Err(CompactWorkerError::Failed(reason.into()));
+                    return Err(AgentInteractionError::Compaction(reason.into()));
                 }
                 let compacted =
                     compact_thread(&predecessor, "Continue the task with the existing shell")

@@ -37,10 +37,7 @@ pub use agent::{
     Agent, AgentEvent, AgentInteractionError, EventSink, NullEventSink, RunOutcome, ToolExecutor,
     TraceContext,
 };
-pub use chat::{
-    CompactWorkerError, Compactor, ModelCompactor, SessionRunner, WorkflowEvent,
-    compact_subagent_prompt, run_compact_worker,
-};
+pub use chat::{Compactor, ModelCompactor, SessionRunner, WorkflowEvent};
 pub use config::{Config, ConfigUserSettings, load_file_config};
 pub use core::{CancelToken, HostResources, ModelInfo, ToolResource, uuid_simple_hex};
 pub use harness::{

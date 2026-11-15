@@ -8,7 +8,7 @@
 //! Persistence only: how a conversation is stored, not how one is produced.
 //! Compaction is split along that line — the document work
 //! ([`compact_thread`], [`select_tail`]) is here, and the
-//! agent run that writes the summary is [`crate::chat::run_compact_worker`].
+//! agent run that writes the summary is [`crate::chat::ModelCompactor`].
 
 mod archive;
 mod attach;

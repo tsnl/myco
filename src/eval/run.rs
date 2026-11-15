@@ -8,8 +8,8 @@ use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
-use crate::agent::Agent;
-use crate::chat::{CompactWorkerError, Compactor, SessionRunner, WorkflowEvent};
+use crate::agent::{Agent, AgentInteractionError};
+use crate::chat::{Compactor, SessionRunner, WorkflowEvent};
 use crate::core::{
     Async, CancelToken, ModelInfo,
     image_store::{ImageStore, sha256, with_images},
@@ -587,13 +587,17 @@ impl Compactor for EvalCompactor {
     fn compact(
         self: Arc<Self>,
         predecessor: Session,
+        single_attempt: bool,
+        observer: Arc<dyn Fn(WorkflowEvent) + Send + Sync>,
         cancel: CancelToken,
-    ) -> Async<Result<(Thread, CompactOutcome), CompactWorkerError>> {
+    ) -> Async<Result<(Thread, CompactOutcome), AgentInteractionError>> {
         Box::pin(async move {
-            crate::chat::run_compact_worker_with_model(
+            crate::chat::run_compact_worker(
                 &predecessor,
                 &self.model,
                 self.max_requests,
+                single_attempt,
+                observer,
                 cancel,
                 |model| self.recorder.wrap(model, true),
             )
