@@ -205,6 +205,7 @@ fn literal(node: Node<'_>, source: &str) -> Option<String> {
     let text = node.utf8_text(source.as_bytes()).ok()?;
     match node.kind() {
         "word" => Some(unescape(text, false)),
+        "number" => Some(text.into()),
         "string_content" => Some(unescape(text, true)),
         "raw_string" => Some(text.strip_prefix('\'')?.strip_suffix('\'')?.into()),
         "ansi_c_string" => ansi_string(text.strip_prefix("$'")?.strip_suffix('\'')?),
@@ -315,6 +316,7 @@ mod tests {
             "nice -n 10 nohup true",
             "time -p nohup true",
             "timeout 30s nohup true",
+            "timeout 120 nohup true",
             "timeout -k 1s --signal TERM 30s nohup true",
             "timeout --kill-after=1s -- 30s /usr/bin/nohup true",
             "sudo -u worker nohup true",
