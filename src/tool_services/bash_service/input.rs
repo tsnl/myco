@@ -84,6 +84,30 @@ pub(super) fn tool_description() -> String {
     )
 }
 
+impl BashService {
+    /// Longest a call with this input may run before the tool replies, for a
+    /// transport watchdog. `None` for invalid input, which is rejected at once.
+    pub fn reply_ceiling_ms(input: &serde_json::Value) -> Option<u64> {
+        let input = serde_json::from_value(input.clone()).ok()?;
+        let stdin_write = |written: bool| if written { STDIN_WRITE_TIMEOUT_MS } else { 0 };
+        match resolve_action(&input).ok()? {
+            Action::Exec {
+                timeout_ms,
+                background_after,
+                ..
+            } => timeout_ms.into_iter().chain(background_after).min(),
+            Action::Start { stdin, wait, .. } => {
+                Some(wait.timeout_ms + stdin_write(stdin.is_some()))
+            }
+            Action::Interact { step, wait, .. } => {
+                Some(wait.timeout_ms + stdin_write(matches!(step, Step::Write(_))))
+            }
+            Action::Close { .. } => Some(CLOSE_DRAIN.timeout_ms),
+            Action::List => Some(0),
+        }
+    }
+}
+
 /// Wire input for the `bash` tool (flat object for Anthropic-friendly JSON Schema).
 ///
 /// `deny_unknown_fields` keeps this struct honest about the schema it advertises:

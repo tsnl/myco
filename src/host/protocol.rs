@@ -81,6 +81,15 @@ pub enum Response {
 }
 
 impl Response {
+    /// The request this answers; `None` for hello and connection-fatal errors.
+    pub fn id(&self) -> Option<&str> {
+        match self {
+            Response::Resources { id, .. } | Response::ToolResult { id, .. } => Some(id),
+            Response::Error { id, .. } => id.as_deref(),
+            Response::HelloOk { .. } => None,
+        }
+    }
+
     /// Encode as one NDJSON line (including trailing newline).
     pub fn encode(&self) -> Result<Vec<u8>, String> {
         let mut line = serde_json::to_string(self).map_err(|e| e.to_string())?;
