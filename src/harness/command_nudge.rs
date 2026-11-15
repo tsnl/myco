@@ -1,9 +1,12 @@
 //! Routing advice belongs beside the configured host catalog, not inside bash.
+//! Commands are read through the bash tool's own shell inspection, so advice
+//! sees the same effective programs the tool's policy does.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::HostController;
+use crate::tool_services::bash_service::effective_commands;
 
 //
 // Routing guidance
@@ -13,34 +16,18 @@ pub(super) fn command_nudge(
     command: &str,
     hosts: &HashMap<String, Arc<HostController>>,
 ) -> Option<String> {
-    let tokens = shell_tokens(command);
-    for words in tokens.split(|word| word == ";") {
-        let words: Vec<_> = words.iter().map(String::as_str).collect();
-        if let Some(message) = command_words(&words, hosts) {
-            return Some(message);
-        }
-    }
-    None
+    effective_commands(command).iter().find_map(|words| {
+        // A word that needs expansion cannot name a configured host, but it
+        // still occupies its position (e.g. as an option's value).
+        let words: Vec<&str> = words.iter().map(|w| w.as_deref().unwrap_or("")).collect();
+        command_words(&words, hosts)
+    })
 }
 
 fn command_words(words: &[&str], hosts: &HashMap<String, Arc<HostController>>) -> Option<String> {
-    let first = words.iter().position(|word| !word.contains('='))?;
-    let program = basename(words[first]);
-    let start = if matches!(
-        program,
-        "timeout" | "env" | "sudo" | "command" | "exec" | "nohup"
-    ) {
-        words
-            .iter()
-            .enumerate()
-            .skip(first + 1)
-            .find(|(_, word)| matches!(basename(word), "ssh" | "scp" | "rsync"))?
-            .0
-    } else {
-        first
-    };
-    let program = basename(words[start]);
-    let operands = operands(program, &words[start + 1..]);
+    let (program, arguments) = words.split_first()?;
+    let program = basename(program);
+    let operands = operands(program, arguments);
     if program == "ssh" {
         let target = operands.first()?;
         let alias = target.rsplit('@').next()?;
@@ -74,7 +61,7 @@ fn configured(alias: &str, hosts: &HashMap<String, Arc<HostController>>) -> bool
 }
 
 //
-// Shell parsing
+// Option parsing
 //
 
 fn operands<'a>(program: &str, words: &'a [&'a str]) -> Vec<&'a str> {
@@ -139,49 +126,6 @@ fn operands<'a>(program: &str, words: &'a [&'a str]) -> Vec<&'a str> {
         }
     }
     result
-}
-
-/// A deliberately small lexer: quoted strings stay one word, shell control
-/// operators start a new command, and comments do not supply executable words.
-/// This is advisory only; it never changes or authorizes shell execution.
-fn shell_tokens(command: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut word = String::new();
-    let mut quote = None;
-    let mut chars = command.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' && quote != Some('\'') {
-            if let Some(next) = chars.next() {
-                word.push(next);
-            }
-        } else if quote == Some(ch) {
-            quote = None;
-        } else if quote.is_some() {
-            word.push(ch);
-        } else if ch == '\'' || ch == '"' {
-            quote = Some(ch);
-        } else if ch == '#' && word.is_empty() {
-            for next in chars.by_ref() {
-                if next == '\n' {
-                    break;
-                }
-            }
-            words.push(";".into());
-        } else if ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '(' | ')') {
-            if !word.is_empty() {
-                words.push(std::mem::take(&mut word));
-            }
-            if ch == '\n' || !ch.is_whitespace() {
-                words.push(";".into());
-            }
-        } else {
-            word.push(ch);
-        }
-    }
-    if !word.is_empty() {
-        words.push(word);
-    }
-    words
 }
 
 #[cfg(test)]

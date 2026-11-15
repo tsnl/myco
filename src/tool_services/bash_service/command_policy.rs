@@ -1,5 +1,6 @@
 //! Keep explicit nohup invocations out of shell command fields. This is a
-//! misuse guard, not containment of arbitrary programs or their stdin.
+//! misuse guard, not containment of arbitrary programs or their stdin. The
+//! same inspection lists a command's effective programs for routing advice.
 
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
@@ -15,10 +16,33 @@ const REJECTED: &str = "nohup is not supported by the bash tool: it bypasses man
 //
 
 pub(super) fn validate(command: &str) -> Result<(), String> {
-    inspect(command, 0)
+    inspect(command, 0, &mut |words| match words.first() {
+        Some(Some(name)) if basename(name) == "nohup" => Err(REJECTED.into()),
+        _ => Ok(()),
+    })
 }
 
-fn inspect(command: &str, depth: usize) -> Result<(), String> {
+/// Literal words of every command `command` runs once launch wrappers
+/// (`env`, `timeout`, `sudo`, …), `sh -c` strings, and `eval` are unwrapped;
+/// `None` marks a word that needs expansion. Advisory: a command too complex
+/// to inspect yields what was found before inspection stopped.
+pub(crate) fn effective_commands(command: &str) -> Vec<Vec<Option<String>>> {
+    let mut commands = Vec::new();
+    let _ = inspect(command, 0, &mut |words| {
+        commands.push(words.to_vec());
+        Ok(())
+    });
+    commands
+}
+
+/// Receives each effective command's words; an error stops inspection.
+type Visit<'a> = dyn FnMut(&[Option<String>]) -> Result<(), String> + 'a;
+
+fn basename(program: &str) -> &str {
+    program.rsplit('/').next().unwrap_or(program)
+}
+
+fn inspect(command: &str, depth: usize, visit: &mut Visit<'_>) -> Result<(), String> {
     if depth > 16 {
         return Err("Shell command nesting is too deep to inspect; simplify the command.".into());
     }
@@ -45,7 +69,7 @@ fn inspect(command: &str, depth: usize) -> Result<(), String> {
     loop {
         let node = cursor.node();
         if node.kind() == "command" {
-            inspect_command(node, command, depth)?;
+            inspect_command(node, command, depth, visit)?;
         }
         if cursor.goto_first_child() {
             continue;
@@ -58,7 +82,12 @@ fn inspect(command: &str, depth: usize) -> Result<(), String> {
     }
 }
 
-fn inspect_command(node: Node<'_>, source: &str, depth: usize) -> Result<(), String> {
+fn inspect_command(
+    node: Node<'_>,
+    source: &str,
+    depth: usize,
+    visit: &mut Visit<'_>,
+) -> Result<(), String> {
     let Some(name) = node.child_by_field_name("name") else {
         return Ok(());
     };
@@ -82,18 +111,21 @@ fn inspect_command(node: Node<'_>, source: &str, depth: usize) -> Result<(), Str
         }
         previous_end = Some(word.end_byte());
     }
-    inspect_words(&words, depth)
+    inspect_words(&words, depth, visit)
 }
 
 //
 // Literal commands and common launch wrappers
 //
 
-fn inspect_words(mut words: &[Option<String>], depth: usize) -> Result<(), String> {
+fn inspect_words(
+    mut words: &[Option<String>],
+    depth: usize,
+    visit: &mut Visit<'_>,
+) -> Result<(), String> {
     while let Some((Some(name), arguments)) = words.split_first() {
-        let program = name.rsplit('/').next().unwrap_or(name);
+        let program = basename(name);
         match program {
-            "nohup" => return Err(REJECTED.into()),
             "command" | "exec" | "env" | "nice" | "time" | "timeout" | "sudo" => {
                 let Some(command) = wrapped_command(program, arguments) else {
                     return Ok(());
@@ -106,15 +138,15 @@ fn inspect_words(mut words: &[Option<String>], depth: usize) -> Result<(), Strin
             }
             "busybox" | "toybox" => words = arguments,
             "bash" | "sh" | "dash" | "zsh" | "ksh" => {
-                return inspect_shell(arguments, depth);
+                return inspect_shell(arguments, depth, visit);
             }
             "eval" => {
                 if let Some(parts) = arguments.iter().cloned().collect::<Option<Vec<_>>>() {
-                    inspect(&parts.join(" "), depth + 1)?;
+                    inspect(&parts.join(" "), depth + 1, visit)?;
                 }
                 return Ok(());
             }
-            _ => return Ok(()),
+            _ => return visit(words),
         }
     }
     Ok(())
@@ -177,14 +209,18 @@ fn option_has_value(program: &str, option: &str) -> bool {
     }
 }
 
-fn inspect_shell(mut arguments: &[Option<String>], depth: usize) -> Result<(), String> {
+fn inspect_shell(
+    mut arguments: &[Option<String>],
+    depth: usize,
+    visit: &mut Visit<'_>,
+) -> Result<(), String> {
     while let Some((Some(option), rest)) = arguments.split_first() {
         if !option.starts_with('-') || option == "--" {
             break;
         }
         if !option.starts_with("--") && option.contains('c') {
             if let Some(Some(command)) = rest.first() {
-                inspect(command, depth + 1)?;
+                inspect(command, depth + 1, visit)?;
             }
             break;
         }

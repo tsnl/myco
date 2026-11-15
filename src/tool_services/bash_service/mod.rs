@@ -29,6 +29,7 @@ use capture::{
 };
 #[cfg(test)]
 use capture::{SESSION_STREAM_CAP, truncate_middle_lossy};
+pub(crate) use command_policy::effective_commands;
 use input::{
     Action, EMPTY_INPUT_ERROR, Input, SignalKind, Step, Wait, json_type_name, resolve_action,
 };
