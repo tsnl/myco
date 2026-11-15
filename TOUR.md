@@ -36,7 +36,7 @@ HTTP and server-sent events. Closing a tab does not stop its runner.
 
 ```mermaid
 flowchart TD
-    Server[HTTP session worker] --> Chat[chat::run_session_turn]
+    Server[HTTP session worker] --> Chat[chat::SessionRunner]
     Chat --> Input[chat::interact]
     Input --> Agent[Agent::run]
     Agent --> Generation[Generation attempts and retries]
@@ -287,7 +287,7 @@ intent and structured system parts; versions 2–4 have explicit upgrades on loa
 Reading alone does not rewrite an existing file.
 
 The chat adapter's `wire_checkpoint` binds a checkpoint to a particular thread.
-Stale callbacks cannot overwrite a successor. `run_session_turn` force-saves
+Stale callbacks cannot overwrite a successor. `SessionRunner` force-saves
 after a turn, including a failed or cancelled one; server shutdown
 also uses `persist_session`. The [session-turn tests](src/chat/session_turn.rs)
 verify recovery, queued turns selecting the successor, and cancellation before

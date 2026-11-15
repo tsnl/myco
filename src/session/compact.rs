@@ -2,7 +2,8 @@
 
 mod tail;
 
-pub use tail::select_tail;
+#[cfg(test)]
+use tail::select_tail;
 use tail::select_tail_indexed;
 
 use crate::generative_model::{Content, Message};
@@ -201,9 +202,14 @@ mod tests {
         active.with_mut(|session| session.title = Some("updated during compaction".into()));
         writer.commit_thread(next.clone()).unwrap();
         assert!(
-            active
-                .persist_thread_messages(&predecessor, &[user("stale")], None, true)
-                .is_err()
+            crate::test_support::persist_messages(
+                &active,
+                &predecessor,
+                &[user("stale")],
+                None,
+                true
+            )
+            .is_err()
         );
         assert_eq!(
             active.snapshot().title.as_deref(),

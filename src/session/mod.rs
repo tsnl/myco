@@ -7,7 +7,7 @@
 //!
 //! Persistence only: how a conversation is stored, not how one is produced.
 //! Compaction is split along that line — the document work
-//! ([`compact_thread`], [`select_tail`]) is here, and the
+//! ([`compact_thread`]) is here, and the
 //! agent run that writes the summary is [`crate::chat::ModelCompactor`].
 
 mod archive;
@@ -22,7 +22,7 @@ pub use thread::Thread;
 
 pub use archive::migrate_archived_sessions;
 pub use attach::{MAX_MESSAGE_ATTACHMENT_BYTES, expand_image_attachments};
-pub use compact::{CompactOutcome, compact_thread, select_tail};
+pub use compact::{CompactOutcome, compact_thread};
 pub use lock::{SessionLockError, SessionWriteLock};
 pub use search::{SessionSearchReport, search_sessions};
 
@@ -339,28 +339,10 @@ impl ActiveSession {
         Ok(id)
     }
 
-    /// Persist the supplied context and usage. `None` explicitly invalidates
-    /// the old usage estimate, as after a rewind or context replacement.
-    pub fn persist_messages(
-        &self,
-        messages: &[Message],
-        last_usage: Option<TokenUsage>,
-        force: bool,
-    ) -> Result<(), String> {
-        let thread_id = self.with(|session| session.active_thread().id.clone());
-        self.persist_thread_messages(&thread_id, messages, last_usage, force)
-    }
-
-    pub fn persist_thread_messages(
-        &self,
-        thread_id: &str,
-        messages: &[Message],
-        last_usage: Option<TokenUsage>,
-        force: bool,
-    ) -> Result<(), String> {
-        self.persist_thread_messages_at(thread_id, messages, last_usage, force, None, None)
-    }
-
+    /// Persist an agent checkpoint to `thread_id`, which must still be active.
+    /// Missing usage explicitly invalidates the old usage estimate, as after a
+    /// rewind or context replacement; `accepted` records when a user turn
+    /// arrived.
     pub fn persist_agent_state(
         &self,
         thread_id: &str,
@@ -368,25 +350,9 @@ impl ActiveSession {
         force: bool,
         accepted: Option<(usize, DateTime<Utc>)>,
     ) -> Result<(), String> {
-        self.persist_thread_messages_at(
-            thread_id,
-            state.history(),
-            state.last_usage(),
-            force,
-            accepted,
-            state.pending_operation(),
-        )
-    }
-
-    pub(crate) fn persist_thread_messages_at(
-        &self,
-        thread_id: &str,
-        messages: &[Message],
-        last_usage: Option<TokenUsage>,
-        force: bool,
-        accepted: Option<(usize, DateTime<Utc>)>,
-        pending: Option<crate::agent::PendingOperation>,
-    ) -> Result<(), String> {
+        let messages = state.history();
+        let last_usage = state.last_usage();
+        let pending = state.pending_operation();
         let mut session = self.lock();
         if session.active_thread().id != thread_id {
             return Err(format!(
@@ -1343,7 +1309,7 @@ pub(crate) fn lock_myco_home_for_test() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
     use crate::generative_model::{Content, Message, TokenUsage};
-    use crate::test_support::{temp_dir, temp_home, user};
+    use crate::test_support::{persist_messages, temp_dir, temp_home, user};
 
     /// Pre-`last_usage` / pre-`kind` v2 file: absent optional fields must default.
     const LEGACY_V2_JSON: &[u8] = br#"{"version":2,"id":"ccddeeff00112233445566778899aabb","created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z","model":"x","messages":[]}"#;
@@ -1570,10 +1536,9 @@ mod tests {
         };
         let active = ActiveSession::new(Session::new("claude-haiku-4-5"));
         let id = active.id();
+        let thread = active.with(|session| session.active_thread().id.clone());
 
-        active
-            .persist_messages(&[user("hi")], Some(usage), true)
-            .unwrap();
+        persist_messages(&active, &thread, &[user("hi")], Some(usage), true).unwrap();
         assert_eq!(
             Session::load_by_id_or_prefix(&id)
                 .unwrap()
@@ -1582,9 +1547,7 @@ mod tests {
             Some(usage)
         );
 
-        active
-            .persist_messages(&[user("replaced")], None, false)
-            .unwrap();
+        persist_messages(&active, &thread, &[user("replaced")], None, false).unwrap();
         assert_eq!(
             Session::load_by_id_or_prefix(&id)
                 .unwrap()
@@ -1887,9 +1850,15 @@ mod tests {
             fs::read_to_string(saved.thread_summary_path(&saved.active_thread().id)).unwrap(),
             "thread summary"
         );
-        active
-            .persist_messages(&[user("continued while archived")], None, true)
-            .unwrap();
+        let thread = active.with(|session| session.active_thread().id.clone());
+        persist_messages(
+            &active,
+            &thread,
+            &[user("continued while archived")],
+            None,
+            true,
+        )
+        .unwrap();
         assert!(!original.exists());
         let listed = list_sessions_with_filter(false, ArchiveFilter::Archived).unwrap();
         assert_eq!(

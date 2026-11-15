@@ -7,7 +7,7 @@
 //! [`SessionRuntime`] binds an agent to persistent context and owns live tool
 //! resources through [`Harness`]. Its lifetime is independent of any one
 //! [`Agent`] or [`Thread`], so compaction can replace context while shells stay
-//! alive. [`chat::run_session_turn`] coordinates input submission and saving.
+//! alive. [`SessionRunner`] coordinates input submission, saving, and compaction.
 //!
 //! Read the [Myco Book](https://tsnl.github.io/myco/) for setup and reuse guides,
 //! or the [code tour](https://github.com/tsnl/myco/blob/main/TOUR.md) for source
@@ -49,7 +49,7 @@ pub use host::HostWorker;
 pub use manual::Article as ManualArticle;
 pub use session::{
     ActiveSession, CompactOutcome, SESSION_FILE_VERSION, Session, SessionKind, SessionLink,
-    SessionListEntry, Thread, compact_thread, select_tail,
+    SessionListEntry, Thread, compact_thread,
 };
 pub use session_runtime::{RuntimeRecord, SessionRuntime};
 pub use tool_services::{

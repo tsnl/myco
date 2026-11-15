@@ -35,8 +35,7 @@ The chat adapter wires persistence back in. For a durable application turn, use
 [`SessionRunner`](../api/myco/chat/struct.SessionRunner.html): it owns the agent,
 session writer coordination, input submission, recovery, and compaction policy.
 It preserves live tools when threads change and rejects stale checkpoints.
-Lower-level `chat::run_session_turn` submits one durable turn; `chat::interact`
-only appends user input and runs the agent.
+Lower-level `chat::interact` only appends user input and runs the agent.
 
 ## Extend tools at the right layer
 

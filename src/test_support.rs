@@ -205,6 +205,19 @@ pub(crate) fn temp_home(tag: &str) -> TempHome {
     }
 }
 
+/// Save `messages` and `usage` to `thread_id` as an agent checkpoint would.
+pub(crate) fn persist_messages(
+    session: &crate::session::ActiveSession,
+    thread_id: &str,
+    messages: &[Message],
+    usage: Option<crate::generative_model::TokenUsage>,
+    force: bool,
+) -> Result<(), String> {
+    let mut state = crate::agent::AgentState::default();
+    state.replace_context(messages.to_vec(), usage).unwrap();
+    session.persist_agent_state(thread_id, &state, force, None)
+}
+
 pub(crate) fn tool_runtime(harness: Arc<crate::harness::Harness>) -> Arc<crate::SessionRuntime> {
     crate::SessionRuntime::new(
         harness,

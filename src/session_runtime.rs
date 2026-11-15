@@ -268,6 +268,7 @@ mod tests {
 
     use super::*;
     use crate::agent::{Agent, NullEventSink};
+    use crate::chat::{SessionRunner, WorkflowEvent};
     use crate::core::CancelToken;
     use crate::generative_model::{Content, GenerateOutput, ToolUse, TurnEndReason};
     use crate::session::{ActiveSession, Session, compact_thread};
@@ -316,8 +317,9 @@ mod tests {
             });
             let mut agent = Agent::new(model.clone(), live.clone(), Arc::new(NullEventSink));
             agent.set_before_generation_notice(Some(prelude_change_notices(vec![])));
-            run(&mut agent, &live).await;
-            run(&mut agent, &live).await;
+            let mut runner = runner(agent, &live).await;
+            run(&mut runner).await;
+            run(&mut runner).await;
 
             let requests = model.requests.lock().unwrap();
             assert_eq!(requests.len(), 3);
@@ -340,7 +342,7 @@ mod tests {
             let saved = Session::load(&session.snapshot().json_path()).unwrap();
             assert_eq!(
                 serde_json::to_value(saved.active_thread().messages.clone()).unwrap(),
-                serde_json::to_value(agent.history()).unwrap()
+                serde_json::to_value(runner.agent().history()).unwrap()
             );
             assert_eq!(saved.active_thread().user_turn_timestamps.len(), 2);
         });
@@ -367,17 +369,18 @@ mod tests {
             });
             let mut agent = Agent::new(model.clone(), live.clone(), Arc::new(NullEventSink));
             agent.set_before_generation_notice(Some(notices));
-            run(&mut agent, &live).await;
+            let mut runner = runner(agent, &live).await;
+            run(&mut runner).await;
             std::fs::write(dir.join("second.md"), "another fact").unwrap();
-            run(&mut agent, &live).await;
-            run(&mut agent, &live).await;
+            run(&mut runner).await;
+            run(&mut runner).await;
             let original = serde_json::to_value(session.snapshot().active_thread()).unwrap();
             let (next, _) = compact_thread(&session.snapshot(), "Continue the task.").unwrap();
             let retained = serde_json::to_string(&next.messages).unwrap();
             assert!(retained.contains("added: second.md"), "{retained}");
             assert!(!retained.contains("modified: build.md"), "{retained}");
             session.writer().await.commit_thread(next).unwrap();
-            run(&mut agent, &live).await;
+            run(&mut runner).await;
             assert_eq!(
                 serde_json::to_value(&session.snapshot().threads()[0]).unwrap(),
                 original
@@ -410,24 +413,23 @@ mod tests {
             );
             let mut agent = Agent::new(model, live.clone(), Arc::new(NullEventSink));
             agent.set_before_generation_notice(Some(notices));
-            let outcome = crate::chat::run_session_turn(
-                &mut agent,
-                &live,
-                vec![Content::Text {
-                    text: "user task".into(),
-                }],
-                CancelToken::new(),
-                chrono::Utc::now(),
-                |warning| panic!("{warning}"),
-            )
-            .await;
+            let mut runner = runner(agent, &live).await;
+            let outcome = runner
+                .submit(
+                    vec![Content::Text {
+                        text: "user task".into(),
+                    }],
+                    chrono::Utc::now(),
+                    CancelToken::new(),
+                )
+                .await;
             assert!(outcome.result.is_err());
             let rewound = serde_json::to_string(&outcome.rewound.unwrap()).unwrap();
             assert!(rewound.contains("user task"), "{rewound}");
             assert!(!rewound.contains("Prelude changes"), "{rewound}");
-            assert!(!agent.history().iter().any(Message::is_user_turn));
+            assert!(!runner.agent().history().iter().any(Message::is_user_turn));
             assert!(
-                !serde_json::to_string(agent.history())
+                !serde_json::to_string(runner.agent().history())
                     .unwrap()
                     .contains("Prelude changes")
             );
@@ -435,8 +437,8 @@ mod tests {
                 inner: ScriptedModel::new(vec![done()]),
                 requests: Mutex::default(),
             });
-            agent.set_model(model.clone());
-            run(&mut agent, &live).await;
+            runner.agent_mut().set_model(model.clone());
+            run(&mut runner).await;
             let requests = model.requests.lock().unwrap();
             let text = serde_json::to_string(&requests[0]).unwrap();
             assert_eq!(text.matches("Prelude changes").count(), 1);
@@ -492,20 +494,28 @@ mod tests {
         }
     }
 
-    async fn run(agent: &mut Agent, runtime: &Arc<SessionRuntime>) {
-        crate::chat::run_session_turn(
-            agent,
-            runtime,
-            vec![Content::Text {
-                text: "task".into(),
-            }],
-            CancelToken::new(),
-            chrono::Utc::now(),
-            |warning| panic!("{warning}"),
-        )
-        .await
-        .result
-        .unwrap();
+    async fn runner(agent: Agent, runtime: &Arc<SessionRuntime>) -> SessionRunner {
+        let mut runner = SessionRunner::new(agent, runtime.clone()).await.unwrap();
+        runner.set_observer(Arc::new(|event| {
+            if let WorkflowEvent::Warning(warning) = event {
+                panic!("{warning}");
+            }
+        }));
+        runner
+    }
+
+    async fn run(runner: &mut SessionRunner) {
+        runner
+            .submit(
+                vec![Content::Text {
+                    text: "task".into(),
+                }],
+                chrono::Utc::now(),
+                CancelToken::new(),
+            )
+            .await
+            .result
+            .unwrap();
     }
 
     #[test]
@@ -613,11 +623,11 @@ mod tests {
                 bash(json!({"action":"write", "session_id":"shared", "stdin":"marker=first; echo observed-$marker\n", "idle_ms":50, "timeout_ms":1000})),
                 done(),
             ]);
-            let mut first = Agent::new(model, live.clone(), Arc::new(NullEventSink));
-            run(&mut first, &live).await;
+            let mut first = runner(Agent::new(model, live.clone(), Arc::new(NullEventSink)), &live).await;
+            run(&mut first).await;
             let original = serde_json::to_value(session.snapshot().active_thread()).unwrap();
             assert!(original.to_string().contains("observed-first"));
-            let first_agent_id = first.context().agent_id;
+            let first_agent_id = first.agent().context().agent_id;
             drop(first);
             session.set_archived(true).unwrap();
             let shells = |hosts: Vec<crate::core::HostResources>| {
@@ -631,10 +641,10 @@ mod tests {
                 bash(json!({"action":"write", "session_id":"shared", "stdin":"echo inherited-$marker; marker=second; echo observed-$marker\n", "idle_ms":50, "timeout_ms":1000})),
                 done(),
             ]);
-            let mut second = Agent::new(model, live.clone(), Arc::new(NullEventSink));
-            run(&mut second, &live).await;
-            assert_ne!(second.context().agent_id, first_agent_id);
-            assert_eq!(second.context().thread_id.as_deref(), Some(session.snapshot().active_thread().id.as_str()));
+            let mut second = runner(Agent::new(model, live.clone(), Arc::new(NullEventSink)), &live).await;
+            run(&mut second).await;
+            assert_ne!(second.agent().context().agent_id, first_agent_id);
+            assert_eq!(second.agent().context().thread_id.as_deref(), Some(session.snapshot().active_thread().id.as_str()));
             let saved = session.snapshot();
             assert!(saved.archived);
             let current = serde_json::to_string(saved.active_thread()).unwrap();
@@ -647,11 +657,11 @@ mod tests {
                 bash(json!({"action":"write", "session_id":"shared", "stdin":"echo stolen\n", "idle_ms":10, "timeout_ms":1000})),
                 done(),
             ]);
-            let mut outsider = Agent::new(model, live.clone(), Arc::new(NullEventSink));
             let other_live = SessionRuntime::new(harness.clone(), unrelated);
-            run(&mut outsider, &other_live).await;
+            let mut outsider = runner(Agent::new(model, live.clone(), Arc::new(NullEventSink)), &other_live).await;
+            run(&mut outsider).await;
             assert_ne!(other_live.owner_id, owner);
-            let output = serde_json::to_string(outsider.history()).unwrap();
+            let output = serde_json::to_string(outsider.agent().history()).unwrap();
             assert!(output.contains("owned by another myco session"), "{output}");
             drop(outsider);
             assert_eq!(shells(live.resources().await), 1);
