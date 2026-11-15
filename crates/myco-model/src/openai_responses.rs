@@ -320,13 +320,22 @@ impl StreamAccumulator {
                         .into());
                     };
                     let tool_index = self.slots.open_tool_use(output_index);
-                    self.set_tool_json(output_index, arguments.unwrap_or_default());
+                    let arguments = arguments.unwrap_or_default();
                     self.saw_tool_call = true;
                     out.push(MessagePart::ToolUseStart(ToolUseStart {
                         index: tool_index,
                         name,
                         thought_signature: None,
                     }));
+                    // Some gateways send the complete arguments here and
+                    // stream no deltas.
+                    if !arguments.is_empty() {
+                        out.push(MessagePart::ToolUseDelta(ToolUseDelta {
+                            index: tool_index,
+                            input_json_delta: arguments.clone(),
+                        }));
+                    }
+                    self.set_tool_json(output_index, arguments);
                 }
                 ResponsesOutputItem::Other => {
                     self.slots.ignore(output_index);
@@ -1033,6 +1042,31 @@ mod tests {
             thinking_text(output),
             vec!["first summary", "second raw fallback"]
         );
+    }
+
+    #[test]
+    fn function_call_arguments_from_output_item_added_reach_the_tool_input() {
+        let added = serde_json::json!({"type":"response.output_item.added", "output_index":0,
+            "item":{"type":"function_call", "name":"bash", "arguments":"{\"command\":\"pwd\"}"}});
+        let done = serde_json::json!({"type":"response.function_call_arguments.done",
+            "output_index":0, "arguments":"{\"command\":\"pwd\"}"});
+        let delta = serde_json::json!({"type":"response.function_call_arguments.delta",
+            "output_index":0, "delta":"{\"command\":\"pwd\"}"});
+        let empty_added = serde_json::json!({"type":"response.output_item.added", "output_index":0,
+            "item":{"type":"function_call", "name":"bash", "arguments":""}});
+        for events in [
+            vec![added.clone()],
+            vec![added, done.clone()],
+            vec![empty_added.clone(), done],
+            vec![empty_added, delta],
+        ] {
+            let output = assembled_response(events);
+            assert_eq!(output.tool_uses.len(), 1);
+            assert_eq!(
+                output.tool_uses[0].input,
+                serde_json::json!({"command": "pwd"})
+            );
+        }
     }
 
     #[test]
