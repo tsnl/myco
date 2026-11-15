@@ -132,6 +132,9 @@ pub struct HostDispatchContext {
     /// Conversation thread observing this call. Discovery notices are repeated
     /// when compaction replaces context, while the live owner remains stable.
     pub thread_id: Option<String>,
+    /// Local skills the model's system prompt lists; the in-process host's
+    /// skill notices start from them. Remote hosts never receive it.
+    pub prompt_skills: Option<Arc<crate::skills::Reported>>,
 }
 
 impl HostDispatchContext {
@@ -142,6 +145,7 @@ impl HostDispatchContext {
             background: CancelToken::new(),
             max_image_base64_bytes: None,
             thread_id: None,
+            prompt_skills: None,
         }
     }
 }

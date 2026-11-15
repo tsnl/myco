@@ -6,6 +6,7 @@ use std::process::{Output, Stdio};
 use std::time::Duration;
 
 use myco::Session;
+use myco::generative_model::{Content, Message};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -546,6 +547,55 @@ async fn print_runs_tools_once_and_resumes_the_saved_session_by_prefix() {
         "x"
     );
     assert_eq!(provider.connections(), 3);
+}
+
+#[tokio::test]
+async fn startup_skills_are_not_repeated_but_later_changes_are_reported() {
+    let provider = StubHttpServer::sequence(vec![
+        tool("bash", json!({"command":"printf unchanged"})),
+        tool(
+            "bash",
+            json!({"command":"printf -- '---\\nname: demo\\ndescription: revised\\n---\\n' > .agents/skills/demo/SKILL.md"}),
+        ),
+        answer("Done.", 100),
+    ])
+    .await;
+    let env = CliEnv::new(&provider, false);
+    let manifest = env.dir.join(".agents/skills/demo/SKILL.md");
+    std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+    std::fs::write(
+        &manifest,
+        "---\nname: demo\ndescription: listed at startup\n---\nbody\n",
+    )
+    .unwrap();
+    let output = env.run(&["-p", "work"], b"").await;
+    assert_eq!(success(&output), "Done.\n");
+    let saved = env.saved(&session_id(&output));
+    let notices: Vec<_> = saved
+        .active_thread()
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::ToolResults { tool_use_results } => Some(tool_use_results),
+            _ => None,
+        })
+        .flatten()
+        .flat_map(|result| &result.content)
+        .filter_map(|part| match part {
+            Content::System { kind, text, .. } if kind == "host_observation" => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(
+        notices[0].contains("revised") && !notices[0].contains("listed at startup"),
+        "{notices:?}"
+    );
+    let first = provider.captured().await.body.to_string();
+    assert!(
+        first.contains("listed at startup"),
+        "prompt omitted the skill"
+    );
 }
 
 #[tokio::test]

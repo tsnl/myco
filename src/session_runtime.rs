@@ -92,6 +92,7 @@ pub struct SessionRuntime {
     session_id: String,
     session: ActiveSession,
     max_image_base64_bytes: AtomicU64,
+    prompt_skills: Mutex<Option<Arc<crate::skills::Reported>>>,
 }
 
 impl SessionRuntime {
@@ -103,6 +104,7 @@ impl SessionRuntime {
             session_id: session.id(),
             session,
             max_image_base64_bytes: AtomicU64::new(limit),
+            prompt_skills: Mutex::new(None),
         })
     }
 
@@ -115,6 +117,11 @@ impl SessionRuntime {
             limit.min(self.harness.max_image_base64_bytes()),
             Ordering::Relaxed,
         );
+    }
+
+    /// Record the local skills the current model's system prompt lists.
+    pub fn set_prompt_skills(&self, skills: crate::skills::Reported) {
+        *self.prompt_skills.lock().unwrap() = Some(Arc::new(skills));
     }
 
     pub fn session_id(&self) -> &str {
@@ -214,6 +221,7 @@ impl ToolExecutor for SessionRuntime {
     ) -> Async<ToolResult> {
         Box::pin(async move {
             let limit = self.max_image_base64_bytes.load(Ordering::Relaxed);
+            let prompt_skills = self.prompt_skills.lock().unwrap().clone();
             let mut result = self
                 .harness
                 .clone()
@@ -228,6 +236,7 @@ impl ToolExecutor for SessionRuntime {
                             self.session
                                 .with(|session| session.active_thread().id.clone()),
                         ),
+                        prompt_skills,
                     },
                 )
                 .await;
@@ -345,7 +354,7 @@ mod tests {
         let dir = prelude::dir().unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("build.md"), "old command").unwrap();
-        let (prompt, initial) = crate::prompts::agent_prompt_epilogue();
+        let (prompt, initial, _) = crate::prompts::agent_prompt_epilogue();
         let notices = prelude_change_notices(initial);
         std::fs::write(dir.join("build.md"), "new command").unwrap();
         assert!(prompt.contains("old command"));

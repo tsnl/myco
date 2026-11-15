@@ -380,6 +380,7 @@ impl HostController {
             background,
             max_image_base64_bytes,
             thread_id,
+            prompt_skills: _,
         } = context;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
         let response_timeout = response_timeout(&tool_use);

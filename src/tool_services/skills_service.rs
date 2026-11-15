@@ -13,6 +13,7 @@ use super::{HostDispatchContext, ToolService, tool_input_schema};
 #[derive(Default)]
 struct Observations {
     thread_id: Option<String>,
+    prompt_skills: Option<Arc<Reported>>,
     reported: Reported,
 }
 type OwnerObservations = Arc<tokio::sync::Mutex<Observations>>;
@@ -81,9 +82,15 @@ impl SkillsService {
             Ok::<_, String>((observed, path, catalog))
         };
         let (mut observed, path, catalog) = run_scan(&ctx.cancel, scan).await?;
-        if observed.thread_id != ctx.thread_id {
-            observed.reported = Reported::default();
+        // A thread starts from what its model's system prompt lists. A model
+        // rebuild replaces that prompt, so the record starts over with it.
+        let prompt = |skills: &Option<Arc<Reported>>| skills.as_ref().map(Arc::as_ptr);
+        if observed.thread_id != ctx.thread_id
+            || prompt(&observed.prompt_skills) != prompt(&ctx.prompt_skills)
+        {
+            observed.reported = ctx.prompt_skills.as_deref().cloned().unwrap_or_default();
             observed.thread_id = ctx.thread_id.clone();
+            observed.prompt_skills = ctx.prompt_skills.clone();
         }
         let heading = if force {
             "Skills for"
