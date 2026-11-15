@@ -78,8 +78,9 @@ pub(super) async fn blocking<T: Send + 'static>(
 }
 
 /// The worker's state as the browser labels it; variant names are the wire strings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 enum Status {
+    #[default]
     Ready,
     Running,
     Compacting,
@@ -88,20 +89,49 @@ enum Status {
     Stopped,
 }
 
-#[derive(Serialize)]
-struct Snapshot {
-    #[serde(skip)]
-    revision: u64,
-    session_id: String,
-    thread_id: String,
-    earlier_threads: Vec<String>,
+/// Untitled sessions show this until they are renamed.
+const UNTITLED: &str = "New session";
+
+/// What the saved session document says about itself.
+#[derive(Default, PartialEq, Serialize)]
+struct SessionFacts {
     title: String,
     archived: bool,
     auto_continue: bool,
-    model: String,
-    models: Vec<String>,
-    attachment_limits: attachments::Limits,
     usage: Option<TokenUsage>,
+}
+
+impl From<&Session> for SessionFacts {
+    fn from(session: &Session) -> Self {
+        Self {
+            title: session.title.clone().unwrap_or_else(|| UNTITLED.into()),
+            archived: session.archived,
+            auto_continue: session.auto_continue,
+            usage: session.active_thread().last_usage,
+        }
+    }
+}
+
+/// The full browser projection: `meta` changes alone publish as `meta` updates.
+#[derive(Default, Serialize)]
+struct Snapshot {
+    #[serde(skip)]
+    revision: u64,
+    #[serde(flatten)]
+    meta: Metadata,
+    earlier_threads: Vec<String>,
+    models: Vec<String>,
+    blocks: Vec<Block>,
+}
+
+#[derive(Default, Serialize)]
+struct Metadata {
+    session_id: String,
+    thread_id: String,
+    #[serde(flatten)]
+    facts: SessionFacts,
+    model: String,
+    attachment_limits: attachments::Limits,
     context_window_tokens: u64,
     /// The accepted run's token: present exactly while the worker is busy.
     #[serde(rename = "busy", serialize_with = "serialize_busy")]
@@ -110,7 +140,6 @@ struct Snapshot {
     queued: VecDeque<QueuedMessage>,
     timers: Vec<timers::Timer>,
     inbox: Vec<InboxEntry>,
-    blocks: Vec<Block>,
 }
 
 fn serialize_busy<S: serde::Serializer>(
@@ -120,7 +149,7 @@ fn serialize_busy<S: serde::Serializer>(
     serializer.serialize_bool(cancel.is_some())
 }
 
-impl Snapshot {
+impl Metadata {
     fn busy(&self) -> bool {
         self.cancel.is_some()
     }
@@ -137,18 +166,6 @@ impl Snapshot {
         }
         self.status = status;
         true
-    }
-
-    fn metadata(&self) -> Value {
-        json!({
-            "session_id": self.session_id, "thread_id": self.thread_id,
-            "title": self.title, "archived": self.archived, "model": self.model,
-            "auto_continue": self.auto_continue,
-            "busy": self.busy(), "status": self.status, "queued": self.queued, "timers": self.timers,
-            "inbox": self.inbox,
-            "attachment_limits": self.attachment_limits,
-            "usage": self.usage, "context_window_tokens": self.context_window_tokens,
-        })
     }
 }
 
@@ -197,7 +214,7 @@ pub(super) struct App {
 impl App {
     pub(super) fn background(&self, session_id: &str, call_id: Uuid) -> Result<()> {
         let mut live = self.live.lock().unwrap();
-        if live.snapshot.session_id != session_id || live.snapshot.cancelling() {
+        if live.snapshot.meta.session_id != session_id || live.snapshot.meta.cancelling() {
             return Err(Error::Conflict(
                 "The session changed or is cancelling.".into(),
             ));
@@ -218,7 +235,7 @@ impl App {
 
     fn stop(&self) {
         self.shutdown.cancel();
-        if let Some(cancel) = &self.live.lock().unwrap().snapshot.cancel {
+        if let Some(cancel) = &self.live.lock().unwrap().snapshot.meta.cancel {
             cancel.cancel();
         }
     }
@@ -226,7 +243,7 @@ impl App {
     fn publish(&self, snapshot: &mut Snapshot, change: Value) {
         snapshot.revision += 1;
         let _ = self.events.send(Arc::new(Update {
-            session_id: snapshot.session_id.clone(),
+            session_id: snapshot.meta.session_id.clone(),
             revision: snapshot.revision,
             change,
         }));
@@ -245,14 +262,14 @@ impl App {
     }
 
     fn publish_metadata(&self, snapshot: &mut Snapshot) {
-        let change = json!({"kind":"meta", "meta":snapshot.metadata()});
+        let change = json!({"kind":"meta", "meta":snapshot.meta});
         self.publish(snapshot, change);
     }
 
     pub(super) fn snapshot(&self) -> Update {
         let live = self.live.lock().unwrap();
         Update {
-            session_id: live.snapshot.session_id.clone(),
+            session_id: live.snapshot.meta.session_id.clone(),
             revision: live.snapshot.revision,
             change: json!({"kind":"snapshot", "snapshot":live.snapshot}),
         }
@@ -274,7 +291,7 @@ impl App {
     }
 
     fn warning(&self, text: String) {
-        let compacting = self.live.lock().unwrap().snapshot.status == Status::Compacting;
+        let compacting = self.live.lock().unwrap().snapshot.meta.status == Status::Compacting;
         if compacting {
             self.status(Status::Running);
         }
@@ -292,7 +309,7 @@ impl App {
 
     fn status(&self, status: Status) {
         let mut live = self.live.lock().unwrap();
-        if live.snapshot.progress(status) {
+        if live.snapshot.meta.progress(status) {
             self.publish_metadata(&mut live.snapshot);
         }
     }
@@ -353,26 +370,20 @@ impl App {
         live.retry_notice = None;
         let snapshot = &mut live.snapshot;
         let mut blocks = view::history(session.active_thread());
-        if snapshot.thread_id == session.active_thread().id {
+        if snapshot.meta.thread_id == session.active_thread().id {
             view::retain_tool_timers(&mut blocks, &snapshot.blocks);
         }
         view::retain_processes(&mut blocks, &snapshot.blocks);
-        snapshot.session_id = session.id.clone();
-        snapshot.thread_id = session.active_thread().id.clone();
+        snapshot.meta.session_id = session.id.clone();
+        snapshot.meta.thread_id = session.active_thread().id.clone();
         snapshot.earlier_threads = view::earlier_threads(&session);
-        snapshot.title = session
-            .title
-            .clone()
-            .unwrap_or_else(|| "New session".into());
-        snapshot.archived = session.archived;
-        snapshot.auto_continue = session.auto_continue;
-        snapshot.model = boot.catalog_model.spec.key.clone();
-        snapshot.attachment_limits =
+        snapshot.meta.facts = SessionFacts::from(&session);
+        snapshot.meta.model = boot.catalog_model.spec.key.clone();
+        snapshot.meta.attachment_limits =
             attachments::Limits::new(boot.catalog_model.spec.max_image_base64_bytes);
-        snapshot.usage = session.active_thread().last_usage;
-        snapshot.context_window_tokens = boot.catalog_model.spec.context_window_tokens;
+        snapshot.meta.context_window_tokens = boot.catalog_model.spec.context_window_tokens;
         snapshot.blocks = blocks;
-        snapshot.status = status;
+        snapshot.meta.status = status;
         if let Err(error) = self.start_next(&mut live) {
             live.snapshot.blocks.push(Block::Notice {
                 text: error.to_string(),
@@ -384,29 +395,16 @@ impl App {
     }
 
     fn refresh_metadata(&self, session: &ActiveSession) {
-        let (title, archived, auto_continue, usage) = session.with(|session| {
-            (
-                session
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| "New session".into()),
-                session.archived,
-                session.auto_continue,
-                session.active_thread().last_usage,
-            )
-        });
+        let facts = session.with(|session| SessionFacts::from(session));
         let mut live = self.live.lock().unwrap();
-        let listing_changed = live.snapshot.title != title || live.snapshot.archived != archived;
-        if listing_changed
-            || live.snapshot.usage != usage
-            || live.snapshot.auto_continue != auto_continue
-        {
-            live.snapshot.title = title;
-            live.snapshot.archived = archived;
-            live.snapshot.auto_continue = auto_continue;
-            live.snapshot.usage = usage;
-            self.publish_metadata(&mut live.snapshot);
+        let current = &live.snapshot.meta.facts;
+        if *current == facts {
+            return;
         }
+        // Session listings show titles and archive state, not usage or modes.
+        let listing_changed = current.title != facts.title || current.archived != facts.archived;
+        live.snapshot.meta.facts = facts;
+        self.publish_metadata(&mut live.snapshot);
         if listing_changed {
             self.generation.fetch_add(1, Ordering::Relaxed);
         }
@@ -784,8 +782,6 @@ impl Sessions {
             )
         });
         let (work, receiver) = mpsc::channel(1);
-        let image_limit = catalog.spec.max_image_base64_bytes;
-        let context_window_tokens = catalog.spec.context_window_tokens;
         let (mut boot, app) = boot_session(
             &self.args,
             self.config.clone(),
@@ -807,33 +803,15 @@ impl Sessions {
                         inbox,
                         generation_start: None,
                         retry_notice: None,
+                        // Nothing observes the app before `sync_with` projects the session.
                         snapshot: Snapshot {
-                            revision: 0,
-                            session_id: session.id.clone(),
-                            thread_id: session.active_thread().id.clone(),
-                            earlier_threads: view::earlier_threads(&session),
-                            title: session
-                                .title
-                                .clone()
-                                .unwrap_or_else(|| "New session".into()),
-                            archived: session.archived,
-                            auto_continue: session.auto_continue,
-                            model: config.model.clone(),
                             models: config
                                 .models
                                 .keys()
                                 .into_iter()
                                 .map(str::to_owned)
                                 .collect(),
-                            attachment_limits: attachments::Limits::new(image_limit),
-                            usage: session.active_thread().last_usage,
-                            context_window_tokens,
-                            cancel: None,
-                            status: Status::Ready,
-                            queued: VecDeque::new(),
-                            timers: vec![],
-                            inbox: vec![],
-                            blocks: view::history(session.active_thread()),
+                            ..Default::default()
                         },
                         background: HashMap::new(),
                         accepted: HashMap::new(),
@@ -920,7 +898,7 @@ impl Sessions {
     /// An open session's live projection and the saved document behind it.
     async fn opened(&self, id: &str) -> Result<(Arc<App>, ActiveSession)> {
         let app = self.open(id).await?;
-        let id = app.live.lock().unwrap().snapshot.session_id.clone();
+        let id = app.live.lock().unwrap().snapshot.meta.session_id.clone();
         let running = self.running.lock().await;
         let session = running
             .get(&id)
@@ -1018,16 +996,16 @@ impl Sessions {
             // Listings add labels for idle work and unopened sessions.
             let status = live.as_ref().map_or(json!("Saved"), |live| {
                 let snapshot = &live.snapshot;
-                if !snapshot.busy() && snapshot.blocks.iter().any(|block| matches!(block, Block::Tool { running: true, .. })) { json!(Status::Running) }
-                else if !snapshot.busy() && snapshot.inbox.iter().any(|entry| entry.state.active()) { json!("Waiting") }
-                else { json!(snapshot.status) }
+                if !snapshot.meta.busy() && snapshot.blocks.iter().any(|block| matches!(block, Block::Tool { running: true, .. })) { json!(Status::Running) }
+                else if !snapshot.meta.busy() && snapshot.meta.inbox.iter().any(|entry| entry.state.active()) { json!("Waiting") }
+                else { json!(snapshot.meta.status) }
             });
-            let title = s.title.unwrap_or_else(|| if s.snippet.is_empty() { "New session".into() } else { s.snippet });
+            let title = s.title.unwrap_or_else(|| if s.snippet.is_empty() { UNTITLED.into() } else { s.snippet });
             json!({
                 "id": s.id, "title": title,
-                "model": live.as_ref().map_or(s.model.as_str(), |live| &live.snapshot.model),
+                "model": live.as_ref().map_or(s.model.as_str(), |live| &live.snapshot.meta.model),
                 "updated_at": s.updated_at, "archived": s.archived, "status": status,
-                "busy": live.as_ref().is_some_and(|live| live.snapshot.busy()),
+                "busy": live.as_ref().is_some_and(|live| live.snapshot.meta.busy()),
             })
         }).collect()))
     }
@@ -1230,7 +1208,7 @@ impl App {
                 "Request ID already belongs to an inbox event.".into(),
             ));
         }
-        if request.session_id != live.snapshot.session_id {
+        if request.session_id != live.snapshot.meta.session_id {
             return Err(Error::Conflict(
                 "The request belongs to a different session.".into(),
             ));
@@ -1239,7 +1217,7 @@ impl App {
             request.action,
             Action::UpdateQueued { .. } | Action::CancelTimer { .. }
         );
-        if live.snapshot.busy()
+        if live.snapshot.meta.busy()
             && !matches!(
                 request.action,
                 Action::Submit { .. } | Action::UpdateQueued { .. } | Action::CancelTimer { .. }
@@ -1249,7 +1227,7 @@ impl App {
                 "Wait for the current run or cancel it first.".into(),
             ));
         }
-        if live.snapshot.cancelling() && !queue_update {
+        if live.snapshot.meta.cancelling() && !queue_update {
             return Err(Error::Conflict("Wait for cancellation to finish.".into()));
         }
         let accepted_at = Utc::now();
@@ -1294,14 +1272,14 @@ impl App {
                 accepted_at,
             })
             .map_err(|_| Error::Unavailable("The session worker is unavailable.".into()))?;
-        live.snapshot.cancel = Some(cancel);
-        live.snapshot.status = Status::Running;
+        live.snapshot.meta.cancel = Some(cancel);
+        live.snapshot.meta.status = Status::Running;
         Ok(())
     }
 
     pub(super) fn cancel(&self, session_id: &str) -> Result<()> {
         let mut live = self.live.lock().unwrap();
-        if session_id != live.snapshot.session_id {
+        if session_id != live.snapshot.meta.session_id {
             return Err(Error::Conflict(
                 "The request belongs to a different session.".into(),
             ));
@@ -1311,9 +1289,9 @@ impl App {
     }
 
     fn cancel_live(&self, live: &mut Live) {
-        if let Some(cancel) = &live.snapshot.cancel {
+        if let Some(cancel) = &live.snapshot.meta.cancel {
             cancel.cancel();
-            live.snapshot.status = Status::Cancelling;
+            live.snapshot.meta.status = Status::Cancelling;
         }
         self.publish_metadata(&mut live.snapshot);
     }

@@ -20,7 +20,7 @@ async fn tool(app: &Arc<App>, input: Value) -> myco::generative_model::ToolResul
 #[tokio::test(start_paused = true)]
 async fn stable_timer_ids_preserve_exact_absolute_times_and_retry_after_the_due_time() {
     let (app, _work) = app();
-    app.live.lock().unwrap().snapshot.cancel = Some(CancelToken::new());
+    app.live.lock().unwrap().snapshot.meta.cancel = Some(CancelToken::new());
     let id = Uuid::new_v4();
     let at = (app.clock.now() + chrono::Duration::seconds(1)).to_rfc3339();
     let input = json!({"action":"set", "event_id":id, "at":at, "message":"Once"});
@@ -74,7 +74,7 @@ async fn timer_wakes_an_idle_session_once_without_a_browser_connection() {
 #[tokio::test(start_paused = true)]
 async fn due_timers_queue_behind_user_input_and_can_be_cancelled_before_delivery() {
     let (app, _work) = app();
-    app.live.lock().unwrap().snapshot.cancel = Some(CancelToken::new());
+    app.live.lock().unwrap().snapshot.meta.cancel = Some(CancelToken::new());
     app.accept(
         serde_json::from_value(json!({"request_id":Uuid::new_v4(),"session_id":"session",
         "action":{"kind":"submit","text":"User followup"}}))
@@ -111,7 +111,7 @@ async fn due_timers_queue_behind_user_input_and_can_be_cancelled_before_delivery
 #[tokio::test(start_paused = true)]
 async fn full_queue_retains_due_timers_and_delivery_respects_deadline_order() {
     let (app, _work) = app();
-    app.live.lock().unwrap().snapshot.cancel = Some(CancelToken::new());
+    app.live.lock().unwrap().snapshot.meta.cancel = Some(CancelToken::new());
     for _ in 0..MAX_QUEUED_MESSAGES {
         app.accept(
             serde_json::from_value(json!({"request_id":Uuid::new_v4(), "session_id":"session",
@@ -131,7 +131,7 @@ async fn full_queue_retains_due_timers_and_delivery_respects_deadline_order() {
             .len(),
         2
     );
-    app.live.lock().unwrap().snapshot.queued.clear();
+    app.live.lock().unwrap().snapshot.meta.queued.clear();
     app.fire_timers();
     let first = app.claim_followup().unwrap().unwrap();
     assert_eq!(first.timer.unwrap().id, early.id);
@@ -148,7 +148,7 @@ async fn full_queue_retains_due_timers_and_delivery_respects_deadline_order() {
 async fn shutdown_and_cancellation_do_not_start_timer_work() {
     let (app, mut work) = app();
     app.set_timer(Some(1.0), None, "Later".into()).unwrap();
-    app.live.lock().unwrap().snapshot.status = Status::Cancelling;
+    app.live.lock().unwrap().snapshot.meta.status = Status::Cancelling;
     tokio::time::advance(Duration::from_secs(2)).await;
     app.fire_timers();
     assert!(work.try_recv().is_err());
@@ -159,7 +159,7 @@ async fn shutdown_and_cancellation_do_not_start_timer_work() {
             .len(),
         1
     );
-    app.live.lock().unwrap().snapshot.status = Status::Ready;
+    app.live.lock().unwrap().snapshot.meta.status = Status::Ready;
     app.stop();
     app.fire_timers();
     assert!(work.try_recv().is_err());
@@ -213,7 +213,7 @@ async fn timer_tool_validates_deadlines_and_arguments_without_mutating_the_queue
 #[tokio::test(start_paused = true)]
 async fn timer_followups_are_labeled_system_messages_live_and_after_reload() {
     let (app, _work) = app();
-    app.live.lock().unwrap().snapshot.cancel = Some(CancelToken::new());
+    app.live.lock().unwrap().snapshot.meta.cancel = Some(CancelToken::new());
     app.set_timer(Some(0.1), None, "Check build".into())
         .unwrap();
     tokio::time::advance(Duration::from_secs(1)).await;
@@ -241,7 +241,7 @@ async fn timer_ownership_and_limits_include_fired_messages_waiting_for_delivery(
     for _ in 1..20 {
         first.set_timer(Some(1.0), None, "Pending".into()).unwrap();
     }
-    first.live.lock().unwrap().snapshot.cancel = Some(CancelToken::new());
+    first.live.lock().unwrap().snapshot.meta.cancel = Some(CancelToken::new());
     tokio::time::advance(Duration::from_secs(1)).await;
     first.fire_timers();
     assert_eq!(

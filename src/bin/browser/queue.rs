@@ -107,7 +107,7 @@ impl App {
         request: &ActionRequest,
         accepted_at: DateTime<Utc>,
     ) -> Result<()> {
-        if live.snapshot.queued.len() >= MAX_QUEUED_MESSAGES {
+        if live.snapshot.meta.queued.len() >= MAX_QUEUED_MESSAGES {
             return Err(Error::Conflict(
                 "The message queue is full (20 messages).".into(),
             ));
@@ -118,9 +118,9 @@ impl App {
         validate_message(
             text,
             images,
-            live.snapshot.attachment_limits.max_image_base64_bytes,
+            live.snapshot.meta.attachment_limits.max_image_base64_bytes,
         )?;
-        live.snapshot.queued.push_back(QueuedMessage {
+        live.snapshot.meta.queued.push_back(QueuedMessage {
             request_id: request.request_id,
             text: text.clone(),
             images: images.clone(),
@@ -141,13 +141,14 @@ impl App {
     ) -> Result<()> {
         let index = live
             .snapshot
+            .meta
             .queued
             .iter()
             .position(|message| message.request_id == id)
             .ok_or_else(|| {
                 Error::Conflict("This message has already been sent or unqueued.".into())
             })?;
-        let message = &mut live.snapshot.queued[index];
+        let message = &mut live.snapshot.meta.queued[index];
         if message.state == QueueState::Sending {
             return Err(Error::Conflict(
                 "This message is already being sent.".into(),
@@ -178,7 +179,7 @@ impl App {
                 validate_message(
                     text,
                     images,
-                    live.snapshot.attachment_limits.max_image_base64_bytes,
+                    live.snapshot.meta.attachment_limits.max_image_base64_bytes,
                 )?;
                 message.text = text.clone();
                 message.images = images.clone();
@@ -186,7 +187,7 @@ impl App {
             }
             QueueUpdate::Resume => message.state = QueueState::Ready,
             QueueUpdate::Remove => {
-                live.snapshot.queued.remove(index);
+                live.snapshot.meta.queued.remove(index);
                 return Ok(());
             }
         }
@@ -197,7 +198,7 @@ impl App {
     /// Expire overdue events, and unqueue those that are no longer awaiting delivery.
     pub(super) fn expire_events(&self, live: &mut Live, now: DateTime<Utc>) -> Result<()> {
         live.inbox.expire(now).map_err(Error::Internal)?;
-        live.snapshot.queued.retain(|message| {
+        live.snapshot.meta.queued.retain(|message| {
             message.timer.is_none()
                 || live
                     .inbox
@@ -210,11 +211,12 @@ impl App {
     pub(super) fn drain_queue(&self, live: &mut Live) -> Result<()> {
         self.expire_events(live, self.clock.now())?;
         self.refresh_inbox(live);
-        if live.snapshot.busy() || self.shutdown.is_cancelled() {
+        if live.snapshot.meta.busy() || self.shutdown.is_cancelled() {
             return Ok(());
         }
         if let Some(next) = live
             .snapshot
+            .meta
             .queued
             .front()
             .filter(|message| message.state == QueueState::Ready)
@@ -225,7 +227,7 @@ impl App {
             }
             if let Err(error) = self.start_work(
                 live,
-                next.request(&live.snapshot.session_id),
+                next.request(&live.snapshot.meta.session_id),
                 next.accepted_at,
             ) {
                 if next.timer.is_some() {
@@ -235,13 +237,13 @@ impl App {
                 }
                 return Err(error);
             }
-            live.snapshot.queued.pop_front();
+            live.snapshot.meta.queued.pop_front();
         }
         Ok(())
     }
 
     pub(super) fn start_next(&self, live: &mut Live) -> Result<()> {
-        live.snapshot.cancel = None;
+        live.snapshot.meta.cancel = None;
         self.drain_queue(live)
     }
 
@@ -251,12 +253,13 @@ impl App {
 
     pub(super) fn claim_followup(&self) -> Result<Option<QueuedMessage>> {
         let mut live = self.live.lock().unwrap();
-        if self.shutdown.is_cancelled() || live.snapshot.cancelling() {
+        if self.shutdown.is_cancelled() || live.snapshot.meta.cancelling() {
             return Ok(None);
         }
         self.expire_events(&mut live, self.clock.now())?;
         let next = live
             .snapshot
+            .meta
             .queued
             .front()
             .filter(|message| message.state == QueueState::Ready)
@@ -268,7 +271,12 @@ impl App {
             self.claim_event(&mut live, next.request_id)?;
         }
         next.state = QueueState::Sending;
-        *live.snapshot.queued.front_mut().expect("claimed entry") = next.clone();
+        *live
+            .snapshot
+            .meta
+            .queued
+            .front_mut()
+            .expect("claimed entry") = next.clone();
         self.publish_metadata(&mut live.snapshot);
         Ok(Some(next))
     }
@@ -280,6 +288,7 @@ impl App {
         }
         let next = live
             .snapshot
+            .meta
             .queued
             .front_mut()
             .expect("claimed queue entry");
@@ -298,7 +307,11 @@ impl App {
             self.refresh_inbox(&mut live);
         }
         let snapshot = &mut live.snapshot;
-        let next = snapshot.queued.pop_front().expect("claimed queue entry");
+        let next = snapshot
+            .meta
+            .queued
+            .pop_front()
+            .expect("claimed queue entry");
         assert_eq!(next.request_id, id);
         if let Some(block) = block {
             self.push_block(snapshot, block);

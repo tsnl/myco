@@ -140,7 +140,7 @@ impl App {
             },
         };
         let mut live = self.live.lock().unwrap();
-        if live.snapshot.session_id != request.session_id {
+        if live.snapshot.meta.session_id != request.session_id {
             return Err(Error::Conflict(
                 "The request belongs to a different session.".into(),
             ));
@@ -177,7 +177,9 @@ impl App {
                 "The session worker is unavailable.".into(),
             ));
         }
-        if live.snapshot.busy() || live.service.active.is_some() || !live.snapshot.queued.is_empty()
+        if live.snapshot.meta.busy()
+            || live.service.active.is_some()
+            || !live.snapshot.meta.queued.is_empty()
         {
             return Err(Error::Conflict("The session has active or queued work. Observe it or wait before submitting a service turn.".into()));
         }
@@ -190,7 +192,7 @@ impl App {
         attachments::literal_content(
             text,
             images,
-            live.snapshot.attachment_limits.max_image_base64_bytes,
+            live.snapshot.meta.attachment_limits.max_image_base64_bytes,
         )
         .map_err(Error::Invalid)?;
         self.start_work(&mut live, request.clone(), chrono::Utc::now())?;
@@ -287,7 +289,7 @@ mod tests {
         });
         app.emit(AgentEvent::GenerationCommitted { context });
         app.finish_service(id, &Ok(()), false);
-        app.live.lock().unwrap().snapshot.cancel = None;
+        app.live.lock().unwrap().snapshot.meta.cancel = None;
     }
 
     #[test]

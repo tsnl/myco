@@ -98,17 +98,20 @@ async fn normal_events_background_bash_but_preserve_fifo_and_do_not_cancel_gener
 #[tokio::test]
 async fn urgent_events_bypass_a_full_or_held_queue_without_dropping_user_input() {
     let (app, _work) = app();
-    app.live.lock().unwrap().snapshot.cancel = Some(CancelToken::new());
+    app.live.lock().unwrap().snapshot.meta.cancel = Some(CancelToken::new());
     for _ in 0..MAX_QUEUED_MESSAGES {
         app.accept(action_request()).unwrap();
     }
-    app.live.lock().unwrap().snapshot.queued[0].state = queue::QueueState::Editing;
+    app.live.lock().unwrap().snapshot.meta.queued[0].state = queue::QueueState::Editing;
     let event = request("Time-sensitive signal", Priority::TimeSensitive);
     app.post_event(event.clone(), Source::Trigger).unwrap();
     let live = app.live.lock().unwrap();
-    assert_eq!(live.snapshot.queued.len(), MAX_QUEUED_MESSAGES + 1);
-    assert_eq!(live.snapshot.queued[0].request_id, event.event_id);
-    assert_eq!(live.snapshot.queued[1].state, queue::QueueState::Editing);
+    assert_eq!(live.snapshot.meta.queued.len(), MAX_QUEUED_MESSAGES + 1);
+    assert_eq!(live.snapshot.meta.queued[0].request_id, event.event_id);
+    assert_eq!(
+        live.snapshot.meta.queued[1].state,
+        queue::QueueState::Editing
+    );
 }
 
 #[tokio::test(start_paused = true)]

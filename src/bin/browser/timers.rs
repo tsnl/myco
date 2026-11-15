@@ -271,6 +271,7 @@ impl App {
             .cancel(id, self.clock.now())
             .map_err(Error::Conflict)?;
         live.snapshot
+            .meta
             .queued
             .retain(|message| message.request_id != id);
         self.refresh_inbox(live);
@@ -278,8 +279,8 @@ impl App {
     }
 
     pub(super) fn refresh_inbox(&self, live: &mut Live) {
-        live.snapshot.inbox = live.inbox.entries().to_vec();
-        live.snapshot.timers = live
+        live.snapshot.meta.inbox = live.inbox.entries().to_vec();
+        live.snapshot.meta.timers = live
             .inbox
             .entries()
             .iter()
@@ -288,13 +289,14 @@ impl App {
                     && entry.source == Source::Timer
                     && !live
                         .snapshot
+                        .meta
                         .queued
                         .iter()
                         .any(|m| m.request_id == entry.request.event_id)
             })
             .map(|entry| self.timer_view(entry))
             .collect();
-        live.snapshot.timers.sort_by_key(|timer| timer.due_at);
+        live.snapshot.meta.timers.sort_by_key(|timer| timer.due_at);
     }
 
     fn timer_view(&self, entry: &Entry) -> Timer {
@@ -317,12 +319,12 @@ impl App {
         if self.shutdown.is_cancelled() || self.work.is_closed() {
             return;
         }
-        let previous = live.snapshot.metadata();
+        let previous = serde_json::json!(live.snapshot.meta);
         if let Err(error) = self.queue_events(&mut live) {
             self.inbox_error(&mut live, error.to_string());
         }
         self.refresh_inbox(&mut live);
-        if live.snapshot.metadata() != previous {
+        if serde_json::json!(live.snapshot.meta) != previous {
             self.publish_metadata(&mut live.snapshot);
         }
     }
@@ -330,7 +332,7 @@ impl App {
     fn queue_events(&self, live: &mut Live) -> Result<()> {
         let now = self.clock.now();
         self.expire_events(live, now)?;
-        if live.snapshot.cancelling() {
+        if live.snapshot.meta.cancelling() {
             return Ok(());
         }
         let mut pending: Vec<_> = live
@@ -350,13 +352,14 @@ impl App {
         for entry in pending {
             if live
                 .snapshot
+                .meta
                 .queued
                 .iter()
                 .any(|m| m.request_id == entry.request.event_id)
             {
                 continue;
             }
-            if live.snapshot.queued.len() >= MAX_QUEUED_MESSAGES
+            if live.snapshot.meta.queued.len() >= MAX_QUEUED_MESSAGES
                 && !entry.request.priority.interrupts()
             {
                 continue;
@@ -365,6 +368,7 @@ impl App {
             if entry.request.priority.interrupts() && !entry.held {
                 let index = live
                     .snapshot
+                    .meta
                     .queued
                     .iter()
                     .position(|m| {
@@ -373,10 +377,10 @@ impl App {
                                 event.priority.interrupts() && m.state == QueueState::Ready
                             })
                     })
-                    .unwrap_or(live.snapshot.queued.len());
-                live.snapshot.queued.insert(index, message);
+                    .unwrap_or(live.snapshot.meta.queued.len());
+                live.snapshot.meta.queued.insert(index, message);
             } else {
-                live.snapshot.queued.push_back(message);
+                live.snapshot.meta.queued.push_back(message);
             }
         }
         self.preempt_for_events(live);
@@ -386,7 +390,7 @@ impl App {
     // Never cancel a turn until every foreground bash call has acknowledged its
     // background signal. Cancelling both signals together would kill the child.
     pub(super) fn preempt_for_events(&self, live: &mut Live) {
-        if !live.snapshot.busy() || live.snapshot.cancelling() {
+        if !live.snapshot.meta.busy() || live.snapshot.meta.cancelling() {
             return;
         }
         let due: Vec<_> = live

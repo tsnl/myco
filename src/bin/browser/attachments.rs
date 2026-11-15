@@ -15,7 +15,7 @@ use serde::Serialize;
 pub(super) const MAX_IMAGES: usize = 20;
 pub(super) const ACTION_BODY_LIMIT: usize = MAX_MESSAGE_ATTACHMENT_BYTES as usize + 2 * 1024 * 1024;
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Default, Serialize)]
 pub(super) struct Limits {
     pub(super) max_image_base64_bytes: u64,
     max_message_attachment_bytes: u64,
