@@ -186,15 +186,27 @@ pub trait ToolService: Send + Sync + 'static {
         ctx: HostDispatchContext,
     ) -> Async<generative_model::ToolResult>;
 
-    /// Optional host-local observations after a successful tool call. Notices
-    /// are data attached to that result as a system part: model context, not
-    /// transcript output. They cannot authorize or replay the call.
+    /// Optional host-local observations after a successful tool call.
+    /// `directory` is the serving service's [`Self::working_directory`].
+    /// Notices are data attached to that result as a system part: model
+    /// context, not transcript output. They cannot authorize or replay the call.
     fn observe_successful_call(
         self: Arc<Self>,
         _tool: generative_model::ToolUse,
+        _directory: Option<std::path::PathBuf>,
         _ctx: HostDispatchContext,
     ) -> Async<Option<String>> {
         Box::pin(async { None })
+    }
+
+    /// The host-local directory a successful call worked in when its input does
+    /// not name one, such as a retained shell's current directory.
+    fn working_directory(
+        &self,
+        _tool: &generative_model::ToolUse,
+        _owner: uuid::Uuid,
+    ) -> Option<std::path::PathBuf> {
+        None
     }
 
     /// Called when a session runtime ends so services can release its state.

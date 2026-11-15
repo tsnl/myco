@@ -240,8 +240,9 @@ Descriptor-relative opens reject symlinked layouts and manifests; work and outpu
 are bounded. Catalogs retain paths to distinguish duplicate names and report
 partial scans. The model reads selected instructions through the editor, keeping
 discovery separate from skill execution and permission policy. Bash observations
-use the worker's launch directory; `skills(path, host)` covers explicit directory
-changes without parsing shell commands.
+use a retained session process's current directory (the `working_directory` hook)
+and otherwise the worker's launch directory; `skills(path, host)` covers other
+directory changes without parsing shell commands.
 
 The external programs myco spawns are named in
 [src/external_command.rs](src/external_command.rs); startup preflight uses that

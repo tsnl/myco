@@ -2,6 +2,7 @@
 
 use super::*;
 use std::io;
+use std::path::PathBuf;
 use std::sync::Weak;
 
 //
@@ -70,6 +71,12 @@ impl ProcessOwner {
         self.child.as_ref().and_then(Child::id)
     }
 
+    /// The leader's current directory. The unreaped leader pins its PID, so
+    /// the lookup cannot name a recycled process.
+    pub(super) fn working_directory(&self) -> Option<PathBuf> {
+        process_directory(self.pid()?)
+    }
+
     pub(super) fn signal(&self, signal: libc::c_int) -> io::Result<()> {
         signal_process_group(self.pid(), signal)
     }
@@ -117,6 +124,46 @@ fn observe_exit(owner: &ProcessOwner) -> io::Result<Option<ProcessExit>> {
         .pid()
         .ok_or_else(|| io::Error::other("child has no PID"))?;
     read_exit(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn process_directory(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn process_directory(pid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    // SAFETY: an all-zero proc_vnodepathinfo is a valid plain-data value.
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    // SAFETY: the buffer is exactly `size` writable bytes of the requested flavor.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    let path: Vec<u8> = info
+        .pvi_cdir
+        .vip_path
+        .as_flattened()
+        .iter()
+        .map(|byte| *byte as u8)
+        .take_while(|byte| *byte != 0)
+        .collect();
+    (!path.is_empty()).then(|| PathBuf::from(std::ffi::OsString::from_vec(path)))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_directory(_pid: u32) -> Option<PathBuf> {
+    None
 }
 
 fn read_exit(pid: u32) -> io::Result<Option<ProcessExit>> {

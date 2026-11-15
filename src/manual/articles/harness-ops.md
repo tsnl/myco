@@ -227,6 +227,8 @@ When tools fail or the user asks why something is broken, investigate with tools
    - `bash` `uname -n` / `pwd` / `hostname` on the intended `host`.
    - For missing skills, call `skills` with the intended directory and host.
      Relative paths use the worker's launch directory, even after a bash `cd`.
+     Automatic discovery follows a retained shell session's directory, but not
+     a `cd` inside an `exec` command.
      Check `.agents/skills`, `.claude/skills`, or `.grok/skills` in that directory,
      its ancestors through the nearest Git root, and that host user's home.
      Outside Git, ancestors are not scanned. Each skill needs its own directory
