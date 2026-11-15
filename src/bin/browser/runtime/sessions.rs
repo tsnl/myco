@@ -135,16 +135,13 @@ impl Sessions {
     }
 
     pub(crate) async fn restore_inboxes(&self) {
-        let pending = tokio::task::spawn_blocking(|| {
+        let pending = blocking(|| {
             myco::core::myco_home().and_then(|home| pending_inboxes(home.join("inbox")))
         })
-        .await;
+        .await
+        .and_then(|pending| pending.map_err(Error::Internal));
         let ids = match pending {
-            Ok(Ok(ids)) => ids,
-            Ok(Err(error)) => {
-                eprintln!("browser inbox: {error}");
-                return;
-            }
+            Ok(ids) => ids,
             Err(error) => {
                 eprintln!("browser inbox: {error}");
                 return;
@@ -384,7 +381,7 @@ impl Sessions {
             if cache.as_ref().is_none_or(|c| {
                 c.generation != generation || c.loaded_at.elapsed() >= Duration::from_secs(5)
             }) {
-                let entries = tokio::task::spawn_blocking(move || {
+                let entries = blocking(move || {
                     let filter = if archived {
                         ArchiveFilter::Archived
                     } else {
@@ -392,8 +389,7 @@ impl Sessions {
                     };
                     myco::session::list_sessions_with_filter(false, filter)
                 })
-                .await
-                .map_err(|e| Error::Internal(e.to_string()))?
+                .await?
                 .map_err(Error::Internal)?;
                 *cache = Some(Listing {
                     entries,
