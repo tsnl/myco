@@ -285,6 +285,22 @@ impl ActiveSession {
         self.update(|session| session.set_title(Some(title)))
     }
 
+    /// Record the selected catalog key. A session without a file keeps it in
+    /// memory until its first save: choosing a model does not create a session.
+    pub fn set_model_key(&self, key: &str) -> Result<(), String> {
+        let mut current = self.lock();
+        if current.model == key {
+            return Ok(());
+        }
+        if !current.json_path().exists() {
+            current.model = key.into();
+            return Ok(());
+        }
+        let mut updated = current.clone();
+        updated.model = key.into();
+        store(&mut current, updated)
+    }
+
     /// Archive only this session, preserving threads, lineage and live tools.
     pub fn set_archived(&self, archived: bool) -> Result<(), String> {
         let mut current = self.lock();

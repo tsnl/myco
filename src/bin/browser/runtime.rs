@@ -730,8 +730,7 @@ impl Sessions {
             return Ok(running.app.clone());
         }
         let saved_model = if session.json_path().exists() {
-            myco::RuntimeRecord::latest(&session.active_thread().messages)
-                .map_or_else(|| session.model.clone(), |record| record.model.key)
+            myco::RuntimeRecord::saved_model_key(&session)
         } else {
             self.config.model.clone()
         };

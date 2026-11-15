@@ -26,6 +26,14 @@ impl RuntimeRecord {
         }
     }
 
+    /// Catalog key a saved session last ran on. The latest record wins over
+    /// [`crate::Session::model`], which sessions saved by older versions left
+    /// at the model they were created with.
+    pub fn saved_model_key(session: &crate::Session) -> String {
+        Self::latest(&session.active_thread().messages)
+            .map_or_else(|| session.model.clone(), |record| record.model.key)
+    }
+
     pub(super) fn observe(
         history: &[Message],
         runtime_id: Uuid,

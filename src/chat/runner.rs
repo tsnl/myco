@@ -175,6 +175,11 @@ impl SessionRunner {
         let session = self.runtime.session().clone();
         let _writer = session.writer().await;
         settle_stopped_run(&mut self.agent)?;
+        // Saved before the runtime notice: a later failure leaves the latest
+        // runtime record naming the model that still runs.
+        session
+            .set_model_key(&info.key)
+            .map_err(AgentInteractionError::Checkpoint)?;
         let mut next = self.agent.state().clone();
         if crate::RuntimeRecord::latest(self.agent.history()).is_some_and(|old| old.model != info) {
             next.replace_context(self.agent.history().to_vec(), None)?;
@@ -1673,6 +1678,34 @@ mod tests {
             assert!(recovered.resources[0].resources.as_ref().unwrap().is_empty());
             assert_eq!(recovered.unavailable_after_restart[0].resources.as_ref().unwrap(), handles);
             assert_eq!(Session::load(&path).unwrap().active_thread().user_turn_timestamps, times);
+        });
+    }
+
+    #[test]
+    fn selected_models_are_recorded_on_the_session_before_and_after_its_first_save() {
+        let _home = temp_home("runner-model-key");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (mut runner, _) = setup(vec![], Arc::new(Summarizer::default())).await;
+            let selected = ScriptedModel::new(vec![output(20, None, TurnEndReason::EndTurn)]);
+            runner
+                .set_model(selected, ModelInfo::named("selected"))
+                .await
+                .unwrap();
+            let path = runner.runtime().session().snapshot().json_path();
+            assert!(
+                !path.exists(),
+                "selecting a model must not create a session"
+            );
+            submit(&mut runner, CancelToken::new())
+                .await
+                .result
+                .unwrap();
+            assert_eq!(Session::load(&path).unwrap().model, "selected");
+            runner
+                .set_model(ScriptedModel::new(vec![]), ModelInfo::named("another"))
+                .await
+                .unwrap();
+            assert_eq!(Session::load(&path).unwrap().model, "another");
         });
     }
 
