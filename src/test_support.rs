@@ -162,7 +162,7 @@ pub(crate) fn temp_dir(tag: &str) -> TempDir {
 }
 
 /// Points `MYCO_HOME` at a fresh temp dir for the guard's lifetime, holding
-/// [`crate::session::lock_myco_home_for_test`] so mutating tests serialize.
+/// [`lock_myco_home_for_test`] so mutating tests serialize.
 /// Cleanup is RAII so a panicking test cannot leak the override to the next.
 pub(crate) struct TempHome {
     dir: PathBuf,
@@ -188,8 +188,17 @@ impl Drop for TempHome {
     }
 }
 
+/// Serialize tests that mutate `MYCO_HOME` (process-global env).
+fn lock_myco_home_for_test() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 pub(crate) fn temp_home(tag: &str) -> TempHome {
-    let lock = crate::session::lock_myco_home_for_test();
+    let lock = lock_myco_home_for_test();
     let dir = std::env::temp_dir().join(format!("myco-{tag}-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     // SAFETY: test-only env override; held under the myco-home lock.

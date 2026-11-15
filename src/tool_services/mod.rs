@@ -31,6 +31,8 @@ pub use prelude_service::PreludeTool;
 pub mod list_recent_service;
 pub use list_recent_service::ListRecentService;
 
+mod session_format;
+
 pub mod getlink_service;
 pub use getlink_service::GetLinkTool;
 

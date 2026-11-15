@@ -8,10 +8,12 @@ use std::sync::Arc;
 use crate::core::Async;
 use crate::generative_model::{self, ToolResult};
 use crate::session::{
-    ActiveSession, Session, SessionLink, format_link_one_line, format_session_detail,
-    format_session_list_line, normalize_pr_url, parse_pr_fields, search_sessions,
+    ActiveSession, Session, SessionLink, normalize_pr_url, parse_pr_fields, search_sessions,
 };
 
+use super::session_format::{
+    format_link_one_line, format_session_detail, format_session_list_line,
+};
 use super::{HostDispatchContext, ToolService};
 
 const TOOL_DESCRIPTION: &str = r#"
