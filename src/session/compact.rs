@@ -51,8 +51,7 @@ pub fn compact_thread(
     );
     let runtime = crate::core::latest_runtime_part(&predecessor.messages);
     let tail_messages = tail.len() + usize::from(runtime.is_some());
-    let mut successor = super::Thread::new();
-    successor.predecessor_id = Some(predecessor.id.clone());
+    let mut successor = super::Thread::successor_of(predecessor);
     let resume = format!(
         "# Compaction resume\n\n{}\n\n---\nSession: `{}`\nPredecessor thread: `{}`\nSummary file: `{}`\n",
         summary_markdown.trim(),

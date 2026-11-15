@@ -10,7 +10,7 @@ use crate::agent::{Agent, AgentInteractionError, RunOutcome};
 use crate::core::CancelToken;
 use crate::generative_model::{Content, Message, Recovery};
 use crate::prompts;
-use crate::session::{ActiveSession, Session, SessionWriter};
+use crate::session::{ActiveSession, Session, SessionWriter, Thread};
 
 pub struct SessionTurnOutcome {
     pub result: Result<RunOutcome, AgentInteractionError>,
@@ -184,12 +184,17 @@ fn rewind_rejected_input(
         .filter(|part| !matches!(part, Content::System { .. }))
         .cloned()
         .collect();
-    let original = runtime.session().snapshot();
-    let mut successor = original.active_thread().clone();
-    successor.id = uuid::Uuid::new_v4().as_simple().to_string();
-    successor.created_at = chrono::Utc::now();
-    successor.predecessor_id = Some(original.active_thread().id.clone());
+    let (session_id, created_at, predecessor) = runtime.session().with(|session| {
+        let thread = session.active_thread().clone();
+        (session.id.clone(), session.created_at, thread)
+    });
+    if predecessor.pending_operation.is_some() {
+        return Err("cannot install a successor with an outstanding operation".into());
+    }
+    let mut successor = Thread::successor_of(&predecessor);
     successor.messages = agent.history()[..index].to_vec();
+    successor.user_turn_timestamps = predecessor.user_turn_timestamps;
+    successor.user_turn_timestamps.retain(|&key, _| key < index);
     if let Some(part) = crate::core::latest_runtime_part(agent.history())
         && crate::core::latest_runtime_part(&successor.messages) != Some(part)
     {
@@ -203,18 +208,14 @@ fn rewind_rejected_input(
     {
         successor.messages.push(Message::UserMessage { content: vec![Content::System {
             kind: "recovery".into(),
-            text: format!("The latest submission was removed from model context after a size rejection. Tools had already returned results in predecessor thread {} of session {}. Their external effects were not undone. Inspect those observations with session_history before repeating actions.", original.active_thread().id, original.id),
-            data: serde_json::json!({"reason":"rejected_input", "predecessor_id":original.active_thread().id, "from_index":index}),
+            text: format!("The latest submission was removed from model context after a size rejection. Tools had already returned results in predecessor thread {} of session {session_id}. Their external effects were not undone. Inspect those observations with session_history before repeating actions.", predecessor.id),
+            data: serde_json::json!({"reason":"rejected_input", "predecessor_id":predecessor.id, "from_index":index}),
         }] });
     }
-    successor.user_turn_timestamps.retain(|&key, _| key < index);
-    successor.last_usage = None;
-    successor.context_tokens_estimate = None;
     if let Some(Message::UserMessage { content }) = successor.messages.first_mut() {
         for part in content {
             if matches!(part, Content::System { kind, .. } if kind == "session") {
-                *part =
-                    prompts::thread_stamp_part(&original.id, &successor.id, original.created_at);
+                *part = prompts::thread_stamp_part(&session_id, &successor.id, created_at);
             }
         }
     }
