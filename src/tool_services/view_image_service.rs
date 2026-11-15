@@ -1,6 +1,6 @@
 //! Host tool service: read an image file into the conversation.
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::core::Async;
@@ -57,16 +57,7 @@ impl ViewImageService {
             return Err("view_image requires a non-empty path".to_string());
         }
 
-        // Reading a directory would surface a confusing OS error instead of
-        // naming the real problem.
-        let path_buf = PathBuf::from(path);
-        let metadata =
-            std::fs::metadata(&path_buf).map_err(|e| format!("cannot read image '{path}': {e}"))?;
-        if !metadata.is_file() {
-            return Err(format!("'{path}' is not a file"));
-        }
-
-        let source = read_image_data_url(&path_buf, &format!("'{path}'"), limit)?;
+        let source = read_image_data_url(Path::new(path), &format!("'{path}'"), limit)?;
         Ok(Content::Image { source })
     }
 }
@@ -81,19 +72,13 @@ impl ToolService for ViewImageService {
         tool_use: generative_model::ToolUse,
         ctx: HostDispatchContext,
     ) -> Async<generative_model::ToolResult> {
-        Box::pin(async move {
-            let input: Input = match serde_json::from_value(tool_use.input) {
-                Ok(v) => v,
-                Err(e) => return ToolResult::err(format!("invalid view_image input: {e}")),
-            };
-            let limit = ctx
-                .max_image_base64_bytes
-                .unwrap_or(self.max_image_base64_bytes)
-                .min(self.max_image_base64_bytes);
-            match self.execute(input, limit) {
-                Ok(image) => ToolResult::ok(vec![image]),
-                Err(e) => ToolResult::err(e),
-            }
+        let limit = ctx
+            .max_image_base64_bytes
+            .unwrap_or(self.max_image_base64_bytes)
+            .min(self.max_image_base64_bytes);
+        super::blocking_tool(tool_use.input, "invalid view_image input", move |input| {
+            let image = self.execute(input, limit)?;
+            Ok(ToolResult::ok(vec![image]))
         })
     }
 }
@@ -110,6 +95,14 @@ struct Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dispatch needs a Tokio runtime: blocking tool bodies run on its pool.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
     use crate::config::DEFAULT_MAX_IMAGE_BASE64_BYTES;
     use crate::core::CancelToken;
     use crate::generative_model::ToolUse;
@@ -124,7 +117,7 @@ mod tests {
     }
 
     fn view_capped(path: &str, max_image_base64_bytes: u64) -> ToolResult {
-        futures::executor::block_on(
+        block_on(
             Arc::new(ViewImageService::new(max_image_base64_bytes)).dispatch_tool_use(
                 ToolUse {
                     name: "view_image".into(),
@@ -217,7 +210,10 @@ mod tests {
 
         let result = view(&dir.to_string_lossy());
         assert!(result.is_error);
-        assert!(result_text(&result).contains("is not a file"), "{result:?}");
+        assert!(
+            result_text(&result).contains("must be a regular file"),
+            "{result:?}"
+        );
     }
 
     #[test]

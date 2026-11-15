@@ -74,20 +74,14 @@ impl ToolService for TextEditorService {
         tool_use: generative_model::ToolUse,
         ctx: HostDispatchContext,
     ) -> Async<generative_model::ToolResult> {
-        Box::pin(async move {
-            let input: Input = match serde_json::from_value(tool_use.input) {
-                Ok(input) => input,
-                Err(e) => {
-                    return generative_model::ToolResult::err(format!(
-                        "Error deserializing text editor input: {e}"
-                    ));
-                }
-            };
-            match self.execute(input, ctx.agent_id) {
-                Ok(text) => generative_model::ToolResult::text(text),
-                Err(e) => generative_model::ToolResult::err(e),
-            }
-        })
+        super::blocking_tool(
+            tool_use.input,
+            "Error deserializing text editor input",
+            move |input| {
+                self.execute(input, ctx.agent_id)
+                    .map(generative_model::ToolResult::text)
+            },
+        )
     }
 }
 
@@ -567,6 +561,14 @@ pub struct Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dispatch needs a Tokio runtime: blocking tool bodies run on its pool.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
     use crate::host::HostWorker;
     use crate::test_support::{result_text, temp_dir};
     use serde_json::json;
@@ -591,7 +593,7 @@ mod tests {
         harness: &Arc<HostWorker>,
         input: serde_json::Value,
     ) -> generative_model::ToolResult {
-        futures::executor::block_on(harness.dispatch_tool_use(
+        block_on(harness.dispatch_tool_use(
             generative_model::ToolUse {
                 name: "str_replace_based_edit_tool".into(),
                 input,
@@ -617,7 +619,7 @@ mod tests {
         let first = uuid::Uuid::new_v4();
         let second = uuid::Uuid::new_v4();
         let call = |owner, input| {
-            futures::executor::block_on(service.clone().dispatch_tool_use(
+            block_on(service.clone().dispatch_tool_use(
                 generative_model::ToolUse {
                     name: "str_replace_based_edit_tool".into(),
                     input,
