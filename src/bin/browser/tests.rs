@@ -1479,6 +1479,60 @@ fn markdown_text_parts_join_without_crossing_images_thinking_or_message_boundari
 }
 
 #[test]
+fn tool_blocks_summarize_reported_skills_without_showing_the_notice() {
+    let observation = |data: Value| Content::System {
+        kind: "host_observation".into(),
+        text: "[myco: host \"local\"] Skill catalog changes for \"/repo\"".into(),
+        data,
+    };
+    let mut reported = ToolResult::text("actual output");
+    reported
+        .content
+        .push(observation(json!({"host": "local", "skills": {
+            "listed": ["a", "b", "c", "d"], "removed": ["old"], "warnings": 2,
+        }})));
+    // Notices saved before summaries carry only the host.
+    let mut unsummarized = ToolResult::text("earlier output");
+    unsummarized
+        .content
+        .push(observation(json!({"host": "local"})));
+    let bash = ToolUse {
+        name: "bash".into(),
+        input: json!({"command":"pwd"}),
+        thought_signature: None,
+    };
+    let mut session = Session::new("test");
+    session.replace_context(
+        vec![
+            Message::UserMessage {
+                content: vec![Content::Text { text: "go".into() }],
+            },
+            Message::AssistantMessage {
+                content: vec![],
+                tool_uses: vec![bash.clone(), bash],
+                turn_end_reason: None,
+            },
+            Message::ToolResults {
+                tool_use_results: vec![reported, unsummarized],
+            },
+        ],
+        None,
+    );
+    let blocks = serde_json::to_value(view::history(session.active_thread())).unwrap();
+    let tools: Vec<_> = blocks
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|block| block["kind"] == "tool")
+        .collect();
+    assert_eq!(tools.len(), 2, "{blocks}");
+    assert_eq!(tools[0]["text"], "actual output");
+    assert_eq!(tools[0]["skills"], "Skills: +a, +b, +c, 2 more, 2 warnings");
+    assert!(tools[1].get("skills").is_none(), "{}", tools[1]);
+    assert!(!blocks.to_string().contains("Skill catalog changes"));
+}
+
+#[test]
 fn prelude_notices_stay_hidden_in_user_messages_and_tool_results() {
     let text = |text: &str| Content::Text { text: text.into() };
     let notices = vec![

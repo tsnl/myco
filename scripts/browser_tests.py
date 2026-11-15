@@ -81,7 +81,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
             if not isinstance(content, str):
                 content = " ".join(part.get("text", "") for part in content)
             resuming |= '# Resumption\n\n' in content
-            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links|profile|getlink|view image|timer|autonomy|event|thinking)\b", content)
+            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links|profile|getlink|view image|timer|autonomy|event|thinking|skills)\b", content)
             if match:
                 prompts.append(match.group(0))
         prompt = prompts[-1] if prompts else 'Alpha images'
@@ -139,6 +139,10 @@ class Provider(http.server.BaseHTTPRequestHandler):
             events = tool({"path": fixture.static_path}, "getlink")
         elif "view image" in prompt:
             events = tool({"path": str(fixture.workspace / 'pixel.png')}, "view_image")
+        elif "skills" in prompt:
+            skill = "---\\nname: review\\ndescription: Review changes\\n---\\nBody\\n"
+            events = tool({"command": f"mkdir -p .agents/skills/review && printf -- '{skill}' > .agents/skills/review/SKILL.md",
+                           "timeout_ms": 1000})
         elif "rename" in prompt:
             events = tool({"action": "set_title", "title": f"Renamed {name}"}, "session_meta")
         elif "parallel" in prompt:
@@ -1477,6 +1481,20 @@ context_window = 100000
             page.clock.set_fixed_time('2026-11-01T09:02:00Z')
             expect(timestamps.nth(1)).to_have_text(fall + ' (4 minutes ago)')
             context.close()
+
+    def test_tool_cards_label_newly_reported_skills_without_showing_the_notice(self):
+        page = self.session(self.page)
+        self.submit(page, 'Alpha skills')
+        expect(page.locator('.assistant .body').last).to_have_text('Alpha finished.')
+        outputs = [item['output'] for item in self.requests[-1]['input'] if item.get('type') == 'function_call_output']
+        self.assertIn('Skill catalog changes', outputs[-1])
+        for reload in [False, True]:
+            if reload:
+                page.reload()
+            expect(page.locator('.tool .tool-skills')).to_have_text('Skills: +review')
+            page.locator('.tool summary').click()
+            expect(page.locator('.tool .output')).to_contain_text('Exit code')
+            expect(page.locator('.tool .output')).not_to_contain_text('Skill catalog')
 
     def test_urls_are_clickable_in_messages_and_tool_output_after_reload(self):
         page = self.session(self.page)

@@ -100,15 +100,17 @@ impl HostWorker {
         if !result.is_error {
             let directory = service.working_directory(&tool_use, ctx.agent_id);
             for observer in &self.services {
-                if let Some(notice) = observer
+                if let Some(observation) = observer
                     .clone()
                     .observe_successful_call(tool_use.clone(), directory.clone(), ctx.clone())
                     .await
                 {
+                    let mut data = observation.data;
+                    data["host"] = self.name.clone().into();
                     result.content.push(generative_model::Content::System {
                         kind: "host_observation".into(),
-                        text: format!("[myco: host {:?}] {notice}", self.name),
-                        data: serde_json::json!({"host": self.name}),
+                        text: format!("[myco: host {:?}] {}", self.name, observation.text),
+                        data,
                     });
                 }
             }

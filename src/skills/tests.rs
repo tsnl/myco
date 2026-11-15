@@ -170,8 +170,10 @@ fn metadata_updates_and_deletions_change_catalogue_but_large_bodies_do_not() {
     std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     assert!(SkillCatalog::scan(tmp.path(), None).entries.is_empty());
     assert_eq!(
-        SkillCatalog::scan(tmp.path(), None).report(&mut Reported::default(), true),
-        Some("No skills found within this scan's scope.".into())
+        SkillCatalog::scan(tmp.path(), None)
+            .report(&mut Reported::default(), true)
+            .map(|report| report.text),
+        Some("No skills found within this scan's scope.".to_owned())
     );
 }
 
@@ -185,7 +187,10 @@ fn global_entry_read_and_output_budgets_report_incomplete_discovery() {
     }
     let bounded = SkillCatalog::scan(tmp.path(), None);
     assert!(bounded.truncated);
-    let rendered = bounded.report(&mut Reported::default(), false).unwrap();
+    let rendered = bounded
+        .report(&mut Reported::default(), false)
+        .map(|report| report.text)
+        .unwrap();
     assert!(rendered.contains("Partial discovery"), "{rendered}");
     std::fs::remove_dir_all(&layout).unwrap();
     for i in 0..12 {
@@ -216,14 +221,21 @@ fn global_entry_read_and_output_budgets_report_incomplete_discovery() {
         ..Default::default()
     };
     let mut reported = Reported::default();
-    let rendered = catalog.report(&mut reported, false).unwrap();
+    let rendered = catalog
+        .report(&mut reported, false)
+        .map(|report| report.text)
+        .unwrap();
     assert!(rendered.len() <= MAX_NOTICE_BYTES);
     assert!(rendered.contains("omitted_notice_entries_or_warnings="));
     assert!(!rendered.contains("\nforged row"));
     // Rows over budget stay unreported, so later notices carry them.
     assert!(reported.skills.len() < MAX_SKILLS);
     for _ in 0..MAX_SKILLS {
-        if catalog.report(&mut reported, false).is_none() {
+        if catalog
+            .report(&mut reported, false)
+            .map(|report| report.text)
+            .is_none()
+        {
             break;
         }
     }
@@ -281,6 +293,7 @@ fn explicit_only_skills_preserve_the_selection_flag_and_reject_ambiguous_values(
     assert!(
         !original
             .report(&mut Reported::default(), true)
+            .map(|report| report.text)
             .unwrap()
             .contains("disable_model_invocation")
     );
@@ -297,6 +310,7 @@ fn explicit_only_skills_preserve_the_selection_flag_and_reject_ambiguous_values(
     assert!(
         explicit
             .report(&mut Reported::default(), true)
+            .map(|report| report.text)
             .unwrap()
             .contains("\"disable_model_invocation\":true")
     );
@@ -329,8 +343,11 @@ fn thread_reports_list_each_skill_once_until_it_changes_or_leaves_a_scanned_layo
     }
     std::fs::create_dir(repo.join(".git")).unwrap();
     let shared = skill(&repo, ".agents", "shared", "shared", "first");
-    let report =
-        |dir: &Path, reported: &mut Reported| SkillCatalog::scan(dir, None).report(reported, false);
+    let report = |dir: &Path, reported: &mut Reported| {
+        SkillCatalog::scan(dir, None)
+            .report(reported, false)
+            .map(|report| report.text)
+    };
     let mut reported = Reported::default();
     assert!(report(&a, &mut reported).unwrap().contains("first"));
     assert_eq!(
@@ -338,7 +355,9 @@ fn thread_reports_list_each_skill_once_until_it_changes_or_leaves_a_scanned_layo
         None,
         "sibling repeated the catalog"
     );
-    let explicit = SkillCatalog::scan(&b, None).report(&mut reported, true);
+    let explicit = SkillCatalog::scan(&b, None)
+        .report(&mut reported, true)
+        .map(|report| report.text);
     assert!(explicit.unwrap().contains("first"));
 
     skill(&repo, ".agents", "shared", "shared", "second");
@@ -392,7 +411,12 @@ fn thread_reports_have_a_fixed_memory_bound() {
                 .collect(),
             ..Default::default()
         };
-        assert!(catalog.report(&mut reported, false).is_some());
+        assert!(
+            catalog
+                .report(&mut reported, false)
+                .map(|report| report.text)
+                .is_some()
+        );
         assert!(reported.skills.len() + reported.warnings.len() <= MAX_REPORTED);
     }
 }

@@ -227,7 +227,9 @@ function blockNode(block) {
     const outcome = toolState(block);
     const details = element('details', `tool ${outcome}`);
     const summary = element('summary');
-    summary.append(element('span', 'tool-name', block.tool.name), element('span', `tool-status ${outcome}`, block.status), toolDuration(block), element('span', 'tool-args', argumentPreview(block.tool.input)));
+    summary.append(element('span', 'tool-name', block.tool.name), element('span', `tool-status ${outcome}`, block.status), toolDuration(block));
+    if (block.skills) summary.append(element('span', 'tool-skills', block.skills));
+    summary.append(element('span', 'tool-args', argumentPreview(block.tool.input)));
     if (block.running && block.background_id) summary.append(backgroundButton(block));
     const body = element('div', 'tool-content');
     body.append(element('span', 'tool-label', 'Input'), toolArguments(block.tool.input));
