@@ -186,13 +186,13 @@ impl HostWorker {
         }
     }
 
-    /// Serve until `reader` hits EOF.
+    /// Serve until `reader` ends: EOF or any read error.
     ///
     /// The read loop only waits on the next request line. Each request is
     /// handled on a spawned task; hello, tool-result, and error replies write
-    /// through `writer` under a mutex. On EOF, in-flight tasks are joined so
-    /// results are flushed before return.
-    pub async fn serve<R, W>(self: &Arc<Self>, reader: R, writer: W) -> Result<(), String>
+    /// through `writer` under a mutex. When input ends, in-flight calls are
+    /// cancelled and joined so results are flushed before return.
+    pub async fn serve<R, W>(self: &Arc<Self>, reader: R, writer: W)
     where
         R: tokio::io::AsyncRead + Unpin + Send + 'static,
         W: AsyncWriteExt + Unpin + Send + 'static,
@@ -204,16 +204,15 @@ impl HostWorker {
             Arc::new(Mutex::new(HashMap::new()));
 
         self.serve_requests(&mut lines, &writer, &controls, &mut in_flight)
-            .await?;
+            .await;
 
-        // EOF means the controller is gone. Cancel host work before joining so
-        // a lost SSH connection cannot leave a command running until its own
+        // The controller is gone. Cancel host work before joining so a lost
+        // SSH connection cannot leave a command running until its own
         // (possibly much longer) timeout.
         for context in controls.lock().await.values() {
             context.cancel.cancel();
         }
         while in_flight.join_next().await.is_some() {}
-        Ok(())
     }
 
     async fn serve_requests<R, W>(
@@ -222,8 +221,7 @@ impl HostWorker {
         writer: &Arc<Mutex<W>>,
         controls: &Arc<Mutex<HashMap<String, HostDispatchContext>>>,
         in_flight: &mut tokio::task::JoinSet<()>,
-    ) -> Result<(), String>
-    where
+    ) where
         R: tokio::io::AsyncRead + Unpin,
         W: AsyncWriteExt + Unpin + Send + 'static,
     {
@@ -231,9 +229,12 @@ impl HostWorker {
             // Reap between reads: cancelling a partial read_line can lose protocol bytes.
             while in_flight.try_join_next().is_some() {}
             let line = match read_line(lines).await {
-                Ok(l) => l,
-                Err(e) if e == "peer closed" => break,
-                Err(e) => return Err(e),
+                Ok(Some(l)) => l,
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("host worker: input failed, shutting down: {e}");
+                    break;
+                }
             };
 
             let msg = match Request::decode(&line) {
@@ -305,12 +306,10 @@ impl HostWorker {
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Serve process stdin/stdout (`myco --mode host`).
-    pub async fn serve_stdio(self) -> Result<(), String> {
+    pub async fn serve_stdio(self) {
         Arc::new(self)
             .serve(tokio::io::stdin(), tokio::io::stdout())
             .await
@@ -385,8 +384,8 @@ mod tests {
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::select! {
-                result = worker.serve_requests(&mut reader, &writer, &controls, &mut in_flight) => {
-                    panic!("worker stopped before the client disconnected: {result:?}");
+                _ = worker.serve_requests(&mut reader, &writer, &controls, &mut in_flight) => {
+                    panic!("worker stopped before the client disconnected");
                 }
                 _ = exchange => {}
             }
@@ -398,6 +397,67 @@ mod tests {
             in_flight.len() <= 1,
             "completed requests retained: {}",
             in_flight.len()
+        );
+    }
+
+    /// Waits for its call's cancel signal and records that it arrived.
+    struct AwaitCancel(Arc<std::sync::atomic::AtomicBool>);
+
+    impl ToolService for AwaitCancel {
+        fn tool_specs(&self) -> Vec<generative_model::ToolSpec> {
+            vec![generative_model::ToolSpec {
+                name: "await_cancel".into(),
+                description: String::new(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }]
+        }
+
+        fn dispatch_tool_use(
+            self: Arc<Self>,
+            _tool_use: ToolUse,
+            ctx: HostDispatchContext,
+        ) -> crate::core::Async<generative_model::ToolResult> {
+            Box::pin(async move {
+                ctx.cancel.cancelled().await;
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                generative_model::ToolResult::err("cancelled")
+            })
+        }
+    }
+
+    /// A broken input stream ends the controller just as EOF does, so it must
+    /// also cancel and join in-flight work rather than abandoning it.
+    #[tokio::test]
+    async fn read_error_cancels_and_joins_in_flight_calls() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = Arc::new(HostWorker::new(
+            "test",
+            vec![Arc::new(AwaitCancel(cancelled.clone())) as Arc<dyn ToolService>],
+        ));
+        let call = Request::ToolCall {
+            id: "1".into(),
+            agent_id: uuid::Uuid::nil(),
+            max_image_base64_bytes: None,
+            thread_id: None,
+            tool_use: ToolUse {
+                name: "await_cancel".into(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            },
+        };
+        let mut input = call.encode().unwrap();
+        input.extend_from_slice(b"\xff\n");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            worker.serve(std::io::Cursor::new(input), tokio::io::sink()),
+        )
+        .await
+        .expect("worker hung after a read error");
+
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "in-flight call was abandoned instead of cancelled"
         );
     }
 

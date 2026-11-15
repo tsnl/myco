@@ -903,7 +903,7 @@ async fn connect(config: &HostConfig) -> Result<Conn, String> {
     // Hello before demux tasks.
     let hello = Request::Hello.encode()?;
     write_all(&mut stdin, &hello).await?;
-    let line = read_line(&mut stdout).await?;
+    let line = read_line(&mut stdout).await?.ok_or("peer closed")?;
     let reply = Response::decode(&line)?;
 
     let (version, protocol) = match reply {
@@ -1016,8 +1016,8 @@ async fn run_reader(
 ) {
     let exit_message = loop {
         let line = match read_line(&mut stdout).await {
-            Ok(l) => l,
-            Err(_) => break "host closed stdout".to_string(),
+            Ok(Some(l)) => l,
+            Ok(None) | Err(_) => break "host closed stdout".to_string(),
         };
         let msg = match Response::decode(&line) {
             Ok(m) => m,

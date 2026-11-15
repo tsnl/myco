@@ -206,13 +206,9 @@ fn configure_profile(profile: Option<&str>) -> Result<(), String> {
 /// hosts (ssh … myco --mode host). The agent-side local host is in-process and
 /// does not spawn this mode.
 async fn run_host(args: Args) {
-    if let Err(e) = HostWorker::standard(args.name, args.max_image_base64_bytes)
+    HostWorker::standard(args.name, args.max_image_base64_bytes)
         .serve_stdio()
-        .await
-    {
-        eprintln!("myco host error: {e}");
-        std::process::exit(1);
-    }
+        .await;
 }
 
 fn resolve_app_config_or_exit(args: &Args) -> (Config, CatalogModel) {
