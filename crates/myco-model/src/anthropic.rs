@@ -172,9 +172,11 @@ struct MessageRun {
     content: Vec<AnthropicContent>,
 }
 
-/// Merge consecutive same-role turns into role-alternating runs. Anthropic
-/// requires alternating user/assistant roles, and tool-result blocks must lead
-/// the user turn they answer.
+/// Merge consecutive same-role turns into role-alternating runs, as Anthropic
+/// requires. Tool-result blocks must also lead the user turn they answer; that
+/// holds without reordering because [`wire_tool_ids`] admits `ToolResults` only
+/// directly after an assistant message with tool calls, which always opens
+/// its own assistant run.
 ///
 /// `wire_ids[i][j]` supplies the id for the `j`-th tool_use / tool_result of
 /// `input[i]` ([`wire_tool_ids`]); stored provider ids never reach the wire.
@@ -231,25 +233,10 @@ fn merge_same_role_turns(input: &[Message], wire_ids: &[Vec<String>]) -> Box<[Me
             }
         };
 
-        // Tool-result blocks must appear before any other content in a user turn.
         if let Some(last) = runs.last_mut()
             && last.role == role
         {
-            if role == AnthropicRole::User {
-                let new_is_only_tool_results = !content.is_empty()
-                    && content
-                        .iter()
-                        .all(|c| matches!(c, AnthropicContent::ToolResult { .. }));
-                if new_is_only_tool_results {
-                    let mut combined = content;
-                    combined.append(&mut last.content);
-                    last.content = combined;
-                } else {
-                    last.content.extend(content);
-                }
-            } else {
-                last.content.extend(content);
-            }
+            last.content.extend(content);
             continue;
         }
         runs.push(MessageRun { role, content });
