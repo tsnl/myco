@@ -48,7 +48,8 @@ without loading their bytes; unavailable or unknown-size images omit that turn.
 A turn that exceeds either bound is represented by the summary, with its original
 history still available through `session_history`. The summary and latest runtime
 inventory are separate from this tail budget. These bounds limit retained history;
-the selected model's context and request-size limits still apply.
+the selected model's context and request-size limits still apply. Retained tool
+results drop their skill notices; hosts report skills again to the new thread.
 
 Live bash shells and editor read stamps belong to the **session runtime**, shared across
 threads and any replacement agent using that runtime. Compaction does not reset them.

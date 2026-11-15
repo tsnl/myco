@@ -115,8 +115,10 @@ Without these, multi-hour coding sessions die or get silently dumb / expensive.
 - [ ] **Layered config** — `~/.myco` + repo `.myco/` / instruction files:
       model defaults, permissions, hooks paths, ignore globs — not only host pool.
 - [ ] **Skills / skill packs**
-  - Directory convention (user + project); load as prompt/procedures or slash-skills.
-  - Import path for Claude/OpenCode-style skills so switching cost drops.
+  - Discovery covers `.agents/skills`, `.claude/skills`, and `.grok/skills` in the
+    project and the host user's home; catalogs reach the prompt at startup and
+    tool results on use (manual: Skills).
+  - Remaining: explicit invocation as slash commands.
 - [x] **Agent workspace** — free-form `~/.myco/workspace/` maintained with the
       ordinary tools; `workspace/prelude/` holds maildir-style write-once prelude
       **entries**, all rendered into every agent system prompt at model build
