@@ -212,6 +212,14 @@ impl HostController {
         &self.tools
     }
 
+    /// Display command: `in-process` for local, the spawn argv for remotes.
+    pub fn command(&self) -> Vec<String> {
+        match &self.backend {
+            Backend::InProcess { .. } => vec!["in-process".into()],
+            Backend::Subprocess { config, .. } => config.command.clone(),
+        }
+    }
+
     /// Whether this host is in-process (always "connected").
     pub fn is_in_process(&self) -> bool {
         matches!(self.backend, Backend::InProcess { .. })
