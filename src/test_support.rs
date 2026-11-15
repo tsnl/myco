@@ -10,9 +10,8 @@ use futures::stream;
 
 use crate::core::AsyncStream;
 use crate::generative_model::{
-    Content, ContentDelta, ContentStart, GenerateError, GenerateOutput, GenerationEvent,
-    GenerationFailure, GenerativeModel, Message, MessagePart, ToolResult, ToolUse, ToolUseDelta,
-    ToolUseStart, TurnEndReason,
+    Content, GenerateError, GenerateOutput, GenerationEvent, GenerationFailure, GenerativeModel,
+    Message, ToolResult, ToolUse, TurnEndReason,
 };
 
 // ---------------------------------------------------------------------------
@@ -73,62 +72,9 @@ impl GenerativeModel for ScriptedModel {
             }
         };
 
-        let mut parts = vec![MessagePart::MessageStart];
-        for (i, c) in output.content.iter().enumerate() {
-            match c {
-                Content::System { .. } => {
-                    panic!("system parts are runtime input, not model output")
-                }
-                Content::Text { text } => {
-                    parts.push(MessagePart::ContentStart(ContentStart::Text { index: i }));
-                    parts.push(MessagePart::ContentDelta(ContentDelta::Text {
-                        index: i,
-                        delta: text.clone(),
-                    }));
-                }
-                Content::Image { source } => {
-                    parts.push(MessagePart::ContentStart(ContentStart::Image { index: i }));
-                    parts.push(MessagePart::ContentDelta(ContentDelta::Image {
-                        index: i,
-                        delta: source.clone(),
-                    }));
-                }
-                Content::Thinking {
-                    text,
-                    signature,
-                    redacted,
-                } => {
-                    parts.push(MessagePart::ContentStart(ContentStart::Thinking {
-                        index: i,
-                        signature: signature.clone(),
-                        redacted: *redacted,
-                    }));
-                    if !text.is_empty() && !*redacted {
-                        parts.push(MessagePart::ContentDelta(ContentDelta::Thinking {
-                            index: i,
-                            delta: text.clone(),
-                        }));
-                    }
-                }
-            }
-        }
-        for (i, tu) in output.tool_uses.iter().enumerate() {
-            parts.push(MessagePart::ToolUseStart(ToolUseStart {
-                index: i,
-                name: tu.name.clone(),
-                thought_signature: None,
-            }));
-            parts.push(MessagePart::ToolUseDelta(ToolUseDelta {
-                index: i,
-                input_json_delta: tu.input.to_string(),
-            }));
-        }
-        if let Some(usage) = output.usage {
-            parts.push(MessagePart::Usage(usage));
-        }
-        parts.push(MessagePart::TurnEndReason(output.turn_end_reason));
-
-        Box::pin(stream::iter(parts.into_iter().map(GenerationEvent::Part)))
+        Box::pin(stream::iter(
+            output.into_parts().into_iter().map(GenerationEvent::Part),
+        ))
     }
 }
 
