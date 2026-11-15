@@ -84,7 +84,8 @@ impl HostWorker {
             .collect()
     }
 
-    /// In-process tool dispatch (unit tests; no NDJSON).
+    /// Dispatch one tool use and attach successful-call notices. Both the
+    /// in-process local host and the NDJSON serve loop run calls through here.
     pub async fn dispatch_tool_use(
         self: &Arc<Self>,
         tool_use: ToolUse,
@@ -128,62 +129,6 @@ impl HostWorker {
             .collect();
         resources.sort_by(|a, b| (&a.tool, &a.id).cmp(&(&b.tool, &b.id)));
         resources
-    }
-
-    /// Handle one decoded request and write the reply through `writer`.
-    async fn handle_request<W>(
-        self: Arc<Self>,
-        writer: Arc<Mutex<W>>,
-        msg: Request,
-        context: Option<HostDispatchContext>,
-    ) where
-        W: AsyncWriteExt + Unpin,
-    {
-        match msg {
-            Request::Hello => {
-                let response = Response::HelloOk {
-                    version: env!("CARGO_PKG_VERSION").to_string(),
-                    protocol: HOST_PROTOCOL_VERSION,
-                };
-                if let Err(e) = write_locked(&writer, &response).await {
-                    eprintln!("host worker: write hello failed: {e}");
-                }
-            }
-            Request::Resources { id, agent_id } => {
-                let response = Response::Resources {
-                    id,
-                    resources: self.resources(agent_id),
-                };
-                if let Err(e) = write_locked(&writer, &response).await {
-                    eprintln!("host worker: write resource inventory failed: {e}");
-                }
-            }
-            Request::ToolCall {
-                id,
-                agent_id: _,
-                max_image_base64_bytes: _,
-                thread_id: _,
-                tool_use,
-            } => {
-                let result = self
-                    .dispatch_tool_use(
-                        tool_use,
-                        context.expect("tool call has registered controls"),
-                    )
-                    .await;
-                let response = Response::ToolResult { id, result };
-                if let Err(e) = write_locked(&writer, &response).await {
-                    eprintln!("host worker: write tool result failed: {e}");
-                }
-            }
-            Request::Cancel { .. } | Request::Background { .. } => {
-                unreachable!("controls are handled by the serve loop")
-            }
-            Request::AgentFinished { agent_id } => {
-                // Fire-and-forget: no reply message exists for this request.
-                self.notify_agent_finished(agent_id);
-            }
-        }
     }
 
     /// Serve until `reader` ends: EOF or any read error.
@@ -241,17 +186,20 @@ impl HostWorker {
                 Ok(m) => m,
                 Err(e) => {
                     let writer = Arc::clone(writer);
-                    in_flight.spawn(async move {
-                        let err = Response::Error {
-                            id: None,
-                            message: format!("invalid request: {e}"),
-                        };
-                        let _ = write_locked(&writer, &err).await;
-                    });
+                    let error = Response::Error {
+                        id: None,
+                        message: format!("invalid request: {e}"),
+                    };
+                    in_flight.spawn(async move { reply(&writer, &error, "request error").await });
                     continue;
                 }
             };
 
+            // Everything but cancel and background runs on its own task: replies
+            // can block on a full pipe, and service state (inventory, owner
+            // cleanup) may be locked by a running call.
+            let worker = Arc::clone(self);
+            let writer = Arc::clone(writer);
             match msg {
                 Request::ToolCall {
                     id,
@@ -264,27 +212,17 @@ impl HostWorker {
                     // never race ahead of the tool task's token.
                     let mut context = HostDispatchContext::new(agent_id, CancelToken::new());
                     context.max_image_base64_bytes = max_image_base64_bytes;
-                    context.thread_id = thread_id.clone();
+                    context.thread_id = thread_id;
                     controls.lock().await.insert(id.clone(), context.clone());
-                    let request_id = id.clone();
-                    let worker = Arc::clone(self);
-                    let writer = Arc::clone(writer);
                     let controls = Arc::clone(controls);
                     in_flight.spawn(async move {
-                        worker
-                            .handle_request(
-                                writer,
-                                Request::ToolCall {
-                                    id,
-                                    agent_id,
-                                    max_image_base64_bytes,
-                                    thread_id,
-                                    tool_use,
-                                },
-                                Some(context),
-                            )
-                            .await;
-                        controls.lock().await.remove(&request_id);
+                        let result = worker.dispatch_tool_use(tool_use, context).await;
+                        let response = Response::ToolResult {
+                            id: id.clone(),
+                            result,
+                        };
+                        reply(&writer, &response, "tool result").await;
+                        controls.lock().await.remove(&id);
                     });
                 }
                 Request::Cancel { id } => {
@@ -297,12 +235,25 @@ impl HostWorker {
                         context.background.cancel();
                     }
                 }
-                other => {
-                    let worker = Arc::clone(self);
-                    let writer = Arc::clone(writer);
+                Request::Hello => {
+                    let hello = Response::HelloOk {
+                        version: env!("CARGO_PKG_VERSION").to_string(),
+                        protocol: HOST_PROTOCOL_VERSION,
+                    };
+                    in_flight.spawn(async move { reply(&writer, &hello, "hello").await });
+                }
+                Request::Resources { id, agent_id } => {
                     in_flight.spawn(async move {
-                        worker.handle_request(writer, other, None).await;
+                        let response = Response::Resources {
+                            id,
+                            resources: worker.resources(agent_id),
+                        };
+                        reply(&writer, &response, "resource inventory").await;
                     });
+                }
+                // Fire-and-forget: no reply message exists for this request.
+                Request::AgentFinished { agent_id } => {
+                    in_flight.spawn(async move { worker.notify_agent_finished(agent_id) });
                 }
             }
         }
@@ -331,13 +282,16 @@ fn build_tool_to_service_map(
     map
 }
 
-/// Lock the shared writer and send one response (concurrent tasks serialize here).
-async fn write_locked<W>(writer: &Arc<Mutex<W>>, msg: &Response) -> Result<(), String>
+/// Lock the shared writer and send one response (concurrent tasks serialize
+/// here). A failed write is only logged: the controller is gone or going.
+async fn reply<W>(writer: &Arc<Mutex<W>>, response: &Response, what: &str)
 where
     W: AsyncWriteExt + Unpin,
 {
     let mut guard = writer.lock().await;
-    msg.write_to(&mut *guard).await
+    if let Err(e) = response.write_to(&mut *guard).await {
+        eprintln!("host worker: write {what} failed: {e}");
+    }
 }
 
 #[cfg(test)]
