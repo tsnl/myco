@@ -103,8 +103,10 @@ impl HostWorker {
                     .observe_successful_call(tool_use.clone(), ctx.clone())
                     .await
                 {
-                    result.content.push(generative_model::Content::Text {
-                        text: format!("[myco: host {:?}]\n{notice}", self.name),
+                    result.content.push(generative_model::Content::System {
+                        kind: "host_observation".into(),
+                        text: format!("[myco: host {:?}] {notice}", self.name),
+                        data: serde_json::json!({"host": self.name}),
                     });
                 }
             }

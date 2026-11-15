@@ -1,20 +1,19 @@
 //! Discover metadata on the host that owns the paths; instructions stay on disk.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::core::Async;
 use crate::generative_model::{ToolResult, ToolSpec, ToolUse};
-use crate::skills::SkillCatalog;
+use crate::skills::{Reported, SkillCatalog};
 
 use super::{HostDispatchContext, ToolService, tool_input_schema};
 
-const MAX_OBSERVED_DIRECTORIES: usize = 16;
 #[derive(Default)]
 struct Observations {
     thread_id: Option<String>,
-    directories: VecDeque<(PathBuf, SkillCatalog)>,
+    reported: Reported,
 }
 type OwnerObservations = Arc<tokio::sync::Mutex<Observations>>;
 
@@ -83,10 +82,16 @@ impl SkillsService {
         };
         let (mut observed, path, catalog) = run_scan(&ctx.cancel, scan).await?;
         if observed.thread_id != ctx.thread_id {
-            observed.directories.clear();
+            observed.reported = Reported::default();
             observed.thread_id = ctx.thread_id.clone();
         }
-        Ok(record(&mut observed.directories, path, catalog, force))
+        let heading = if force {
+            "Skills for"
+        } else {
+            "Skill catalog changes for"
+        };
+        let body = catalog.report(&mut observed.reported, force);
+        Ok(body.map(|body| format!("{heading} {path:?}\n{body}")))
     }
 }
 
@@ -145,7 +150,7 @@ impl ToolService for SkillsService {
             match self.discover(target, &ctx, false).await {
                 Ok(notice) => notice,
                 Err(_) if ctx.cancel.is_cancelled() => None,
-                Err(error) => Some(format!("[myco: Skill discovery incomplete] {error}")),
+                Err(error) => Some(format!("Skill discovery incomplete: {error}")),
             }
         })
     }
@@ -159,34 +164,8 @@ impl ToolService for SkillsService {
 }
 
 //
-// Bounded observations and operation paths
+// Operation paths
 //
-
-fn record(
-    observed: &mut VecDeque<(PathBuf, SkillCatalog)>,
-    path: PathBuf,
-    catalog: SkillCatalog,
-    force: bool,
-) -> Option<String> {
-    let previous = observed
-        .iter()
-        .position(|(directory, _)| directory == &path)
-        .and_then(|index| observed.remove(index));
-    let changed = previous.as_ref().is_none_or(|(_, old)| old != &catalog);
-    let empty = catalog.entries.is_empty() && catalog.issues.is_empty() && !catalog.truncated;
-    let notice = (force || (changed && (previous.is_some() || !empty))).then(|| {
-        format!(
-            "[myco: Skills for directory {:?}]\n{}",
-            path,
-            catalog.render_notice()
-        )
-    });
-    observed.push_back((path, catalog));
-    if observed.len() > MAX_OBSERVED_DIRECTORIES {
-        observed.pop_front();
-    }
-    notice
-}
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]

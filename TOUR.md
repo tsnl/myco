@@ -226,10 +226,11 @@ up resources belonging to a released session runtime. Useful implementations to 
   returned to the model. Shared decoding and size limits live in
   [src/core/image.rs](src/core/image.rs).
 - [SkillsService](src/tool_services/skills_service.rs): explicit discovery and
-  notices after successful bash, editor, and image calls. Its bounded observation
-  cache belongs to the runtime owner, resets when the conversation thread changes,
-  and is released with that owner. Discovery
-  does not create a retained resource that keeps idle host workers alive.
+  notices after successful bash, editor, and image calls. Notices list only skills
+  and warnings the thread has not been told, and reach the model as hidden system
+  parts of the tool result. That bounded record belongs to the runtime owner,
+  resets when the conversation thread changes, and is released with that owner.
+  Discovery does not create a retained resource that keeps idle host workers alive.
 
 [src/skills/](src/skills/) supplies the shared filesystem scanner and metadata
 parser, below prompts and host services. It checks known layouts in the operated

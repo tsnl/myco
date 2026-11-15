@@ -232,8 +232,9 @@ When tools fail or the user asks why something is broken, investigate with tools
      Outside Git, ancestors are not scanned. Each skill needs its own directory
      and a regular `SKILL.md` with `name` and `description` frontmatter.
    - Read discovery warnings: symlinks, malformed metadata, unreadable paths,
-     and scan limits can exclude entries. Explicit discovery refreshes the
-     catalog; successful file operations also discover their operated directory.
+     and scan limits can exclude entries. Explicit discovery lists the full
+     catalog; successful file operations also discover their operated directory,
+     in transcript-hidden notices that list only changes.
      Read a selected skill with the editor on the same host. Identical names
      in different paths remain distinct skills.
 

@@ -550,14 +550,18 @@ by their paths.
 
 Successful editor and image calls scan the operated file's directory, or the
 operated directory itself. Successful bash calls scan the host worker's launch
-directory. Changed catalogs appear as notices attached to tool results, tagged
-with their host and directory. Observations are scoped to the session runtime;
-unchanged catalogs normally do not repeat within a thread. A new thread receives
-the catalog again when it next operates in that directory. Discovery has bounded
+directory. A notice attached to the tool result, tagged with its host and
+directory, lists only what the thread has not been told: new or changed skills,
+listed skills no longer found in a layout the scan checked, and new discovery
+warnings. A skill already listed is not repeated when another directory sees it.
+Notices are model context; browser and terminal transcripts do not display them.
+Observations are scoped to the session runtime and thread: a new thread receives
+skills again when it next operates where they are visible. Discovery has bounded
 directory, metadata, and notice limits. A partial catalog reports omissions or
-scan errors.
+scan errors and claims no removals.
 
-Use `skills` explicitly to inspect or refresh another directory:
+Use `skills` explicitly to list the full catalog for another directory; its
+result is an ordinary, visible tool result:
 
 ```json
 {"path":"/work/project","host":"devbox"}
