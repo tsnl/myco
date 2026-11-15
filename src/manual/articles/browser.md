@@ -171,8 +171,11 @@ disable the pulse. Status changes arrive through the shared event stream; the
 browser also polls for changes made by other server processes.
 
 Hidden tabs defer live transcript rendering to save browser CPU. Generation,
-tools, and timers continue on the server. Returning to a tab loads the current
-transcript and activity state while preserving your unsent draft.
+tools, and timers continue on the server. While the live connection stays up, a
+hidden session tab keeps its own changes in the shared worker, so returning
+applies them without downloading the transcript; it formats only messages that
+streamed meanwhile. A dropped connection, a resynchronization, or a long absence
+loads the current transcript instead. Either way your unsent draft is preserved.
 
 The input border also shows the session's state. **Running** and **Compacting**
 carry a travelling highlight and soft glow using the sky's current light color.
@@ -577,7 +580,9 @@ fails, the input draft remains available. Tabs share a live-output connection
 through a browser SharedWorker so a tab group does not exhaust HTTP connections.
 Only tabs viewing a session fetch its full history. Live events carry deltas and
 small refresh notices; a slow connection resynchronizes subscribed views without
-replaying every running session's history. Activity bursts coalesce into a session
+replaying every running session's history. When a turn settles on the same thread,
+its refresh notice carries the rebuilt history's changed tail (up to 64 KiB), so
+open views update in place instead of downloading the whole transcript. Activity bursts coalesce into a session
 list refresh, and each session view allows one snapshot request at a time.
 Reload open tabs after upgrading the server to use the updated browser worker.
 

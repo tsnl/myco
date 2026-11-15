@@ -422,6 +422,11 @@ function updateSession(update) {
   revision = update.revision;
   const change = update.change;
   if (change.kind === 'snapshot') snapshot(change.snapshot);
+  else if (change.kind === 'refresh') {
+    // A rebuilt history keeps this view's unchanged prefix and rendered nodes.
+    const { start, blocks, snapshot: rest } = change.splice;
+    snapshot({ ...rest, blocks: [...state.blocks.slice(0, start), ...blocks] });
+  }
   else if (change.kind === 'meta') { Object.assign(state, change.meta); metadata(); }
   else if (change.kind === 'block') { replaceBlock(change.index, change.block, state.blocks[change.index]); state.blocks[change.index] = change.block; navigation.refresh(); activity(); }
   else if (change.kind === 'append') {

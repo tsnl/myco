@@ -3845,7 +3845,7 @@ context_window = 100000
             self.assertIn('<h1>Review</h1>', assistant['html'])
             self.assertNotIn('html', user)
 
-    def test_streaming_coalesces_renders_and_late_html_cannot_overwrite_a_snapshot(self):
+    def test_streaming_coalesces_renders_and_the_settled_turn_keeps_the_streamed_block(self):
         page = self.session(self.page)
         expect(page.locator(".notice")).to_contain_text("prelude directory unreadable")
         held = []
@@ -3855,14 +3855,22 @@ context_window = 100000
         expect(page.locator("#model")).to_be_enabled()
         page.wait_for_timeout(200)
         self.assertEqual(len(held), 1, "Only one render of the streaming block may be in flight")
-        expect(page.locator(".markdown p").last).to_have_text("Chunk 29.")
         first = held.pop()
         first.fulfill(response=first.fetch())
-        page.wait_for_timeout(150)
+        # The settled turn keeps the streamed block instead of refetching the
+        # transcript, so one more render covers the text that arrived meanwhile.
+        for _ in range(40):
+            if held:
+                break
+            page.wait_for_timeout(50)
+        self.assertEqual(len(held), 1, "One render covers the rest of the streamed text")
+        last = held.pop()
+        last.fulfill(response=last.fetch())
         expect(page.locator(".markdown p").last).to_have_text("Chunk 29.")
-        self.assertEqual(held, [], 'The snapshot already supplied the latest rendered output')
+        page.wait_for_timeout(150)
+        self.assertEqual(held, [], 'The final text needs no further render')
 
-    def test_hidden_tabs_defer_stream_rendering_and_catch_up_without_losing_drafts(self):
+    def test_hidden_tabs_defer_stream_rendering_and_catch_up_without_reconnecting_or_losing_drafts(self):
         self.stream_chunks = 100
         self.event_gates = {1: threading.Event()}
         self.addCleanup(self.event_gates[1].set)
@@ -3882,12 +3890,20 @@ context_window = 100000
         expect(observer.locator('#model')).to_be_enabled()
         expect(page.locator('.markdown p')).to_have_text('Chunk 0.')
         self.assertEqual(renders, [], 'Hidden tabs must not format streamed output')
+        page.evaluate("""() => {
+            window.connectionStates = [];
+            const node = document.querySelector('#connection');
+            new MutationObserver(() => window.connectionStates.push(node.textContent))
+                .observe(node, {childList: true, characterData: true, subtree: true});
+        }""")
         page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: false}); document.dispatchEvent(new Event('visibilitychange'))")
         expect(page.locator('.markdown p').last).to_have_text('Chunk 99.')
         expect(page.locator('.markdown p')).to_have_count(100)
         expect(page.locator('#model')).to_be_enabled()
         expect(page.locator('#prompt')).to_have_value('Keep this unsent draft.')
-        self.assertEqual(renders, [], 'Returning to the tab uses the rendered snapshot')
+        self.assertEqual(len(renders), 1, 'Returning formats only the message that streamed while hidden')
+        self.assertNotIn('Reconnecting…', page.evaluate('window.connectionStates'),
+                         'Returning applies buffered changes without refetching the session')
 
     def test_26_concurrent_sessions_do_not_replay_unobserved_histories(self):
         # Keep large-history transport independent of automatic compaction.
