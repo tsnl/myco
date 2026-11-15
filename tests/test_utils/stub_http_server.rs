@@ -9,8 +9,8 @@
 //! Most constructors serve exactly one request. [`StubHttpServer::sequence`]
 //! serves several, one per connection, which is what retry tests need.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -19,11 +19,12 @@ use tokio::sync::oneshot;
 pub struct StubHttpServer {
     base_url: String,
     request: oneshot::Receiver<CapturedRequest>,
+    requests: Arc<Mutex<Vec<CapturedRequest>>>,
     connections: Arc<AtomicUsize>,
 }
 
 /// What the driver sent.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CapturedRequest {
     pub path: String,
     pub body: serde_json::Value,
@@ -124,6 +125,11 @@ impl StubHttpServer {
         self.request.await.expect("stub server received a request")
     }
 
+    /// Every request received so far, in arrival order.
+    pub fn requests(&self) -> Vec<CapturedRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+
     async fn spawn(writes: Vec<Vec<u8>>) -> Self {
         // One connection, whose response is written in several pieces.
         Self::spawn_inner(vec![writes]).await
@@ -138,6 +144,8 @@ impl StubHttpServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let (tx, request) = oneshot::channel();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let received = requests.clone();
         let counter = Arc::new(AtomicUsize::new(0));
         let served = counter.clone();
 
@@ -147,7 +155,7 @@ impl StubHttpServer {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 served.fetch_add(1, Ordering::SeqCst);
                 let captured = read_request(&mut stream).await;
-                // Only the first request is reported; retries resend it verbatim.
+                received.lock().unwrap().push(captured.clone());
                 if let Some(tx) = tx.take() {
                     let _ = tx.send(captured);
                 }
@@ -165,6 +173,7 @@ impl StubHttpServer {
         Self {
             base_url: format!("http://127.0.0.1:{port}"),
             request,
+            requests,
             connections: counter,
         }
     }
