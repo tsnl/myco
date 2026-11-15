@@ -183,7 +183,8 @@ pub trait ToolService: Send + Sync + 'static {
     ) -> Async<generative_model::ToolResult>;
 
     /// Optional host-local observations after a successful tool call. Notices
-    /// are data attached to that result; they cannot authorize or replay it.
+    /// are data attached to that result as a system part: model context, not
+    /// transcript output. They cannot authorize or replay the call.
     fn observe_successful_call(
         self: Arc<Self>,
         _tool: generative_model::ToolUse,

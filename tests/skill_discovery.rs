@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 
 const BODY: &str = "INSTRUCTIONS_READ_ONLY_AFTER_EXPLICIT_EDITOR_VIEW";
-const NOTICE: &str = "[myco: Skills for directory";
+const NOTICE: &str = "Skill catalog changes for";
 
 struct Fixture(PathBuf);
 
@@ -34,7 +34,9 @@ impl Fixture {
             "outside",
             "outside metadata",
         );
-        std::fs::write(root.join("launch/work/file.txt"), "actual file content\n").unwrap();
+        for file in ["launch/work/file.txt", "launch/top.txt"] {
+            std::fs::write(root.join(file), "actual file content\n").unwrap();
+        }
         Self(root.canonicalize().unwrap())
     }
 
@@ -150,25 +152,29 @@ impl Host {
         }
     }
 
-    async fn view(&mut self, owner: uuid::Uuid, thread: &str) -> String {
+    /// The host's skill notice for a successful file view, or "" without one.
+    async fn view(&mut self, owner: uuid::Uuid, thread: &str, path: &str) -> String {
         let result = self
             .call(
                 owner,
                 thread,
                 "str_replace_based_edit_tool",
-                json!({
-                    "command":"view", "path":"work/file.txt"
-                }),
+                json!({"command":"view", "path":path}),
             )
             .await;
         assert!(!result.is_error, "{result:?}");
         let text = text(&result);
         assert!(text.contains("actual file content"), "{text}");
         assert!(
-            !text.contains(BODY),
-            "instructions leaked into metadata: {text}"
+            !text.contains(NOTICE),
+            "notice reached the transcript: {text}"
         );
-        text
+        let notice = notice(&result);
+        assert!(
+            !notice.contains(BODY),
+            "instructions leaked into metadata: {notice}"
+        );
+        notice
     }
 
     async fn resources(&mut self, owner: uuid::Uuid) -> Vec<ToolResource> {
@@ -196,6 +202,7 @@ impl Host {
     }
 }
 
+/// What transcripts display.
 fn text(result: &ToolResult) -> String {
     result
         .content
@@ -208,12 +215,25 @@ fn text(result: &ToolResult) -> String {
         .join("\n")
 }
 
+/// Host observations: model context that transcripts omit.
+fn notice(result: &ToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|part| match part {
+            Content::System { kind, text, .. } if kind == "host_observation" => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[tokio::test]
 async fn successful_file_calls_announce_metadata_changes_once_per_owner_and_thread() {
     let fixture = Fixture::new();
     let mut host = Host::start(&fixture).await;
     let owner = uuid::Uuid::new_v4();
-    let first = host.view(owner, "predecessor").await;
+    let first = host.view(owner, "predecessor", "work/file.txt").await;
     for expected in [
         NOTICE,
         "skill-fixture",
@@ -224,7 +244,13 @@ async fn successful_file_calls_announce_metadata_changes_once_per_owner_and_thre
         assert!(first.contains(expected), "missing {expected}: {first}");
     }
     assert!(!first.contains("outside metadata"), "{first}");
-    assert!(!host.view(owner, "predecessor").await.contains(NOTICE));
+    assert!(
+        host.view(owner, "predecessor", "work/file.txt")
+            .await
+            .is_empty()
+    );
+    // The launch directory's skills were all reported from its subdirectory.
+    assert!(host.view(owner, "predecessor", "top.txt").await.is_empty());
 
     let manifest = write_skill(
         &fixture.path("launch/work"),
@@ -232,31 +258,40 @@ async fn successful_file_calls_announce_metadata_changes_once_per_owner_and_thre
         "project",
         "revised metadata",
     );
-    let changed = host.view(owner, "predecessor").await;
+    let changed = host.view(owner, "predecessor", "work/file.txt").await;
     assert!(changed.contains("revised metadata"), "{changed}");
     assert!(!changed.contains("project metadata"), "{changed}");
     std::fs::remove_dir_all(manifest.parent().unwrap()).unwrap();
-    let removed = host.view(owner, "predecessor").await;
+    let removed = host.view(owner, "predecessor", "work/file.txt").await;
     assert!(
-        removed.contains(NOTICE),
+        removed.contains("No longer listed"),
         "catalog deletion was silent: {removed}"
     );
     assert!(!removed.contains("revised metadata"), "{removed}");
-    assert!(!host.view(owner, "predecessor").await.contains(NOTICE));
+    assert!(
+        host.view(owner, "predecessor", "work/file.txt")
+            .await
+            .is_empty()
+    );
 
     assert!(
-        host.view(owner, "successor")
+        host.view(owner, "successor", "work/file.txt")
             .await
             .contains("launch metadata")
     );
-    assert!(!host.view(owner, "successor").await.contains(NOTICE));
     assert!(
-        host.view(uuid::Uuid::new_v4(), "successor")
+        host.view(owner, "successor", "work/file.txt")
+            .await
+            .is_empty()
+    );
+    assert!(
+        host.view(uuid::Uuid::new_v4(), "successor", "work/file.txt")
             .await
             .contains("launch metadata")
     );
+    // One editor read fingerprint per viewed file; discovery retains nothing.
     let resources = host.resources(owner).await;
-    assert_eq!(resources.len(), 1, "{resources:?}");
+    assert_eq!(resources.len(), 2, "{resources:?}");
     assert!(
         resources
             .iter()
@@ -275,7 +310,7 @@ async fn successful_file_calls_announce_metadata_changes_once_per_owner_and_thre
     .await
     .expect("owner resources were not released");
     assert!(
-        host.view(owner, "successor")
+        host.view(owner, "successor", "work/file.txt")
             .await
             .contains("launch metadata")
     );
@@ -373,7 +408,7 @@ async fn bash_uses_launch_scope_while_successful_images_discover_their_operated_
         )
         .await;
     assert!(failed.is_error, "{failed:?}");
-    assert!(!text(&failed).contains(NOTICE), "{failed:?}");
+    assert!(notice(&failed).is_empty(), "{failed:?}");
     let bash = host
         .call(
             owner,
@@ -385,11 +420,9 @@ async fn bash_uses_launch_scope_while_successful_images_discover_their_operated_
         )
         .await;
     assert!(!bash.is_error, "{bash:?}");
-    let bash = text(&bash);
-    assert!(
-        bash.contains("changed shell directory") && bash.contains("launch metadata"),
-        "{bash}"
-    );
+    assert!(text(&bash).contains("changed shell directory"), "{bash:?}");
+    let bash = notice(&bash);
+    assert!(bash.contains("launch metadata"), "{bash}");
     assert!(
         !bash.contains("project metadata") && !bash.contains(BODY),
         "{bash}"
@@ -413,8 +446,12 @@ async fn bash_uses_launch_scope_while_successful_images_discover_their_operated_
             .any(|part| matches!(part, Content::Image { .. })),
         "{image:?}"
     );
-    assert!(text(&image).contains("project metadata"), "{image:?}");
-    assert!(!text(&image).contains(BODY), "{image:?}");
-    assert!(!host.view(owner, "thread").await.contains(NOTICE));
+    let image = notice(&image);
+    assert!(image.contains("project metadata"), "{image}");
+    assert!(
+        !image.contains("launch metadata") && !image.contains(BODY),
+        "{image}"
+    );
+    assert!(host.view(owner, "thread", "work/file.txt").await.is_empty());
     host.finish().await;
 }

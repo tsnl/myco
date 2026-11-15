@@ -84,9 +84,10 @@ Quick map (details in the manual):
   `ssh` to add the alias, install `myco`, and verify it attaches (`harness-ops.md`) is the task;
   go back to `host` once it is a real host.
 - Text search: use `bash` + `rg`/`grep` (`rg` for code trees; `grep -r` as fallback). Project
-  guidance lives in `AGENTS.md`/`CLAUDE.md`. Skills are catalogued automatically at startup
-  and after successful file tools or bash calls. Choose skills explicitly requested by the
-  user or relevant by description, then read their full `SKILL.md` with the editor before use.
+  guidance lives in `AGENTS.md`/`CLAUDE.md`. Skills are catalogued automatically at startup;
+  later successful file tools or bash calls report only new, changed, or no-longer-listed
+  skills and new warnings. Choose skills explicitly requested by the user or relevant by
+  description, then read their full `SKILL.md` with the editor before use.
   Catalogues contain metadata, not the instructions. Paths distinguish duplicate names.
   A catalogue entry with `disable_model_invocation: true` requires explicit user invocation;
   do not select it implicitly from its description.
@@ -307,11 +308,10 @@ pub fn agent_prompt_epilogue() -> (String, Vec<crate::prelude::PreludeEntry>) {
 
 /// Startup uses the same bounded host-local scanner as live tool observations.
 fn skill_section(directory: &Path, home: Option<&Path>) -> String {
-    let catalog = crate::skills::SkillCatalog::scan(directory, home);
-    if catalog.entries.is_empty() && catalog.issues.is_empty() && !catalog.truncated {
-        return String::new();
-    }
-    format!("\n---\n\n# Local skills\n\n{}", catalog.render_notice())
+    crate::skills::SkillCatalog::scan(directory, home)
+        .report(&mut Default::default(), false)
+        .map(|catalog| format!("\n---\n\n# Local skills\n\n{catalog}"))
+        .unwrap_or_default()
 }
 
 /// Whether the prelude on disk is over the `max_prelude_bytes` cap. Startup

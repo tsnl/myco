@@ -170,8 +170,8 @@ fn metadata_updates_and_deletions_change_catalogue_but_large_bodies_do_not() {
     std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     assert!(SkillCatalog::scan(tmp.path(), None).entries.is_empty());
     assert_eq!(
-        SkillCatalog::scan(tmp.path(), None).render_notice(),
-        "No skills found within this scan's scope."
+        SkillCatalog::scan(tmp.path(), None).report(&mut Reported::default(), true),
+        Some("No skills found within this scan's scope.".into())
     );
 }
 
@@ -185,7 +185,8 @@ fn global_entry_read_and_output_budgets_report_incomplete_discovery() {
     }
     let bounded = SkillCatalog::scan(tmp.path(), None);
     assert!(bounded.truncated);
-    assert!(bounded.render_notice().contains("Partial discovery"));
+    let rendered = bounded.report(&mut Reported::default(), false).unwrap();
+    assert!(rendered.contains("Partial discovery"), "{rendered}");
     std::fs::remove_dir_all(&layout).unwrap();
     for i in 0..12 {
         let path = skill(
@@ -214,10 +215,19 @@ fn global_entry_read_and_output_budgets_report_incomplete_discovery() {
             .collect(),
         ..Default::default()
     };
-    let rendered = catalog.render_notice();
+    let mut reported = Reported::default();
+    let rendered = catalog.report(&mut reported, false).unwrap();
     assert!(rendered.len() <= MAX_NOTICE_BYTES);
     assert!(rendered.contains("omitted_notice_entries_or_warnings="));
     assert!(!rendered.contains("\nforged row"));
+    // Rows over budget stay unreported, so later notices carry them.
+    assert!(reported.skills.len() < MAX_SKILLS);
+    for _ in 0..MAX_SKILLS {
+        if catalog.report(&mut reported, false).is_none() {
+            break;
+        }
+    }
+    assert_eq!(reported.skills.len(), MAX_SKILLS);
 }
 
 #[test]
@@ -268,6 +278,12 @@ fn explicit_only_skills_preserve_the_selection_flag_and_reject_ambiguous_values(
     skill(tmp.path(), ".agents", "skill", "name", "description");
     let original = SkillCatalog::scan(tmp.path(), None);
     assert!(!original.entries[0].disable_model_invocation);
+    assert!(
+        !original
+            .report(&mut Reported::default(), true)
+            .unwrap()
+            .contains("disable_model_invocation")
+    );
     skill(
         tmp.path(),
         ".agents",
@@ -280,7 +296,8 @@ fn explicit_only_skills_preserve_the_selection_flag_and_reject_ambiguous_values(
     assert_ne!(explicit.entries[0].digest, original.entries[0].digest);
     assert!(
         explicit
-            .render_notice()
+            .report(&mut Reported::default(), true)
+            .unwrap()
             .contains("\"disable_model_invocation\":true")
     );
     for value in ["'true'", "yes", "false\ndisable-model-invocation: true"] {
@@ -299,5 +316,83 @@ fn explicit_only_skills_preserve_the_selection_flag_and_reject_ambiguous_values(
                 .iter()
                 .any(|error| error.contains("disable-model-invocation"))
         );
+    }
+}
+
+#[test]
+fn thread_reports_list_each_skill_once_until_it_changes_or_leaves_a_scanned_layout() {
+    let tmp = temp_dir("skills-reported");
+    let repo = tmp.path().join("repo");
+    let (a, b, other) = (repo.join("a"), repo.join("b"), tmp.path().join("other"));
+    for dir in [&a, &b, &other] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::create_dir(repo.join(".git")).unwrap();
+    let shared = skill(&repo, ".agents", "shared", "shared", "first");
+    let report =
+        |dir: &Path, reported: &mut Reported| SkillCatalog::scan(dir, None).report(reported, false);
+    let mut reported = Reported::default();
+    assert!(report(&a, &mut reported).unwrap().contains("first"));
+    assert_eq!(
+        report(&b, &mut reported),
+        None,
+        "sibling repeated the catalog"
+    );
+    let explicit = SkillCatalog::scan(&b, None).report(&mut reported, true);
+    assert!(explicit.unwrap().contains("first"));
+
+    skill(&repo, ".agents", "shared", "shared", "second");
+    let changed = report(&b, &mut reported).unwrap();
+    assert!(
+        changed.contains("second") && !changed.contains("No longer listed"),
+        "{changed}"
+    );
+    assert_eq!(report(&a, &mut reported), None);
+
+    std::fs::remove_dir_all(shared.parent().unwrap()).unwrap();
+    // A scan that never checked the repository's layout claims nothing.
+    assert_eq!(report(&other, &mut reported), None);
+    // Nor does a scan whose limits skipped that layout.
+    let crowded = b.join(".agents/skills");
+    std::fs::create_dir_all(&crowded).unwrap();
+    for i in 0..MAX_ENTRIES {
+        std::fs::write(crowded.join(format!("entry-{i}")), "").unwrap();
+    }
+    let partial = report(&b, &mut reported).unwrap();
+    assert!(
+        partial.contains("Partial discovery") && !partial.contains("No longer listed"),
+        "{partial}"
+    );
+    std::fs::remove_dir_all(&crowded).unwrap();
+    let removed = report(&b, &mut reported).unwrap();
+    assert!(
+        removed.contains("No longer listed") && removed.contains(shared.to_str().unwrap()),
+        "{removed}"
+    );
+    assert_eq!(
+        report(&a, &mut reported),
+        None,
+        "removal was reported twice"
+    );
+}
+
+#[test]
+fn thread_reports_have_a_fixed_memory_bound() {
+    let mut reported = Reported::default();
+    for batch in 0..=MAX_REPORTED / 64 {
+        let catalog = SkillCatalog {
+            entries: (0..64)
+                .map(|i| SkillEntry {
+                    name: "name".into(),
+                    description: "description".into(),
+                    path: PathBuf::from(format!("/{batch}/{i}/SKILL.md")),
+                    disable_model_invocation: false,
+                    digest: String::new(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(catalog.report(&mut reported, false).is_some());
+        assert!(reported.skills.len() + reported.warnings.len() <= MAX_REPORTED);
     }
 }

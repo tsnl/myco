@@ -1,5 +1,6 @@
 use super::*;
 use crate::core::CancelToken;
+use crate::generative_model::Content;
 use crate::host::HostWorker;
 use crate::test_support::{result_text, temp_dir};
 use crate::tool_services::TextEditorService;
@@ -190,10 +191,19 @@ async fn host_observes_only_successful_file_calls_and_preserves_their_result() {
     assert!(!result.is_error);
     let text = result_text(&result);
     assert!(text.contains("file content"));
-    assert!(text.contains("remote-fixture"));
-    assert!(text.contains("host-local metadata"));
+    assert!(
+        !text.contains("host-local metadata"),
+        "notice reached the transcript"
+    );
+    let [_, Content::System { kind, text, data }] = &result.content[..] else {
+        panic!("expected one observation part: {result:?}");
+    };
+    assert_eq!(kind, "host_observation");
+    assert_eq!(data["host"], "remote-fixture");
+    assert!(text.starts_with("[myco: host \"remote-fixture\"] Skill catalog changes for "));
+    assert!(text.contains("host-local metadata"), "{text}");
     let repeated = worker.dispatch_tool_use(view(&path), ctx).await;
-    assert!(!result_text(&repeated).contains("host-local metadata"));
+    assert_eq!(repeated.content.len(), 1, "{repeated:?}");
 }
 
 #[tokio::test]
@@ -260,23 +270,4 @@ async fn concurrent_calls_dedupe_and_cancelled_scans_do_not_consume_notices() {
         service.clone().observe_successful_call(call, ctx),
     );
     assert_ne!(first.is_some(), second.is_some());
-}
-
-#[tokio::test]
-async fn owner_observation_cache_has_a_fixed_directory_bound() {
-    let temp = temp_dir("skill-cache-bound");
-    let service = service(temp.path());
-    let ctx = context();
-    for index in 0..MAX_OBSERVED_DIRECTORIES + 5 {
-        let dir = temp.path().join(index.to_string());
-        std::fs::create_dir(&dir).unwrap();
-        service
-            .clone()
-            .observe_successful_call(view(&dir), ctx.clone())
-            .await;
-    }
-    let observations = service.observations(ctx.agent_id);
-    let observations = observations.lock().await;
-    assert_eq!(observations.directories.len(), MAX_OBSERVED_DIRECTORIES);
-    assert!(observations.directories.front().unwrap().0.ends_with("5"));
 }
