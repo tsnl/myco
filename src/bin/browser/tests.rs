@@ -1598,9 +1598,16 @@ impl myco::generative_model::GenerativeModel for UnusedModel {
 }
 
 async fn settlement_boot(app: &Arc<App>) -> Boot {
+    history_boot(app, vec![]).await
+}
+
+async fn history_boot(app: &Arc<App>, history: Vec<Message>) -> Boot {
     let config = test_config();
     let mut saved = Session::new("test");
     saved.id = app.snapshot().session_id;
+    if !history.is_empty() {
+        saved.replace_context(history, None);
+    }
     let session = ActiveSession::new(saved);
     let harness = myco::Harness::local_with_services(vec![]);
     let runtime = myco::SessionRuntime::new(harness.clone(), session.clone());
@@ -1616,6 +1623,63 @@ async fn settlement_boot(app: &Arc<App>) -> Boot {
             .await
             .unwrap(),
     }
+}
+
+#[tokio::test]
+async fn a_rebuilt_history_relays_only_its_changed_tail_on_the_same_thread() {
+    let (app, _work) = app();
+    let text = |text: String| vec![Content::Text { text }];
+    let boot = history_boot(
+        &app,
+        vec![
+            Message::UserMessage {
+                content: text("saved request".into()),
+            },
+            Message::AssistantMessage {
+                content: text("long answer ".repeat(10_000)),
+                tool_uses: vec![],
+                turn_end_reason: None,
+            },
+        ],
+    )
+    .await;
+    let mut events = app.events.subscribe();
+    let mut relayed = || -> String {
+        let update = events.try_recv().unwrap();
+        serde_json::to_string(&update.live_update()).unwrap()
+    };
+    app.sync_with(&boot, "Ready", |_| {});
+    relayed();
+    let saved_blocks = app.live.lock().unwrap().snapshot.blocks.len();
+    app.notice("shown only until the turn settles");
+    relayed();
+
+    app.sync_with(&boot, "Ready", |_| {});
+    let event = relayed();
+    assert!(
+        event.len() < 4096,
+        "the history must not be relayed: {}",
+        event.len()
+    );
+    let change = &serde_json::from_str::<Value>(&event).unwrap()["change"];
+    assert_eq!(change["kind"], "refresh");
+    assert_eq!(change["splice"]["start"], saved_blocks);
+    assert_eq!(change["splice"]["blocks"], json!([]));
+    assert_eq!(change["splice"]["snapshot"]["status"], "Ready");
+
+    // A tail too large to relay, or another thread, is fetched instead.
+    app.live.lock().unwrap().snapshot.blocks.clear();
+    app.sync_with(&boot, "Ready", |_| {});
+    assert_eq!(
+        serde_json::from_str::<Value>(&relayed()).unwrap()["change"],
+        json!({"kind":"refresh"})
+    );
+    app.live.lock().unwrap().snapshot.thread_id = "replaced".into();
+    app.sync_with(&boot, "Ready", |_| {});
+    assert_eq!(
+        serde_json::from_str::<Value>(&relayed()).unwrap()["change"],
+        json!({"kind":"refresh"})
+    );
 }
 
 #[tokio::test]

@@ -135,17 +135,42 @@ pub(super) struct Update {
 
 impl Update {
     // The browser fetches histories only for subscribed sessions. Relaying full
-    // snapshots of every running session can make lag recovery itself lag.
+    // snapshots of every running session can make lag recovery itself lag. A
+    // bounded splice rides along; tabs that cannot apply it refetch as before.
     pub(super) fn live_update(&self) -> Cow<'_, Self> {
         if self.change["kind"] != "snapshot" {
             return Cow::Borrowed(self);
         }
+        let mut change = json!({"kind":"refresh"});
+        if let Some(splice) = self.change.get("splice") {
+            change["splice"] = splice.clone();
+        }
         Cow::Owned(Self {
             session_id: self.session_id.clone(),
             revision: self.revision,
-            change: json!({"kind":"refresh"}),
+            change,
         })
     }
+}
+
+/// Largest rebuilt-history tail relayed to every browser instead of a refetch.
+const MAX_SPLICE_BYTES: usize = 64 * 1024;
+
+/// The changed tail of a rebuilt history on the same thread, with every
+/// non-block field, or `None` when browsers should refetch it.
+fn splice(previous: &[Block], snapshot: &mut Snapshot) -> Option<Value> {
+    let visible = |block: &Block| serde_json::to_value(block).ok();
+    let start = previous
+        .iter()
+        .zip(&snapshot.blocks)
+        .take_while(|(old, new)| visible(old) == visible(new))
+        .count();
+    let tail = serde_json::to_value(&snapshot.blocks[start..]).ok()?;
+    let blocks = std::mem::take(&mut snapshot.blocks);
+    let head = serde_json::to_value(&*snapshot);
+    snapshot.blocks = blocks;
+    let splice = json!({"start": start, "blocks": tail, "snapshot": head.ok()?});
+    (serde_json::to_vec(&splice).ok()?.len() <= MAX_SPLICE_BYTES).then_some(splice)
 }
 
 pub(super) struct App {
@@ -205,6 +230,17 @@ impl App {
     fn push_block(&self, snapshot: &mut Snapshot, block: Block) {
         snapshot.blocks.push(block);
         self.publish_block(snapshot, snapshot.blocks.len() - 1);
+    }
+
+    /// Publish a rebuilt history. Browsers apply a bounded splice of the same
+    /// thread in place; anything else invalidates their copy.
+    fn publish_history(&self, snapshot: &mut Snapshot, previous: Option<&[Block]>) {
+        let splice = previous.and_then(|previous| splice(previous, snapshot));
+        let mut change = json!({"kind":"snapshot", "snapshot":snapshot});
+        if let Some(splice) = splice {
+            change["splice"] = splice;
+        }
+        self.publish(snapshot, change);
     }
 
     fn publish_metadata(&self, snapshot: &mut Snapshot) {
@@ -285,7 +321,7 @@ impl App {
         // A finished generation may still need its checkpoint repaired. Its
         // validated service output must survive until GenerationCommitted.
         live.service.reset_draft();
-        let previous_len = live.snapshot.blocks.len();
+        let previous = live.snapshot.blocks.clone();
         let mut index = 0;
         let retry_notice = live.retry_notice;
         let mut removed_before_notice = 0;
@@ -300,11 +336,10 @@ impl App {
             keep
         });
         live.retry_notice = retry_notice.map(|index| index - removed_before_notice);
-        if live.snapshot.blocks.len() == previous_len {
+        if live.snapshot.blocks.len() == previous.len() {
             return;
         }
-        let change = json!({"kind":"snapshot", "snapshot":live.snapshot});
-        self.publish(&mut live.snapshot, change);
+        self.publish_history(&mut live.snapshot, Some(&previous));
     }
 
     fn sync_with(&self, boot: &Boot, status: &str, finish: impl FnOnce(&mut service::Receipts)) {
@@ -316,11 +351,14 @@ impl App {
         live.generation_start = None;
         live.retry_notice = None;
         let snapshot = &mut live.snapshot;
+        let same_thread =
+            snapshot.session_id == session.id && snapshot.thread_id == session.active_thread().id;
         let mut blocks = view::history(session.active_thread());
         if snapshot.thread_id == session.active_thread().id {
             view::retain_tool_timers(&mut blocks, &snapshot.blocks);
         }
         view::retain_processes(&mut blocks, &snapshot.blocks);
+        let previous = same_thread.then(|| std::mem::take(&mut snapshot.blocks));
         snapshot.session_id = session.id.clone();
         snapshot.thread_id = session.active_thread().id.clone();
         snapshot.earlier_threads = view::earlier_threads(&session);
@@ -342,8 +380,7 @@ impl App {
                 text: error.to_string(),
             });
         }
-        let change = json!({"kind":"snapshot", "snapshot":live.snapshot});
-        self.publish(&mut live.snapshot, change);
+        self.publish_history(&mut live.snapshot, previous.as_deref());
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
