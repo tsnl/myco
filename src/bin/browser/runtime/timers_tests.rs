@@ -1,5 +1,8 @@
+use std::time::Duration;
+
+use super::queue::MAX_QUEUED_MESSAGES;
+use super::tests::app;
 use super::*;
-use crate::browser::runtime::tests::app;
 use myco::generative_model::{Content, Message, ToolUse};
 use myco::tool_services::{HostDispatchContext, ToolService};
 

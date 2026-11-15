@@ -6,7 +6,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use myco::core::Async;
 use myco::generative_model::{ToolResult, ToolSpec, ToolUse};
-use myco::session::inbox::{Entry, EventRequest, Priority, Source, State};
+use myco::session::inbox::{Entry, EventRequest, Inbox, Priority, Source, State};
 use myco::tool_services::{HostDispatchContext, ToolService, tool_input_schema};
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant as Deadline;
@@ -541,4 +541,39 @@ fn timer_deadline(
         let delay = Duration::from_secs_f64(seconds);
         now + chrono::Duration::from_std(delay).expect("bounded timer duration")
     }))
+}
+
+// Inbox discovery does not open sessions, hold writer locks, or run models.
+// A corrupt inbox is reported independently so other sessions can recover.
+pub(crate) fn pending_inboxes(
+    directory: std::path::PathBuf,
+) -> std::result::Result<Vec<String>, String> {
+    let files = match std::fs::read_dir(&directory) {
+        Ok(files) => files,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(error) => return Err(format!("Read {}: {error}", directory.display())),
+    };
+    let mut ids = Vec::new();
+    for file in files {
+        let path = file.map_err(|e| e.to_string())?.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let Some(id) = path
+            .file_stem()
+            .and_then(|id| id.to_str())
+            .filter(|id| Uuid::parse_str(id).is_ok())
+        else {
+            continue;
+        };
+        match Inbox::open(path.clone(), id) {
+            Ok(inbox) if inbox.entries().iter().any(|event| event.state.active()) => {
+                ids.push(id.to_owned())
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("browser inbox {id}: {error}"),
+        }
+    }
+    ids.sort();
+    Ok(ids)
 }

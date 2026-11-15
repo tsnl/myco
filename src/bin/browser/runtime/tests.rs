@@ -4,14 +4,22 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
 use futures::StreamExt;
 use myco::generative_model::ToolUse;
 use myco::generative_model::{Content, Message, ToolResult};
+use myco::session::ActiveSession;
+use myco::{AgentEvent, EventSink};
 
 use super::super::http::{
     Server, SessionRequest, events, live_events, session_action, session_cancel,
 };
+use super::queue::MAX_QUEUED_MESSAGES;
+use super::sessions::RunningSession;
 use super::*;
+use crate::{Args, Boot, Config, StartupPreflight};
 
 pub(super) fn app() -> (Arc<App>, mpsc::Receiver<Work>) {
     app_for("session", broadcast::channel(4).0)
