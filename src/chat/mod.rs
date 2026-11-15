@@ -18,6 +18,9 @@ mod autonomy;
 mod runner;
 pub use runner::{Compactor, ModelCompactor, SessionRunner, WorkflowEvent};
 
+mod agent_model;
+pub use agent_model::AgentModel;
+
 mod auxiliary;
 mod compact_worker;
 pub(crate) use compact_worker::run_compact_worker;

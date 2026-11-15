@@ -86,6 +86,20 @@ pub fn prelude_change_notices(initial: Vec<PreludeEntry>) -> BeforeGenerationNot
     })
 }
 
+/// The root-only tools bound to `session`, installed on the in-process local
+/// host after any frontend tools.
+pub fn session_root_tools(
+    session: &ActiveSession,
+    max_prelude_bytes: usize,
+) -> Vec<Arc<dyn crate::ToolService>> {
+    vec![
+        Arc::new(crate::SessionMetaTool::new(session.clone())),
+        Arc::new(crate::SessionHistoryTool::new()),
+        Arc::new(crate::ListRecentService::new()),
+        Arc::new(crate::PreludeTool::new(max_prelude_bytes)),
+    ]
+}
+
 pub struct SessionRuntime {
     harness: Arc<Harness>,
     owner_id: Uuid,

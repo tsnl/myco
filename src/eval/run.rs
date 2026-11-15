@@ -9,14 +9,13 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 use crate::agent::{Agent, AgentInteractionError};
-use crate::chat::{Compactor, SessionRunner, WorkflowEvent};
+use crate::chat::{AgentModel, Compactor, SessionRunner, WorkflowEvent};
 use crate::core::{
-    Async, CancelToken, ModelInfo,
-    image_store::{ImageStore, sha256, with_images},
+    Async, CancelToken,
+    image_store::{ImageStore, sha256},
 };
 use crate::generative_model::{
-    self, BackendConfig, CatalogModel, Content, Effort, GenerativeModelConfig, Message,
-    TurnEndReason,
+    BackendConfig, CatalogModel, Content, Effort, Message, TurnEndReason,
 };
 use crate::session::{ActiveSession, CompactOutcome, Session, Thread};
 use crate::{Config, ConfigUserSettings, Harness, SessionRuntime};
@@ -367,7 +366,7 @@ pub async fn run(mut options: RunOptions) -> Result<serde_json::Value, String> {
     for result in results {
         result?;
     }
-    report(&options.output, None)
+    report_with_interventions(&options.output, None, None)
 }
 
 async fn run_one(job: Job) -> Result<(), String> {
@@ -608,7 +607,7 @@ impl Compactor for EvalCompactor {
 
 pub async fn execute_job(path: &Path) -> Result<(), String> {
     let job: Job = read_json(path)?;
-    let (config, mut catalog) = config(&job.config, &job.model)?;
+    let (config, catalog) = config(&job.config, &job.model)?;
     if job.free_only {
         enforce_free(&catalog)?;
     }
@@ -650,42 +649,22 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
     harness_config.remote_hosts.clear();
     let harness = Harness::attach_with_root_services(
         harness_config,
-        vec![
-            Arc::new(crate::SessionMetaTool::new(session.clone())),
-            Arc::new(crate::SessionHistoryTool::new()),
-            Arc::new(crate::ListRecentService::new()),
-            Arc::new(crate::PreludeTool::new(config.max_prelude_bytes)),
-        ],
+        crate::session_runtime::session_root_tools(&session, config.max_prelude_bytes),
     )
     .await?;
     let runtime = SessionRuntime::new(harness.clone(), session);
-    runtime.set_max_image_base64_bytes(catalog.spec.max_image_base64_bytes);
-    match &mut catalog.backend {
-        BackendConfig::Anthropic(c) => {
-            c.effort = Some(job.effort);
-            c.debug_dump_api_requests = false;
-        }
-        BackendConfig::OpenAIResponses(c) | BackendConfig::OpenAICompletions(c) => {
-            c.effort = Some(job.effort);
-            c.debug_dump_api_requests = false;
-        }
-    }
-    let (epilogue, prelude, skills) = crate::prompts::agent_prompt_epilogue();
-    let model_config = GenerativeModelConfig {
-        model: catalog.spec.clone(),
-        tools: harness.tool_specs_with_image_limit(catalog.spec.max_image_base64_bytes),
-        backend_config: catalog.backend.clone(),
-        system_prompt: format!(
-            "You are a helpful assistant running in an agentic harness with unfettered computer access.\n{}\n{}\n{}\nThe current task workspace is {}. This is already an isolated task checkout; make changes directly here. Historical paths and tool handles are observations from an earlier run; use the current workspace. Only the local host is configured. Complete this task in this agent; nested model runs are not configured in this evaluation.",
-            epilogue,
-            crate::prompts::model_stamp(&job.model),
-            crate::prompts::auto_compact_notice(
-                catalog.spec.auto_compact_at_tokens,
-                catalog.spec.context_window_tokens
-            ),
-            job.output.join("workspace").display()
-        ),
-    };
+    let workspace_notice = format!(
+        "The current task workspace is {}. This is already an isolated task checkout; make changes directly here. Historical paths and tool handles are observations from an earlier run; use the current workspace. Only the local host is configured. Complete this task in this agent; nested model runs are not configured in this evaluation.",
+        job.output.join("workspace").display()
+    );
+    let (selected, model_config) = AgentModel::new(
+        &catalog,
+        &harness,
+        job.effort,
+        false,
+        "You are a helpful assistant running in an agentic harness with unfettered computer access.",
+        Some(&workspace_notice),
+    );
     write_json(
         &job.output.join("provenance.json"),
         &serde_json::json!({
@@ -709,39 +688,25 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
             },
         }),
     )?;
-    let model = generative_model::new(model_config).map_err(|error| error.to_string())?;
     let recorder = Recorder::new(
         job.max_requests,
         std::fs::File::create(job.output.join("events.jsonl"))
             .map_err(|error| error.to_string())?,
     );
-    let model = with_images(
-        recorder.wrap(model, false),
-        image_store,
-        catalog.spec.max_image_base64_bytes,
-    );
-    runtime.set_prompt_skills(skills);
-    let mut agent = Agent::new(model.clone(), runtime.clone(), recorder.clone());
-    agent.set_before_generation_notice(Some(crate::session_runtime::prelude_change_notices(
-        prelude,
-    )));
-    agent.set_retry_policy(catalog.backend.retry_policy());
-    agent.set_max_truncated_resumes(catalog.spec.max_truncated_resumes);
+    let model = selected.build(model_config, |model| recorder.wrap(model, false))?;
+    let compactor = Arc::new(EvalCompactor {
+        model: selected.catalog.clone(),
+        max_requests: config.compaction_max_requests,
+        recorder: recorder.clone(),
+    });
+    let agent = Agent::new(model.clone(), runtime.clone(), recorder.clone());
     let mut runner = SessionRunner::new(agent, runtime)
         .await
         .map_err(|error| error.to_string())?;
     runner
-        .set_model(model, ModelInfo::from_spec(&catalog.spec, Some(job.effort)))
+        .select_model(model, selected, compactor)
         .await
         .map_err(|error| error.to_string())?;
-    runner.set_compactor(
-        Arc::new(EvalCompactor {
-            model: catalog.clone(),
-            max_requests: config.compaction_max_requests,
-            recorder: recorder.clone(),
-        }),
-        catalog.spec.auto_compact_at_tokens,
-    );
     let observer = recorder.clone();
     runner.set_observer(Arc::new(move |event| match event {
         WorkflowEvent::Compacting { session_id, thread_id, automatic } => {
@@ -812,10 +777,6 @@ pub async fn execute_job(path: &Path) -> Result<(), String> {
     recorder.event(serde_json::json!({"event":"run_finished", "status":result.status}));
     recorder.check_trace()?;
     write_json(&job.output.join("agent.json"), &result)
-}
-
-pub fn report(output: &Path, prices: Option<&Path>) -> Result<serde_json::Value, String> {
-    report_with_interventions(output, prices, None)
 }
 
 /// Join explicit observer attestations without modifying run artifacts or machine metrics.
