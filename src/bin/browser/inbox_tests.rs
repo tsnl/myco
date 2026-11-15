@@ -98,7 +98,7 @@ async fn normal_events_background_bash_but_preserve_fifo_and_do_not_cancel_gener
 #[tokio::test]
 async fn urgent_events_bypass_a_full_or_held_queue_without_dropping_user_input() {
     let (app, _work) = app();
-    app.live.lock().unwrap().snapshot.busy = true;
+    app.live.lock().unwrap().snapshot.cancel = Some(CancelToken::new());
     for _ in 0..MAX_QUEUED_MESSAGES {
         app.accept(action_request()).unwrap();
     }

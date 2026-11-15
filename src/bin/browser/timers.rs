@@ -330,7 +330,7 @@ impl App {
     fn queue_events(&self, live: &mut Live) -> Result<()> {
         let now = self.clock.now();
         self.expire_events(live, now)?;
-        if live.snapshot.status == "Cancelling" {
+        if live.snapshot.cancelling() {
             return Ok(());
         }
         let mut pending: Vec<_> = live
@@ -386,7 +386,7 @@ impl App {
     // Never cancel a turn until every foreground bash call has acknowledged its
     // background signal. Cancelling both signals together would kill the child.
     pub(super) fn preempt_for_events(&self, live: &mut Live) {
-        if !live.snapshot.busy || live.snapshot.status == "Cancelling" {
+        if !live.snapshot.busy() || live.snapshot.cancelling() {
             return;
         }
         let due: Vec<_> = live

@@ -177,7 +177,8 @@ impl App {
                 "The session worker is unavailable.".into(),
             ));
         }
-        if live.snapshot.busy || live.service.active.is_some() || !live.snapshot.queued.is_empty() {
+        if live.snapshot.busy() || live.service.active.is_some() || !live.snapshot.queued.is_empty()
+        {
             return Err(Error::Conflict("The session has active or queued work. Observe it or wait before submitting a service turn.".into()));
         }
         let Action::ServiceSubmit { text, images } = &request.action else {
@@ -286,9 +287,7 @@ mod tests {
         });
         app.emit(AgentEvent::GenerationCommitted { context });
         app.finish_service(id, &Ok(()), false);
-        let mut live = app.live.lock().unwrap();
-        live.snapshot.busy = false;
-        live.cancel = None;
+        app.live.lock().unwrap().snapshot.cancel = None;
     }
 
     #[test]

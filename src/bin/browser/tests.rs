@@ -17,6 +17,25 @@ pub(super) fn app() -> (Arc<App>, mpsc::Receiver<Work>) {
     app_for("session", broadcast::channel(4).0)
 }
 
+/// `activity.js` and `app.js` match these labels literally.
+#[test]
+fn run_status_serializes_to_the_labels_the_browser_matches() {
+    for (status, label) in [
+        (Status::Ready, "Ready"),
+        (Status::Running, "Running"),
+        (Status::Compacting, "Compacting"),
+        (Status::Retrying, "Retrying"),
+        (Status::Cancelling, "Cancelling"),
+        (Status::Stopped, "Stopped"),
+    ] {
+        assert_eq!(json!(status), label);
+    }
+    let (app, _) = app();
+    assert_eq!(app.snapshot().change["snapshot"]["busy"], false);
+    app.live.lock().unwrap().snapshot.cancel = Some(CancelToken::new());
+    assert_eq!(app.snapshot().change["snapshot"]["busy"], true);
+}
+
 #[test]
 fn retry_discards_only_the_current_generation_and_preserves_output_and_live_tools() {
     let (app, _) = app();
@@ -155,14 +174,13 @@ fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc:
                 ),
                 usage: None,
                 context_window_tokens: 100_000,
-                busy: false,
-                status: "Ready".into(),
+                cancel: None,
+                status: Status::Ready,
                 queued: VecDeque::new(),
                 timers: vec![],
                 inbox: vec![],
                 blocks: vec![],
             },
-            cancel: None,
             background: HashMap::new(),
             accepted: HashMap::new(),
             service: service::Receipts::default(),
@@ -512,7 +530,7 @@ fn title_changes_reach_live_metadata_and_invalidate_session_listings() {
             .set_title(Some("Renamed while running".into()))
             .unwrap()
     });
-    app.live.lock().unwrap().snapshot.busy = true;
+    app.live.lock().unwrap().snapshot.cancel = Some(CancelToken::new());
     let mut updates = app.events.subscribe();
     app.refresh_metadata(&active);
     let update = updates.try_recv().unwrap();
@@ -532,7 +550,7 @@ fn auto_continue_changes_reach_live_clients_while_the_run_is_busy() {
     let (app, _) = app();
     let active = ActiveSession::new(Session::new_with_id("test", "session"));
     active.with_mut(|session| session.auto_continue = true);
-    app.live.lock().unwrap().snapshot.busy = true;
+    app.live.lock().unwrap().snapshot.cancel = Some(CancelToken::new());
     let mut updates = app.events.subscribe();
     app.refresh_metadata(&active);
     let update = updates.try_recv().unwrap();
@@ -553,7 +571,7 @@ fn recorded_usage_reaches_live_and_reconnect_metadata_without_inventing_unknown_
     let mut session = Session::new_with_id("test", "session");
     session.title = Some("Test".into());
     let active = ActiveSession::new(session);
-    app.live.lock().unwrap().snapshot.busy = true;
+    app.live.lock().unwrap().snapshot.cancel = Some(CancelToken::new());
     let mut updates = app.events.subscribe();
     for usage in [
         Some(TokenUsage {
@@ -657,7 +675,7 @@ fn background_controls_target_one_call_and_reject_stale_or_foreign_requests() {
     assert_eq!(blocks[0]["running"], true);
     assert_eq!(blocks[1]["status"], "backgrounded");
     assert!(app.background("session", second).is_err());
-    app.live.lock().unwrap().snapshot.status = "Cancelling".into();
+    app.live.lock().unwrap().snapshot.status = Status::Cancelling;
     assert!(app.background("session", first).is_err());
     assert!(!first_signal.is_cancelled());
 }
@@ -889,7 +907,7 @@ async fn retries_keep_one_action_and_its_original_cancellation() {
     );
     app.cancel("session").unwrap();
     assert!(accepted.cancel.is_cancelled());
-    app.live.lock().unwrap().snapshot.busy = false;
+    app.live.lock().unwrap().snapshot.cancel = None;
     app.accept(request.clone()).unwrap();
     assert!(
         work.try_recv().is_err(),
@@ -917,7 +935,7 @@ async fn model_selection_requires_an_idle_current_session() {
     request.action = Action::SelectModel {
         key: "second".into(),
     };
-    app.live.lock().unwrap().snapshot.busy = true;
+    app.live.lock().unwrap().snapshot.cancel = Some(CancelToken::new());
     assert_eq!(
         app.accept(request.clone())
             .unwrap_err()
@@ -925,7 +943,7 @@ async fn model_selection_requires_an_idle_current_session() {
             .status(),
         StatusCode::CONFLICT
     );
-    app.live.lock().unwrap().snapshot.busy = false;
+    app.live.lock().unwrap().snapshot.cancel = None;
     let mut stale = request.clone();
     stale.session_id = "another-session".into();
     assert_eq!(
@@ -972,7 +990,7 @@ async fn an_unavailable_worker_does_not_accept_a_turn() {
         StatusCode::SERVICE_UNAVAILABLE
     );
     let live = app.live.lock().unwrap();
-    assert!(!live.snapshot.busy);
+    assert!(!live.snapshot.busy());
     assert!(live.accepted.is_empty());
 }
 
@@ -1062,7 +1080,7 @@ async fn lagged_live_observers_drop_stale_deltas_and_request_one_resync() {
     let resync = event_data(&stream.next().await.unwrap().unwrap());
     assert_eq!(resync, json!({"kind":"resync"}));
 
-    app.status("Running");
+    app.status(Status::Running);
     let fresh = event_data(&stream.next().await.unwrap().unwrap());
     assert_eq!(fresh["revision"], app.snapshot().revision);
     assert_eq!(fresh["change"]["kind"], "meta");
@@ -1169,7 +1187,7 @@ fn compaction_reports_activity_and_separates_tool_first_continuation_without_a_m
     assert_eq!(blocks[2]["kind"], "assistant_heading");
     assert_eq!(blocks[2]["time"], blocks[1]["time"]);
     assert_eq!(blocks[3]["kind"], "tool");
-    app.live.lock().unwrap().snapshot.status = "Cancelling".into();
+    app.live.lock().unwrap().snapshot.status = Status::Cancelling;
     app.finish_compaction();
     assert_eq!(app.snapshot().change["snapshot"]["status"], "Cancelling");
 }
@@ -1643,7 +1661,7 @@ async fn receipt_completion_and_next_admission_share_the_settlement_lock() {
             None
         );
 
-        app.sync_with(&boot, "Ready", |receipts| {
+        app.sync_with(&boot, Status::Ready, |receipts| {
             receipts.finish(input.request_id, &Ok(()), false);
             assert!(
                 matches!(

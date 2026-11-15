@@ -77,7 +77,18 @@ pub(super) async fn blocking<T: Send + 'static>(
         .map_err(|error| Error::Internal(error.to_string()))
 }
 
-#[derive(Clone, Serialize)]
+/// The worker's state as the browser labels it; variant names are the wire strings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+enum Status {
+    Ready,
+    Running,
+    Compacting,
+    Retrying,
+    Cancelling,
+    Stopped,
+}
+
+#[derive(Serialize)]
 struct Snapshot {
     #[serde(skip)]
     revision: u64,
@@ -92,21 +103,48 @@ struct Snapshot {
     attachment_limits: attachments::Limits,
     usage: Option<TokenUsage>,
     context_window_tokens: u64,
-    busy: bool,
-    status: String,
+    /// The accepted run's token: present exactly while the worker is busy.
+    #[serde(rename = "busy", serialize_with = "serialize_busy")]
+    cancel: Option<CancelToken>,
+    status: Status,
     queued: VecDeque<QueuedMessage>,
     timers: Vec<timers::Timer>,
     inbox: Vec<InboxEntry>,
     blocks: Vec<Block>,
 }
 
+fn serialize_busy<S: serde::Serializer>(
+    cancel: &Option<CancelToken>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_bool(cancel.is_some())
+}
+
 impl Snapshot {
+    fn busy(&self) -> bool {
+        self.cancel.is_some()
+    }
+
+    fn cancelling(&self) -> bool {
+        self.status == Status::Cancelling
+    }
+
+    /// Progress events cannot relabel a cancelled run: `Cancelling` holds
+    /// until the run settles and [`App::sync_with`] records its outcome.
+    fn progress(&mut self, status: Status) -> bool {
+        if self.cancelling() || self.status == status {
+            return false;
+        }
+        self.status = status;
+        true
+    }
+
     fn metadata(&self) -> Value {
         json!({
             "session_id": self.session_id, "thread_id": self.thread_id,
             "title": self.title, "archived": self.archived, "model": self.model,
             "auto_continue": self.auto_continue,
-            "busy": self.busy, "status": self.status, "queued": self.queued, "timers": self.timers,
+            "busy": self.busy(), "status": self.status, "queued": self.queued, "timers": self.timers,
             "inbox": self.inbox,
             "attachment_limits": self.attachment_limits,
             "usage": self.usage, "context_window_tokens": self.context_window_tokens,
@@ -121,7 +159,6 @@ struct Live {
     retry_notice: Option<usize>,
     background: HashMap<Uuid, CancelToken>,
     snapshot: Snapshot,
-    cancel: Option<CancelToken>,
     accepted: HashMap<Uuid, ActionRequest>,
     service: service::Receipts,
 }
@@ -160,7 +197,7 @@ pub(super) struct App {
 impl App {
     pub(super) fn background(&self, session_id: &str, call_id: Uuid) -> Result<()> {
         let mut live = self.live.lock().unwrap();
-        if live.snapshot.session_id != session_id || live.snapshot.status == "Cancelling" {
+        if live.snapshot.session_id != session_id || live.snapshot.cancelling() {
             return Err(Error::Conflict(
                 "The session changed or is cancelling.".into(),
             ));
@@ -181,7 +218,7 @@ impl App {
 
     fn stop(&self) {
         self.shutdown.cancel();
-        if let Some(cancel) = &self.live.lock().unwrap().cancel {
+        if let Some(cancel) = &self.live.lock().unwrap().snapshot.cancel {
             cancel.cancel();
         }
     }
@@ -226,37 +263,36 @@ impl App {
     }
 
     fn compacting(&self) {
-        self.status("Compacting");
+        self.status(Status::Compacting);
     }
 
     fn finish_compaction(&self) {
         self.append_block(Block::Boundary {
             time: view::timestamp(&Utc::now()),
         });
-        self.status("Running");
+        self.status(Status::Running);
     }
 
     fn warning(&self, text: String) {
-        let compacting = self.live.lock().unwrap().snapshot.status == "Compacting";
+        let compacting = self.live.lock().unwrap().snapshot.status == Status::Compacting;
         if compacting {
-            self.status("Running");
+            self.status(Status::Running);
         }
         self.notice(text);
     }
 
     fn retrying(&self, error: String, delay: Duration) {
         self.discard_generation();
-        self.status("Retrying");
+        self.status(Status::Retrying);
         self.retry_notice(format!(
             "{error} — auto-continue retrying in {:.1}s",
             delay.as_secs_f64()
         ));
     }
 
-    fn status(&self, status: &str) {
+    fn status(&self, status: Status) {
         let mut live = self.live.lock().unwrap();
-        if live.snapshot.status != "Cancelling" && live.snapshot.status != status {
-            live.snapshot.status = status.into();
+        if live.snapshot.progress(status) {
             self.publish_metadata(&mut live.snapshot);
         }
     }
@@ -307,7 +343,7 @@ impl App {
         self.publish(&mut live.snapshot, change);
     }
 
-    fn sync_with(&self, boot: &Boot, status: &str, finish: impl FnOnce(&mut service::Receipts)) {
+    fn sync_with(&self, boot: &Boot, status: Status, finish: impl FnOnce(&mut service::Receipts)) {
         let session = boot.session.snapshot();
         let mut live = self.live.lock().unwrap();
         // The receipt and snapshot settle under one lock. A completed native
@@ -336,7 +372,7 @@ impl App {
         snapshot.usage = session.active_thread().last_usage;
         snapshot.context_window_tokens = boot.catalog_model.spec.context_window_tokens;
         snapshot.blocks = blocks;
-        snapshot.status = status.into();
+        snapshot.status = status;
         if let Err(error) = self.start_next(&mut live) {
             live.snapshot.blocks.push(Block::Notice {
                 text: error.to_string(),
@@ -436,7 +472,7 @@ impl EventSink for App {
                 live.generation_start = Some(live.snapshot.blocks.len());
                 live.service.reset_draft();
                 drop(live);
-                self.status("Running");
+                self.status(Status::Running);
             }
             AgentEvent::GenerationFinished { context } if context.depth == 0 => {
                 self.live.lock().unwrap().generation_start = None;
@@ -512,7 +548,7 @@ impl EventSink for App {
                 self.live.lock().unwrap().service.reset_draft();
                 let retry = if let Some(delay) = retry_in {
                     self.discard_generation();
-                    self.status("Retrying");
+                    self.status(Status::Retrying);
                     let budget = recovery_remaining
                         .map(|left| format!(" ({:.1}s recovery budget left)", left.as_secs_f64()))
                         .unwrap_or_default();
@@ -792,14 +828,13 @@ impl Sessions {
                             attachment_limits: attachments::Limits::new(image_limit),
                             usage: session.active_thread().last_usage,
                             context_window_tokens,
-                            busy: false,
-                            status: "Ready".into(),
+                            cancel: None,
+                            status: Status::Ready,
                             queued: VecDeque::new(),
                             timers: vec![],
                             inbox: vec![],
                             blocks: view::history(session.active_thread()),
                         },
-                        cancel: None,
                         background: HashMap::new(),
                         accepted: HashMap::new(),
                         service: service::Receipts::default(),
@@ -823,7 +858,7 @@ impl Sessions {
                 None,
             )
             .map_err(Error::Internal)?;
-        app.sync_with(&boot, "Ready", |_| {});
+        app.sync_with(&boot, Status::Ready, |_| {});
         app.fire_timers();
         if let Some(notice) = model_fallback {
             app.notice(notice);
@@ -980,17 +1015,19 @@ impl Sessions {
         let running = self.running.lock().await;
         Ok(Value::Array(entries.into_iter().filter(|s| s.archived == archived).map(|s| {
             let live = running.get(&s.id).map(|session| session.app.live.lock().unwrap());
-            let status = live.as_ref().map_or("Saved", |live| {
-                if !live.snapshot.busy && live.snapshot.blocks.iter().any(|block| matches!(block, Block::Tool { running: true, .. })) { "Running" }
-                else if !live.snapshot.busy && live.snapshot.inbox.iter().any(|entry| entry.state.active()) { "Waiting" }
-                else { live.snapshot.status.as_str() }
+            // Listings add labels for idle work and unopened sessions.
+            let status = live.as_ref().map_or(json!("Saved"), |live| {
+                let snapshot = &live.snapshot;
+                if !snapshot.busy() && snapshot.blocks.iter().any(|block| matches!(block, Block::Tool { running: true, .. })) { json!(Status::Running) }
+                else if !snapshot.busy() && snapshot.inbox.iter().any(|entry| entry.state.active()) { json!("Waiting") }
+                else { json!(snapshot.status) }
             });
             let title = s.title.unwrap_or_else(|| if s.snippet.is_empty() { "New session".into() } else { s.snippet });
             json!({
                 "id": s.id, "title": title,
                 "model": live.as_ref().map_or(s.model.as_str(), |live| &live.snapshot.model),
                 "updated_at": s.updated_at, "archived": s.archived, "status": status,
-                "busy": live.as_ref().is_some_and(|live| live.snapshot.busy),
+                "busy": live.as_ref().is_some_and(|live| live.snapshot.busy()),
             })
         }).collect()))
     }
@@ -1033,7 +1070,11 @@ async fn worker(
         let settled = app.settle_events(&boot.session.snapshot(), &result, cancel.is_cancelled());
         app.sync_with(
             &boot,
-            if result.is_ok() { "Ready" } else { "Stopped" },
+            if result.is_ok() {
+                Status::Ready
+            } else {
+                Status::Stopped
+            },
             |receipts| receipts.finish(request_id, &result, cancel.is_cancelled()),
         );
         if let Err(error) = settled {
@@ -1198,7 +1239,7 @@ impl App {
             request.action,
             Action::UpdateQueued { .. } | Action::CancelTimer { .. }
         );
-        if live.snapshot.busy
+        if live.snapshot.busy()
             && !matches!(
                 request.action,
                 Action::Submit { .. } | Action::UpdateQueued { .. } | Action::CancelTimer { .. }
@@ -1208,7 +1249,7 @@ impl App {
                 "Wait for the current run or cancel it first.".into(),
             ));
         }
-        if live.snapshot.status == "Cancelling" && !queue_update {
+        if live.snapshot.cancelling() && !queue_update {
             return Err(Error::Conflict("Wait for cancellation to finish.".into()));
         }
         let accepted_at = Utc::now();
@@ -1253,9 +1294,8 @@ impl App {
                 accepted_at,
             })
             .map_err(|_| Error::Unavailable("The session worker is unavailable.".into()))?;
-        live.cancel = Some(cancel);
-        live.snapshot.busy = true;
-        live.snapshot.status = "Running".into();
+        live.snapshot.cancel = Some(cancel);
+        live.snapshot.status = Status::Running;
         Ok(())
     }
 
@@ -1271,9 +1311,9 @@ impl App {
     }
 
     fn cancel_live(&self, live: &mut Live) {
-        if let Some(cancel) = &live.cancel {
+        if let Some(cancel) = &live.snapshot.cancel {
             cancel.cancel();
-            live.snapshot.status = "Cancelling".into();
+            live.snapshot.status = Status::Cancelling;
         }
         self.publish_metadata(&mut live.snapshot);
     }

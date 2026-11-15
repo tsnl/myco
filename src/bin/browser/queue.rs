@@ -210,7 +210,7 @@ impl App {
     pub(super) fn drain_queue(&self, live: &mut Live) -> Result<()> {
         self.expire_events(live, self.clock.now())?;
         self.refresh_inbox(live);
-        if live.snapshot.busy || self.shutdown.is_cancelled() {
+        if live.snapshot.busy() || self.shutdown.is_cancelled() {
             return Ok(());
         }
         if let Some(next) = live
@@ -241,8 +241,7 @@ impl App {
     }
 
     pub(super) fn start_next(&self, live: &mut Live) -> Result<()> {
-        live.cancel = None;
-        live.snapshot.busy = false;
+        live.snapshot.cancel = None;
         self.drain_queue(live)
     }
 
@@ -252,7 +251,7 @@ impl App {
 
     pub(super) fn claim_followup(&self) -> Result<Option<QueuedMessage>> {
         let mut live = self.live.lock().unwrap();
-        if self.shutdown.is_cancelled() || live.snapshot.status == "Cancelling" {
+        if self.shutdown.is_cancelled() || live.snapshot.cancelling() {
             return Ok(None);
         }
         self.expire_events(&mut live, self.clock.now())?;
