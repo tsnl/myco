@@ -549,8 +549,10 @@ or discover plugin bundles. Duplicate names remain separate entries identified
 by their paths.
 
 Successful editor and image calls scan the operated file's directory, or the
-operated directory itself. Successful bash calls scan the host worker's launch
-directory. A notice attached to the tool result, tagged with its host and
+operated directory itself. A successful bash call on a retained session (start,
+write, read, signal) scans that session process's current directory on Linux and
+macOS, so a `cd` written to a live shell is followed. Other bash calls, and other
+platforms, scan the host worker's launch directory. A notice attached to the tool result, tagged with its host and
 directory, lists only what the thread has not been told: new or changed skills,
 listed skills no longer found in a layout the scan checked, and new discovery
 warnings. A skill already listed is not repeated when another directory sees it,
@@ -569,9 +571,9 @@ result is an ordinary, visible tool result:
 ```
 
 Omitting `host` selects `local`; omitting `path` selects that host worker's launch
-directory. Relative paths use that launch directory. Shell-internal `cd` commands
-and retained shell working directories are not inferred. After changing a shell's
-directory, pass its new path explicitly. Remote discovery and subsequent editor
+directory. Relative paths use that launch directory. A `cd` inside an `exec`
+command ends with that call and is not inferred, since commands are not parsed;
+pass the directory explicitly after working there. Remote discovery and subsequent editor
 reads happen on the selected host; the startup catalog does not connect remotes.
 
 Frontmatter supports plain, quoted, literal (`|`), and folded (`>`) scalar values

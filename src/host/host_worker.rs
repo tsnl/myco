@@ -94,13 +94,15 @@ impl HostWorker {
             return generative_model::ToolResult::err(format!("unknown tool '{}'", tool_use.name));
         };
         let mut result = service
+            .clone()
             .dispatch_tool_use(tool_use.clone(), ctx.clone())
             .await;
         if !result.is_error {
+            let directory = service.working_directory(&tool_use, ctx.agent_id);
             for observer in &self.services {
                 if let Some(notice) = observer
                     .clone()
-                    .observe_successful_call(tool_use.clone(), ctx.clone())
+                    .observe_successful_call(tool_use.clone(), directory.clone(), ctx.clone())
                     .await
                 {
                     result.content.push(generative_model::Content::System {

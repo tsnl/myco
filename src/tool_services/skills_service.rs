@@ -46,7 +46,7 @@ impl SkillsService {
     pub fn specs() -> Vec<ToolSpec> {
         vec![ToolSpec {
             name: "skills".into(),
-            description: "Discover skill metadata in a directory and its project ancestors on this host. Omit path for the host worker's launch directory. Scans .agents/skills, .claude/skills and .grok/skills plus user skill directories, with bounded work. Use after shell cd to discover skills where you work; shell directory changes are not inferred. Read a relevant SKILL.md with the editor before following it. Discovery does not grant permissions.".into(),
+            description: "Discover skill metadata in a directory and its project ancestors on this host. Omit path for the host worker's launch directory. Scans .agents/skills, .claude/skills and .grok/skills plus user skill directories, with bounded work. Use after cd inside an exec command to discover skills where you work: live shell sessions are followed, commands are not parsed. Read a relevant SKILL.md with the editor before following it. Discovery does not grant permissions.".into(),
             input_schema: tool_input_schema::<Input>(),
         }]
     }
@@ -150,10 +150,11 @@ impl ToolService for SkillsService {
     fn observe_successful_call(
         self: Arc<Self>,
         tool: ToolUse,
+        directory: Option<PathBuf>,
         ctx: HostDispatchContext,
     ) -> Async<Option<String>> {
         Box::pin(async move {
-            let target = Target::from_tool(&tool)?;
+            let target = Target::from_tool(&tool, directory)?;
             match self.discover(target, &ctx, false).await {
                 Ok(notice) => notice,
                 Err(_) if ctx.cancel.is_cancelled() => None,
@@ -185,12 +186,13 @@ struct Input {
 enum Target {
     Directory(Option<String>),
     OperatedPath(String),
+    WorkingDirectory(PathBuf),
 }
 
 impl Target {
-    fn from_tool(tool: &ToolUse) -> Option<Self> {
+    fn from_tool(tool: &ToolUse, directory: Option<PathBuf>) -> Option<Self> {
         match tool.name.as_str() {
-            "bash" => Some(Self::Directory(None)),
+            "bash" => Some(directory.map_or(Self::Directory(None), Self::WorkingDirectory)),
             "str_replace_based_edit_tool" | "view_image" => tool
                 .input
                 .get("path")
@@ -204,6 +206,7 @@ impl Target {
         let operated = matches!(self, Self::OperatedPath(_));
         let path = match self {
             Self::Directory(None) => launch,
+            Self::WorkingDirectory(path) => path,
             Self::Directory(Some(path)) | Self::OperatedPath(path) => {
                 if path.trim().is_empty() {
                     return Err("skills path must be a non-empty directory".into());

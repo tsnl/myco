@@ -197,6 +197,26 @@ impl ToolService for BashService {
         self.reap_owner(agent_id);
     }
 
+    /// A session call worked wherever its process is now; an exec's own `cd`
+    /// ended with the call.
+    fn working_directory(
+        &self,
+        tool_use: &generative_model::ToolUse,
+        owner: Uuid,
+    ) -> Option<std::path::PathBuf> {
+        let input: Input = serde_json::from_value(tool_use.input.clone()).ok()?;
+        let session_id = match resolve_action(&input).ok()? {
+            Action::Start { session_id, .. }
+            | Action::Write { session_id, .. }
+            | Action::Read { session_id, .. }
+            | Action::Signal { session_id, .. } => session_id,
+            _ => return None,
+        };
+        let sessions = self.sessions();
+        let session = sessions.get(&session_id).filter(|s| s.owner == owner)?;
+        session.process.working_directory()
+    }
+
     fn resources(&self, agent_id: Uuid) -> Vec<crate::core::ToolResource> {
         self.sessions()
             .iter()

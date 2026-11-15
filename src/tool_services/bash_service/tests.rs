@@ -1993,3 +1993,33 @@ async fn a_typoed_field_is_rejected_not_silently_dropped() {
         result_text(&result)
     );
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn a_session_call_works_where_its_shell_is_and_an_exec_cd_ends_with_the_call() {
+    let service = Arc::new(BashService::new());
+    let owner = Uuid::new_v4();
+    let target = crate::test_support::temp_dir("bash-working-directory");
+    let target = target.path().canonicalize().unwrap();
+    let id = unique_id("cwd");
+    let start = json!({"action":"start", "session_id":id, "command":"bash"});
+    assert!(!dispatch_json_as(&service, owner, start).await.is_error);
+    let write = json!({"action":"write", "session_id":id, "stdin":format!("cd {target:?} && echo moved\n")});
+    let moved = dispatch_json_as(&service, owner, write.clone()).await;
+    assert!(
+        crate::test_support::result_text(&moved).contains("moved"),
+        "{moved:?}"
+    );
+    assert_eq!(
+        service.working_directory(&tool_use_json(write.clone()), owner),
+        Some(target)
+    );
+    assert_eq!(
+        service.working_directory(&tool_use_json(write), Uuid::new_v4()),
+        None,
+        "another owner's session"
+    );
+    let exec = json!({"action":"exec", "command":format!("cd {:?}", std::env::temp_dir())});
+    assert_eq!(service.working_directory(&tool_use_json(exec), owner), None);
+    service.on_agent_finished(owner);
+}
