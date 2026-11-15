@@ -6,6 +6,7 @@
 //! dialects share: identical backend settings, and the same rules for
 //! rendering history text, image sources, and tool results.
 
+use super::driver_core::ImageSource;
 use super::*;
 
 /// Only explicit transient codes permit replay; prose and unknown codes never do.
@@ -112,16 +113,13 @@ pub(super) fn text_of(content: &[Content]) -> String {
         .join("\n")
 }
 
-/// Image URL fields accept http(s) and `data:` URLs. Same source policy as the
-/// Anthropic driver: pass URLs through, treat anything else as raw base64 PNG.
+/// Image URL fields accept http(s) and `data:` URLs, so only raw base64
+/// ([`ImageSource::RawBase64`]) needs wrapping.
 pub(super) fn image_url(source: &str) -> String {
-    if source.starts_with("http://")
-        || source.starts_with("https://")
-        || source.starts_with("data:")
-    {
-        return source.to_string();
+    match ImageSource::parse(source) {
+        ImageSource::RawBase64(data) => format!("data:image/png;base64,{data}"),
+        ImageSource::Url(_) | ImageSource::DataUrl { .. } => source.to_string(),
     }
-    format!("data:image/png;base64,{source}")
 }
 
 /// Shared algorithm for a user message's content in either dialect: `None`

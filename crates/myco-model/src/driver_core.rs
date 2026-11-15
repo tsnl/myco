@@ -1,6 +1,7 @@
 //! Protocol-independent scaffolding shared by the streaming drivers: HTTP
-//! client construction, the spawned generate task (channel + request + stream
-//! bridge), the SSE drive loop with end-of-stream validation, and
+//! client construction, the one `generate` path (image and request-size
+//! preflight, spawned task, HTTP status classification, stream bridge), the
+//! SSE drive loop with end-of-stream validation, image-source parsing, and
 //! stream-index remapping.
 
 use super::*;
@@ -50,22 +51,34 @@ pub(super) trait SseAccumulator: Send + 'static {
     fn finished(&self) -> bool;
 }
 
-pub(super) fn error_stream(e: GenerateError) -> AsyncStream<GenerationEvent> {
-    Box::pin(futures::stream::once(async move {
-        GenerationEvent::Failure(GenerationFailure::terminal(e))
-    }))
+/// `Authorization: Bearer` for a non-empty token; an empty one sends no auth.
+pub(super) fn bearer(token: &str) -> Option<(&'static str, String)> {
+    (!token.is_empty()).then(|| ("authorization", format!("Bearer {token}")))
 }
 
-/// Send `request` in a spawned task and bridge its SSE stream into the
-/// [`GenerativeModel::generate`] stream shape. The receiver owns the request
-/// lifetime, including time spent awaiting headers or body bytes. It never retries.
-pub(super) fn spawn_generate<A: SseAccumulator>(
-    request: reqwest::RequestBuilder,
-    acc: A,
+/// Every driver's [`GenerativeModel::generate`]: check image sizes, build the
+/// provider request from `input`, then send it in a spawned task and bridge
+/// its SSE stream into the generate stream shape. The receiver owns the
+/// request lifetime, including time spent awaiting headers or body bytes. It
+/// never retries.
+pub(super) fn generate<A: SseAccumulator + Default>(
     provider: &'static str,
+    input: &[Message],
+    max_image_base64_bytes: u64,
+    request: impl FnOnce(&[Message]) -> Result<reqwest::RequestBuilder, GenerateError>,
     debug_dump_api_requests: bool,
     max_request_bytes: usize,
 ) -> AsyncStream<GenerationEvent> {
+    let request =
+        match validate_image_sizes(input, max_image_base64_bytes).and_then(|()| request(input)) {
+            Ok(request) => request,
+            Err(e) => {
+                return Box::pin(futures::stream::once(async move {
+                    GenerationEvent::Failure(GenerationFailure::terminal(e))
+                }));
+            }
+        };
+    let acc = A::default();
     let (tx, rx) = tokio::sync::mpsc::channel::<GenerationEvent>(32);
 
     tokio::spawn(async move {
@@ -93,6 +106,61 @@ pub(super) fn spawn_generate<A: SseAccumulator>(
     Box::pin(futures::stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|item| (item, rx))
     }))
+}
+
+/// Check inline and legacy base64 images before constructing a provider body.
+/// Remote URLs carry no known payload size; the provider validates their
+/// content. Local references must be checked while resolving and never sent
+/// to a provider.
+fn validate_image_sizes(input: &[Message], limit: u64) -> Result<(), GenerateError> {
+    for part in input.iter().flat_map(Message::content) {
+        let Content::Image { source } = part else {
+            continue;
+        };
+        if source.starts_with("myco-image:") {
+            return Err(GenerateError::ExecutionError(
+                "resolve local image references before calling a provider".into(),
+            ));
+        }
+        match ImageSource::parse(source) {
+            ImageSource::Url(_) => {}
+            ImageSource::DataUrl { data, .. } | ImageSource::RawBase64(data) => {
+                check_image_size(data.len() as u64, limit)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How every driver reads the opaque [`Content::Image`] `source` string.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ImageSource<'a> {
+    /// An http(s) URL, sent by reference.
+    Url(&'a str),
+    /// `data:[<media type>][;base64],<data>`; the media type defaults to PNG.
+    DataUrl { media_type: &'a str, data: &'a str },
+    /// Anything else: raw base64, taken to be PNG.
+    RawBase64(&'a str),
+}
+
+impl<'a> ImageSource<'a> {
+    pub(super) fn parse(source: &'a str) -> Self {
+        if source.starts_with("http://") || source.starts_with("https://") {
+            return Self::Url(source);
+        }
+        if let Some((meta, data)) = source
+            .strip_prefix("data:")
+            .and_then(|rest| rest.split_once(','))
+        {
+            let media_type = meta
+                .split(';')
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("image/png");
+            return Self::DataUrl { media_type, data };
+        }
+        Self::RawBase64(source)
+    }
 }
 
 fn prepare_request(
@@ -150,6 +218,55 @@ async fn attempt_send(
     } else {
         Err(GenerationFailure::terminal(error))
     }
+}
+
+/// Refuse a composed request body over the configured endpoint limit.
+///
+/// Takes the already-serialized length so the checked size is exactly the size
+/// uploaded — no second serialization pass over a multi-megabyte body.
+fn check_request_size(len: usize, limit: usize, provider: &str) -> Result<(), GenerateError> {
+    if len > limit {
+        return Err(GenerateError::RequestTooLargeError(format!(
+            "the {provider} request is {len} bytes; the configured limit is {limit} bytes \
+             (max_request_bytes). Images accumulate in the conversation; reduce \
+             attachments or compact the session before retrying. Raise the gateway's \
+             max_request_bytes only if it supports larger requests",
+        )));
+    }
+    Ok(())
+}
+
+/// Map a provider HTTP status to the right error variant: a size rejection is
+/// not a generic failure.
+///
+/// 413 is unambiguous. Everything else has to be read out of the body, because
+/// providers disagree on how they report an oversized request: some name a
+/// machine-readable type (`request_too_large`), others return a 400 whose body
+/// only describes the size in prose. Getting this wrong is expensive — the
+/// identical body is resent on every later turn, so a size failure classified
+/// as [`Recovery::Retry`] never triggers the rewind and the session fails
+/// forever.
+fn http_error(status: reqwest::StatusCode, message: String) -> GenerateError {
+    if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE || describes_a_size_rejection(&message) {
+        GenerateError::RequestTooLargeError(message)
+    } else {
+        GenerateError::ExecutionError(message)
+    }
+}
+
+/// Does this provider error body say the request was too big?
+///
+/// Matching prose is unavoidable, so it is kept to phrasings only a size
+/// rejection produces: "too large" however the provider spells it, or a size
+/// that "exceeds" a stated limit.
+fn describes_a_size_rejection(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("too_large")
+        || message.contains("too large")
+        || (message.contains("size") && message.contains("exceeds"))
+        || (message.contains("image dimensions")
+            && message.contains("exceed")
+            && message.contains("max allowed size"))
 }
 
 /// Statuses worth another attempt: the provider is rate-limiting, overloaded
@@ -305,5 +422,141 @@ impl SlotMap {
             .iter()
             .filter(|s| matches!(s, Some(Slot::ToolUse { .. })))
             .count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_sources_parse_as_urls_data_urls_or_raw_png() {
+        for (source, want) in [
+            (
+                "https://x.test/a.png",
+                ImageSource::Url("https://x.test/a.png"),
+            ),
+            (
+                "http://x.test/a.png",
+                ImageSource::Url("http://x.test/a.png"),
+            ),
+            (
+                "data:image/jpeg;base64,AA",
+                ImageSource::DataUrl {
+                    media_type: "image/jpeg",
+                    data: "AA",
+                },
+            ),
+            (
+                "data:;base64,AA",
+                ImageSource::DataUrl {
+                    media_type: "image/png",
+                    data: "AA",
+                },
+            ),
+            ("data:AA", ImageSource::RawBase64("data:AA")),
+            ("iVBOR", ImageSource::RawBase64("iVBOR")),
+        ] {
+            assert_eq!(ImageSource::parse(source), want, "{source}");
+        }
+    }
+
+    #[test]
+    fn image_checks_size_inline_payloads_and_refuse_local_references() {
+        let input = |source: &str| {
+            [Message::UserMessage {
+                content: vec![Content::Image {
+                    source: source.into(),
+                }],
+            }]
+        };
+        assert!(validate_image_sizes(&input("data:image/png;base64,AAAA"), 4).is_ok());
+        assert!(validate_image_sizes(&input("AAAA"), 4).is_ok());
+        assert!(validate_image_sizes(&input("https://x.test/a.png"), 4).is_ok());
+        for source in ["data:image/png;base64,AAAAA", "AAAAA"] {
+            assert!(matches!(
+                validate_image_sizes(&input(source), 4),
+                Err(GenerateError::RequestTooLargeError(_))
+            ));
+        }
+        assert!(matches!(
+            validate_image_sizes(&input("myco-image:sha256:abc"), 1024),
+            Err(GenerateError::ExecutionError(_))
+        ));
+    }
+
+    /// The preflight is the whole point of the rewind path: a request that is
+    /// too big must be refused *before* upload, and must say so in a way the
+    /// top level can act on.
+    #[test]
+    fn oversized_request_is_refused_before_upload() {
+        for limit in [1024, MAX_REQUEST_BYTES, 60_000_000] {
+            assert!(check_request_size(limit, limit, "Anthropic").is_ok());
+            let err = check_request_size(limit + 1, limit, "Anthropic").unwrap_err();
+            assert!(
+                matches!(err, GenerateError::RequestTooLargeError(_)),
+                "{err:?}"
+            );
+            assert_eq!(err.recovery(), Recovery::OmitLastMessage);
+            assert!(
+                err.to_string().contains(&format!("limit is {limit} bytes")),
+                "{err}"
+            );
+        }
+    }
+
+    /// A provider that rejects the size itself lands on the same variant, so
+    /// the caller rewinds whether the cap was caught locally or remotely.
+    #[test]
+    fn provider_size_rejections_map_to_the_same_recovery() {
+        let too_large = http_error(
+            reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+            "HTTP 413: too big".into(),
+        );
+        assert_eq!(too_large.recovery(), Recovery::OmitLastMessage);
+
+        // Anthropic reports it as a 400 whose body names the error type.
+        let named = http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"HTTP 400: {"error":{"type":"request_too_large"}}"#.into(),
+        );
+        assert_eq!(named.recovery(), Recovery::OmitLastMessage);
+
+        // Others name no type and only describe the size in prose. Read as a
+        // generic failure this is resent unchanged on every later turn.
+        let described = http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"HTTP 400: {"error":{"code":400,"message":"The message size (31271377 bytes) \
+               exceeds 30.000MB limit.","status":"FAILED_PRECONDITION"}}"#
+                .into(),
+        );
+        assert_eq!(described.recovery(), Recovery::OmitLastMessage);
+
+        let extent = http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.9.content.13.image.source.base64.data: At least one of the image dimensions exceed max allowed size for many-image requests: 2576 pixels"}}"#.into(),
+        );
+        assert_eq!(extent.recovery(), Recovery::OmitLastMessage);
+
+        let unrelated = http_error(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "HTTP 500: overloaded".into(),
+        );
+        assert_eq!(unrelated.recovery(), Recovery::Retry);
+    }
+
+    /// Reading the body is how a size rejection is recognized, so an ordinary
+    /// failure must not be mistaken for one: rewinding drops a user message,
+    /// which is destructive when the request was never too big.
+    #[test]
+    fn ordinary_failures_are_not_read_as_size_rejections() {
+        for body in [
+            r#"HTTP 400: {"error":{"message":"max_tokens exceeds the model's limit"}}"#,
+            r#"HTTP 400: {"error":{"message":"messages: unexpected role"}}"#,
+            r#"HTTP 401: {"error":{"message":"invalid x-api-key"}}"#,
+        ] {
+            let err = http_error(reqwest::StatusCode::BAD_REQUEST, body.into());
+            assert_eq!(err.recovery(), Recovery::Retry, "{body}");
+        }
     }
 }

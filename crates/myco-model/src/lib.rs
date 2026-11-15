@@ -619,29 +619,6 @@ pub fn check_image_size(encoded_bytes: u64, limit: u64) -> Result<(), GenerateEr
     Ok(())
 }
 
-/// Validate inline and legacy base64 images before constructing a provider body.
-/// Remote URLs carry no known payload size; the provider validates their content.
-/// Local references must be checked while resolving and never sent to a provider.
-pub fn validate_image_sizes(input: &[Message], limit: u64) -> Result<(), GenerateError> {
-    for part in input.iter().flat_map(Message::content) {
-        if let Content::Image { source } = part {
-            if source.starts_with("http://") || source.starts_with("https://") {
-                continue;
-            }
-            if source.starts_with("myco-image:") {
-                return Err(GenerateError::ExecutionError(
-                    "resolve local image references before calling a provider".into(),
-                ));
-            }
-            let payload = source
-                .split_once(',')
-                .map_or(source.as_str(), |(_, data)| data);
-            check_image_size(payload.len() as u64, limit)?;
-        }
-    }
-    Ok(())
-}
-
 /// Wire ids for every tool call in `input`: `out[i][j]` is the id a driver
 /// sends for the `j`-th tool_use of the assistant message at index `i`, and
 /// equally for the `j`-th result of the `ToolResults` message answering it.
@@ -663,14 +640,6 @@ pub fn validate_image_sizes(input: &[Message], limit: u64) -> Result<(), Generat
 /// request is sent: guessing the pairing would corrupt the conversation
 /// silently.
 pub(crate) fn wire_tool_ids(input: &[Message]) -> Result<Vec<Vec<String>>, GenerateError> {
-    if input.iter().flat_map(Message::content).any(|part| {
-        matches!(part,
-        Content::Image { source } if source.starts_with("myco-image:"))
-    }) {
-        return Err(GenerateError::ExecutionError(
-            "resolve local image references before calling a provider".into(),
-        ));
-    }
     let mut out: Vec<Vec<String>> = Vec::with_capacity(input.len());
     for (i, message) in input.iter().enumerate() {
         let ids = match message {
@@ -1219,26 +1188,6 @@ mod tests {
         assert!(err.to_string().contains("speaks openai-responses"), "{err}");
     }
 
-    /// The preflight is the whole point of the rewind path: a request that is
-    /// too big must be refused *before* upload, and must say so in a way the
-    /// top level can act on.
-    #[test]
-    fn oversized_request_is_refused_before_upload() {
-        for limit in [1024, MAX_REQUEST_BYTES, 60_000_000] {
-            assert!(check_request_size(limit, limit, "Anthropic").is_ok());
-            let err = check_request_size(limit + 1, limit, "Anthropic").unwrap_err();
-            assert!(
-                matches!(err, GenerateError::RequestTooLargeError(_)),
-                "{err:?}"
-            );
-            assert_eq!(err.recovery(), Recovery::OmitLastMessage);
-            assert!(
-                err.to_string().contains(&format!("limit is {limit} bytes")),
-                "{err}"
-            );
-        }
-    }
-
     #[test]
     fn older_backend_configs_default_to_a_thirty_megabyte_request_cap() {
         let mut anthropic = serde_json::to_value(AnthropicBackendConfig::default()).unwrap();
@@ -1259,61 +1208,6 @@ mod tests {
                 .max_request_bytes,
             30_000_000
         );
-    }
-
-    /// A provider that rejects the size itself lands on the same variant, so
-    /// the caller rewinds whether the cap was caught locally or remotely.
-    #[test]
-    fn provider_size_rejections_map_to_the_same_recovery() {
-        let too_large = http_error(
-            reqwest::StatusCode::PAYLOAD_TOO_LARGE,
-            "HTTP 413: too big".into(),
-        );
-        assert_eq!(too_large.recovery(), Recovery::OmitLastMessage);
-
-        // Anthropic reports it as a 400 whose body names the error type.
-        let named = http_error(
-            reqwest::StatusCode::BAD_REQUEST,
-            r#"HTTP 400: {"error":{"type":"request_too_large"}}"#.into(),
-        );
-        assert_eq!(named.recovery(), Recovery::OmitLastMessage);
-
-        // Others name no type and only describe the size in prose. Read as a
-        // generic failure this is resent unchanged on every later turn.
-        let described = http_error(
-            reqwest::StatusCode::BAD_REQUEST,
-            r#"HTTP 400: {"error":{"code":400,"message":"The message size (31271377 bytes) \
-               exceeds 30.000MB limit.","status":"FAILED_PRECONDITION"}}"#
-                .into(),
-        );
-        assert_eq!(described.recovery(), Recovery::OmitLastMessage);
-
-        let extent = http_error(
-            reqwest::StatusCode::BAD_REQUEST,
-            r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.9.content.13.image.source.base64.data: At least one of the image dimensions exceed max allowed size for many-image requests: 2576 pixels"}}"#.into(),
-        );
-        assert_eq!(extent.recovery(), Recovery::OmitLastMessage);
-
-        let unrelated = http_error(
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-            "HTTP 500: overloaded".into(),
-        );
-        assert_eq!(unrelated.recovery(), Recovery::Retry);
-    }
-
-    /// Reading the body is how a size rejection is recognized, so an ordinary
-    /// failure must not be mistaken for one: rewinding drops a user message,
-    /// which is destructive when the request was never too big.
-    #[test]
-    fn ordinary_failures_are_not_read_as_size_rejections() {
-        for body in [
-            r#"HTTP 400: {"error":{"message":"max_tokens exceeds the model's limit"}}"#,
-            r#"HTTP 400: {"error":{"message":"messages: unexpected role"}}"#,
-            r#"HTTP 401: {"error":{"message":"invalid x-api-key"}}"#,
-        ] {
-            let err = http_error(reqwest::StatusCode::BAD_REQUEST, body.into());
-            assert_eq!(err.recovery(), Recovery::Retry, "{body}");
-        }
     }
 
     #[test]
@@ -1419,57 +1313,4 @@ impl GenerateError {
             | GenerateError::MalformedResponseError(_) => Recovery::Retry,
         }
     }
-}
-
-/// Refuse a composed request body over the configured endpoint limit.
-///
-/// Takes the already-serialized length so the checked size is exactly the size
-/// uploaded — no second serialization pass over a multi-megabyte body.
-pub(crate) fn check_request_size(
-    len: usize,
-    limit: usize,
-    provider: &str,
-) -> Result<(), GenerateError> {
-    if len > limit {
-        return Err(GenerateError::RequestTooLargeError(format!(
-            "the {provider} request is {len} bytes; the configured limit is {limit} bytes \
-             (max_request_bytes). Images accumulate in the conversation; reduce \
-             attachments or compact the session before retrying. Raise the gateway's \
-             max_request_bytes only if it supports larger requests",
-        )));
-    }
-    Ok(())
-}
-
-/// Map a provider HTTP status to the right error variant: a size rejection is
-/// not a generic failure.
-///
-/// 413 is unambiguous. Everything else has to be read out of the body, because
-/// providers disagree on how they report an oversized request: some name a
-/// machine-readable type (`request_too_large`), others return a 400 whose body
-/// only describes the size in prose. Getting this wrong is expensive — the
-/// identical body is resent on every later turn, so a size failure classified
-/// as [`Recovery::Retry`] never triggers the rewind and the session fails
-/// forever.
-pub(crate) fn http_error(status: reqwest::StatusCode, message: String) -> GenerateError {
-    if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE || describes_a_size_rejection(&message) {
-        GenerateError::RequestTooLargeError(message)
-    } else {
-        GenerateError::ExecutionError(message)
-    }
-}
-
-/// Does this provider error body say the request was too big?
-///
-/// Matching prose is unavoidable, so it is kept to phrasings only a size
-/// rejection produces: "too large" however the provider spells it, or a size
-/// that "exceeds" a stated limit.
-fn describes_a_size_rejection(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    message.contains("too_large")
-        || message.contains("too large")
-        || (message.contains("size") && message.contains("exceeds"))
-        || (message.contains("image dimensions")
-            && message.contains("exceed")
-            && message.contains("max allowed size"))
 }

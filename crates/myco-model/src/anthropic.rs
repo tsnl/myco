@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use super::driver_core::{Slot, SlotMap, SseAccumulator};
+use super::driver_core::{ImageSource, Slot, SlotMap, SseAccumulator};
 use super::*;
 
 /// Anthropic Messages API settings ([`BackendConfig::Anthropic`]).
@@ -69,12 +69,10 @@ impl AnthropicGenerativeModel {
         // Bearer is the convention for gateway/OAuth tokens. Pick by token
         // shape so both work against the default base URL.
         let token = &backend.anthropic_auth_token;
-        let auth = if token.is_empty() {
-            None
-        } else if token.starts_with("sk-ant-") {
+        let auth = if token.starts_with("sk-ant-") {
             Some(("x-api-key", token.clone()))
         } else {
-            Some(("authorization", format!("Bearer {token}")))
+            driver_core::bearer(token)
         };
         let client = driver_core::build_client(auth, &[("anthropic-version", "2023-06-01")])?;
 
@@ -142,17 +140,11 @@ impl AnthropicGenerativeModel {
 
 impl GenerativeModel for AnthropicGenerativeModel {
     fn generate(&self, input: &[Message]) -> AsyncStream<GenerationEvent> {
-        if let Err(error) = validate_image_sizes(input, self.model.max_image_base64_bytes) {
-            return driver_core::error_stream(error);
-        }
-        let messages = match convert_messages(input) {
-            Ok(messages) => messages,
-            Err(e) => return driver_core::error_stream(e),
-        };
-        driver_core::spawn_generate(
-            self.message_request(&messages),
-            StreamAccumulator::default(),
+        driver_core::generate::<StreamAccumulator>(
             "Anthropic",
+            input,
+            self.model.max_image_base64_bytes,
+            |input| Ok(self.message_request(&convert_messages(input)?)),
             self.backend.debug_dump_api_requests,
             self.backend.max_request_bytes,
         )
@@ -705,28 +697,12 @@ enum AnthropicImageSource {
 }
 
 fn anthropic_image_source(source: String) -> AnthropicImageSource {
-    if source.starts_with("http://") || source.starts_with("https://") {
-        return AnthropicImageSource::Url { url: source };
-    }
-    if let Some(rest) = source.strip_prefix("data:") {
-        // data:[<media_type>][;base64],<data>
-        if let Some((meta, data)) = rest.split_once(',') {
-            let media_type = meta
-                .split(';')
-                .next()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("image/png")
-                .to_string();
-            return AnthropicImageSource::Base64 {
-                media_type,
-                data: data.to_string(),
-            };
-        }
-    }
-    AnthropicImageSource::Base64 {
-        media_type: "image/png".into(),
-        data: source,
-    }
+    let (media_type, data) = match ImageSource::parse(&source) {
+        ImageSource::Url(_) => return AnthropicImageSource::Url { url: source },
+        ImageSource::DataUrl { media_type, data } => (media_type.into(), data.into()),
+        ImageSource::RawBase64(_) => ("image/png".into(), source),
+    };
+    AnthropicImageSource::Base64 { media_type, data }
 }
 
 /// Wire block for one history content item. History thinking is never re-sent

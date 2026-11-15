@@ -29,9 +29,7 @@ impl OpenAIResponsesGenerativeModel {
         config: GenerativeModelConfig,
         backend: OpenAIBackendConfig,
     ) -> Result<Arc<Self>, ModelCreationError> {
-        let auth = (!backend.auth_token.is_empty())
-            .then(|| ("authorization", format!("Bearer {}", backend.auth_token)));
-        let client = driver_core::build_client(auth, &[])?;
+        let client = driver_core::build_client(driver_core::bearer(&backend.auth_token), &[])?;
 
         let tools = config
             .tools
@@ -87,17 +85,11 @@ impl OpenAIResponsesGenerativeModel {
 
 impl GenerativeModel for OpenAIResponsesGenerativeModel {
     fn generate(&self, input: &[Message]) -> AsyncStream<GenerationEvent> {
-        if let Err(error) = validate_image_sizes(input, self.model.max_image_base64_bytes) {
-            return driver_core::error_stream(error);
-        }
-        let input_items = match convert_messages(input) {
-            Ok(items) => items,
-            Err(e) => return driver_core::error_stream(e),
-        };
-        driver_core::spawn_generate(
-            self.response_request(&input_items),
-            StreamAccumulator::default(),
+        driver_core::generate::<StreamAccumulator>(
             "OpenAI Responses",
+            input,
+            self.model.max_image_base64_bytes,
+            |input| Ok(self.response_request(&convert_messages(input)?)),
             self.backend.debug_dump_api_requests,
             self.backend.max_request_bytes,
         )
