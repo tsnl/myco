@@ -11,9 +11,30 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::{
-    App, Block, Error, Result, SessionFacts, Snapshot, Status, Update, attachments, service, view,
+    App, Block, DownHost, Error, Result, SessionFacts, Snapshot, Status, Update, attachments,
+    service, view,
 };
 use crate::Boot;
+
+/// Largest rebuilt-history tail relayed to every browser instead of a refetch.
+const MAX_SPLICE_BYTES: usize = 64 * 1024;
+
+/// The changed tail of a rebuilt history on the same thread, with every
+/// non-block field, or `None` when browsers should refetch it.
+fn splice(previous: &[Block], snapshot: &mut Snapshot) -> Option<Value> {
+    let visible = |block: &Block| serde_json::to_value(block).ok();
+    let start = previous
+        .iter()
+        .zip(&snapshot.blocks)
+        .take_while(|(old, new)| visible(old) == visible(new))
+        .count();
+    let tail = serde_json::to_value(&snapshot.blocks[start..]).ok()?;
+    let blocks = std::mem::take(&mut snapshot.blocks);
+    let head = serde_json::to_value(&*snapshot);
+    snapshot.blocks = blocks;
+    let splice = json!({"start": start, "blocks": tail, "snapshot": head.ok()?});
+    (serde_json::to_vec(&splice).ok()?.len() <= MAX_SPLICE_BYTES).then_some(splice)
+}
 
 impl App {
     pub(crate) fn background(&self, session_id: &str, call_id: Uuid) -> Result<()> {
@@ -63,6 +84,17 @@ impl App {
     pub(super) fn push_block(&self, snapshot: &mut Snapshot, block: Block) {
         snapshot.blocks.push(block);
         self.publish_block(snapshot, snapshot.blocks.len() - 1);
+    }
+
+    /// Publish a rebuilt history. Browsers apply a bounded splice of the same
+    /// thread in place; anything else invalidates their copy.
+    fn publish_history(&self, snapshot: &mut Snapshot, previous: Option<&[Block]>) {
+        let splice = previous.and_then(|previous| splice(previous, snapshot));
+        let mut change = json!({"kind":"snapshot", "snapshot":snapshot});
+        if let Some(splice) = splice {
+            change["splice"] = splice;
+        }
+        self.publish(snapshot, change);
     }
 
     pub(super) fn publish_metadata(&self, snapshot: &mut Snapshot) {
@@ -142,7 +174,7 @@ impl App {
         // A finished generation may still need its checkpoint repaired. Its
         // validated service output must survive until GenerationCommitted.
         live.service.reset_draft();
-        let previous_len = live.snapshot.blocks.len();
+        let previous = live.snapshot.blocks.clone();
         let mut index = 0;
         let retry_notice = live.retry_notice;
         let mut removed_before_notice = 0;
@@ -157,11 +189,10 @@ impl App {
             keep
         });
         live.retry_notice = retry_notice.map(|index| index - removed_before_notice);
-        if live.snapshot.blocks.len() == previous_len {
+        if live.snapshot.blocks.len() == previous.len() {
             return;
         }
-        let change = json!({"kind":"snapshot", "snapshot":live.snapshot});
-        self.publish(&mut live.snapshot, change);
+        self.publish_history(&mut live.snapshot, Some(&previous));
     }
 
     pub(super) fn sync_with(
@@ -178,11 +209,14 @@ impl App {
         live.generation_start = None;
         live.retry_notice = None;
         let snapshot = &mut live.snapshot;
+        let same_thread = snapshot.meta.session_id == session.id
+            && snapshot.meta.thread_id == session.active_thread().id;
         let mut blocks = view::history(session.active_thread());
         if snapshot.meta.thread_id == session.active_thread().id {
             view::retain_tool_timers(&mut blocks, &snapshot.blocks);
         }
         view::retain_processes(&mut blocks, &snapshot.blocks);
+        let previous = same_thread.then(|| std::mem::take(&mut snapshot.blocks));
         snapshot.meta.session_id = session.id.clone();
         snapshot.meta.thread_id = session.active_thread().id.clone();
         snapshot.earlier_threads = view::earlier_threads(&session);
@@ -198,8 +232,7 @@ impl App {
                 text: error.to_string(),
             });
         }
-        let change = json!({"kind":"snapshot", "snapshot":live.snapshot});
-        self.publish(&mut live.snapshot, change);
+        self.publish_history(&mut live.snapshot, previous.as_deref());
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -216,6 +249,25 @@ impl App {
         self.publish_metadata(&mut live.snapshot);
         if listing_changed {
             self.generation.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn hosts(&self, status: Vec<myco::HostStatus>) {
+        let down: Vec<_> = status
+            .into_iter()
+            .filter_map(|host| {
+                let failure = host.failure?;
+                Some(DownHost {
+                    name: host.name,
+                    since: failure.at,
+                    error: failure.message,
+                })
+            })
+            .collect();
+        let mut live = self.live.lock().unwrap();
+        if live.snapshot.meta.down_hosts != down {
+            live.snapshot.meta.down_hosts = down;
+            self.publish_metadata(&mut live.snapshot);
         }
     }
 

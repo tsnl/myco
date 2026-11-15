@@ -21,12 +21,14 @@ pub(super) async fn worker(
     args: Arc<Args>,
 ) {
     let runtime = boot.runner.runtime().clone();
+    let harness = boot.harness.clone();
     let resources = async {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
             app.refresh_metadata(runtime.session());
+            app.hosts(harness.host_status());
             app.resources(runtime.resources().await);
         }
     };

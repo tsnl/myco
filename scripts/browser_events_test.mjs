@@ -33,6 +33,8 @@ function fixture() {
   const send = event => stream.onmessage({ data: JSON.stringify(event) });
   return {
     requests, send,
+    drop() { stream.readyState = 0; stream.onerror(); },
+    reopen() { stream.readyState = EventSource.OPEN; stream.onopen(); },
     update(profile, session_id, revision, kind = 'append') {
       send({ kind: kind === 'refresh' ? 'resync' : 'update', profile,
         update: { session_id, revision, change: { kind, text: `delta ${revision}` } } });
@@ -71,7 +73,7 @@ test('bursts across 26 sessions coalesce catalog notifications and stop after un
   assert.equal(changed(), 2);
 });
 
-test('hidden sessions skip deltas and resyncs, then resume from one current snapshot', async () => {
+test('a refresh while hidden discards buffered deltas and resumes from one current snapshot', async () => {
   const f = fixture(), hidden = f.subscribe('work', 'hidden'), visible = f.subscribe('work', 'visible');
   f.requests[0].respond(snapshot('hidden', 1));
   f.requests[1].respond(snapshot('visible', 1));
@@ -91,6 +93,88 @@ test('hidden sessions skip deltas and resyncs, then resume from one current snap
   await settle();
   assert.deepEqual(hidden.messages.filter(message => message.update).map(message => message.update.revision), [1001, 1002]);
   assert.equal(hidden.messages.at(-1).connected, true);
+});
+
+test('a hidden current session resumes from its own deltas without a snapshot', async () => {
+  const f = fixture(), hidden = f.subscribe('work', 'hidden'), visible = f.subscribe('work', 'visible');
+  f.requests[0].respond(snapshot('hidden', 1));
+  f.requests[1].respond(snapshot('visible', 1));
+  await settle();
+  hidden.messages.length = 0;
+  hidden.send({ kind: 'visibility', visible: false });
+  for (let revision = 2; revision < 900; revision++) f.update('work', 'hidden', revision);
+  f.update('work', 'hidden', 900, 'meta');
+  f.update('work', 'hidden', 901);
+  f.update('work', 'visible', 2);
+  assert.equal(hidden.messages.length, 0);
+  hidden.send({ kind: 'visibility', visible: true });
+  assert.equal(f.requests.length, 2);
+  const updates = hidden.messages.map(message => message.update);
+  assert.deepEqual(updates.map(update => [update.revision, update.change.kind]), [[899, 'append'], [900, 'meta'], [901, 'append']]);
+  assert.equal(updates[0].change.text, Array.from({ length: 898 }, (_, index) => `delta ${index + 2}`).join(''));
+  assert.equal(hidden.messages.filter(message => message.kind === 'connection').length, 0);
+  f.update('work', 'hidden', 902);
+  assert.equal(hidden.messages.at(-1).update.revision, 902);
+});
+
+test('a refresh that carries its splice is applied in place, live, hidden, and during a fetch', async () => {
+  const f = fixture(), live = f.subscribe('work', 'live'), hidden = f.subscribe('work', 'hidden');
+  const splice = (session_id, revision) => f.send({ kind: 'resync', profile: 'work', update: {
+    session_id, revision, change: { kind: 'refresh', splice: { start: 1, blocks: [], snapshot: {} } } } });
+  f.requests[0].respond(snapshot('live', 1));
+  f.requests[1].respond(snapshot('hidden', 1));
+  await settle();
+  hidden.send({ kind: 'visibility', visible: false });
+  splice('live', 2);
+  splice('hidden', 2);
+  assert.equal(live.messages.at(-1).update.change.kind, 'refresh');
+  hidden.send({ kind: 'visibility', visible: true });
+  assert.equal(hidden.messages.at(-1).update.revision, 2);
+  live.send({ kind: 'visibility', visible: false });
+  live.send({ kind: 'visibility', visible: true });
+  f.update('work', 'live', 3, 'refresh');
+  assert.equal(f.requests.length, 3, 'a bare refresh still refetches');
+  splice('live', 4);
+  f.requests[2].respond(snapshot('live', 3));
+  await settle();
+  assert.equal(f.requests.length, 3, 'a buffered splice applies after the snapshot');
+  assert.deepEqual(live.messages.filter(message => message.update).map(message => message.update.revision), [1, 2, 3, 4]);
+});
+
+test('a lost stream, resync, or profile reconnect while hidden resumes from one snapshot', async () => {
+  for (const interrupt of [
+    f => { f.drop(); f.reopen(); },
+    f => f.send({ kind: 'resync', profile: 'work' }),
+    f => f.send({ kind: 'resync' }),
+    f => { f.send({ kind: 'connection', profile: 'work', connected: false }); f.send({ kind: 'connection', profile: 'work', connected: true }); },
+  ]) {
+    const f = fixture(), port = f.subscribe('work', 'session');
+    f.requests[0].respond(snapshot('session', 1));
+    await settle();
+    port.send({ kind: 'visibility', visible: false });
+    f.update('work', 'session', 2);
+    interrupt(f);
+    f.update('work', 'session', 3);
+    port.send({ kind: 'visibility', visible: true });
+    assert.equal(f.requests.length, 2);
+    f.requests[1].respond(snapshot('session', 3));
+    await settle();
+    assert.deepEqual(port.messages.filter(message => message.update).map(message => message.update.revision), [1, 3]);
+    assert.equal(port.messages.at(-1).connected, true);
+  }
+});
+
+test('an absence longer than the delta buffer resumes from one snapshot', async () => {
+  const f = fixture(), port = f.subscribe('work', 'session');
+  f.requests[0].respond(snapshot('session', 1));
+  await settle();
+  port.send({ kind: 'visibility', visible: false });
+  for (let revision = 2; revision < 1100; revision++) f.update('work', 'session', revision, 'meta');
+  port.send({ kind: 'visibility', visible: true });
+  assert.equal(f.requests.length, 2);
+  f.requests[1].respond(snapshot('session', 1099));
+  await settle();
+  assert.deepEqual(port.messages.filter(message => message.update).map(message => message.update.revision), [1, 1099]);
 });
 
 test('hiding during a fetch discards its result and cannot restart background recovery', async () => {

@@ -140,6 +140,10 @@ fn trim_message(message: &mut Message, tool_body_max: usize) {
     match message {
         Message::ToolResults { tool_use_results } => {
             for result in tool_use_results {
+                // A successor thread's hosts report skills again where it works.
+                result.content.retain(|part| {
+                    !matches!(part, Content::System { kind, .. } if kind == "host_observation")
+                });
                 truncate_text(&mut result.content, tool_body_max);
             }
         }
@@ -217,6 +221,36 @@ mod tests {
         let tail = select_tail(&messages, 2, 1000);
         assert_eq!(tail, messages[2..]);
         crate::agent::validate_context(&tail).unwrap();
+    }
+
+    #[test]
+    fn host_observations_are_left_for_the_successor_threads_hosts_to_report() {
+        let mut results = tool_results(&["done"]);
+        let Message::ToolResults { tool_use_results } = &mut results else {
+            unreachable!()
+        };
+        tool_use_results[0].content.push(Content::System {
+            kind: "host_observation".into(),
+            text: "[myco: host \"local\"] Skill catalog changes".repeat(200),
+            data: json!({"host": "local"}),
+        });
+        let messages = vec![
+            user("request"),
+            assistant_tool(None, "bash", json!({"command": "true"})),
+            results,
+            assistant("answer"),
+        ];
+        let tail = select_tail(&messages, 2, 1000);
+        assert_eq!(tail.len(), 4);
+        let Message::ToolResults { tool_use_results } = &tail[2] else {
+            panic!("{tail:?}")
+        };
+        assert_eq!(
+            tool_use_results[0].content,
+            vec![Content::Text {
+                text: "done".into()
+            }]
+        );
     }
 
     #[test]

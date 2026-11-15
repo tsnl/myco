@@ -48,7 +48,8 @@ without loading their bytes; unavailable or unknown-size images omit that turn.
 A turn that exceeds either bound is represented by the summary, with its original
 history still available through `session_history`. The summary and latest runtime
 inventory are separate from this tail budget. These bounds limit retained history;
-the selected model's context and request-size limits still apply.
+the selected model's context and request-size limits still apply. Retained tool
+results drop their skill notices; hosts report skills again to the new thread.
 
 Live bash shells and editor read stamps belong to the **session runtime**, shared across
 threads and any replacement agent using that runtime. Compaction does not reset them.
@@ -549,13 +550,16 @@ or discover plugin bundles. Duplicate names remain separate entries identified
 by their paths.
 
 Successful editor and image calls scan the operated file's directory, or the
-operated directory itself. Successful bash calls scan the host worker's launch
-directory. A notice attached to the tool result, tagged with its host and
+operated directory itself. A successful bash call on a retained session (start,
+write, read, signal) scans that session process's current directory on Linux and
+macOS, so a `cd` written to a live shell is followed. Other bash calls, and other
+platforms, scan the host worker's launch directory. A notice attached to the tool result, tagged with its host and
 directory, lists only what the thread has not been told: new or changed skills,
 listed skills no longer found in a layout the scan checked, and new discovery
 warnings. A skill already listed is not repeated when another directory sees it,
 and on the local host the startup catalog in the model's prompt counts as listed.
-Notices are model context; browser and terminal transcripts do not display them.
+Notices are model context; transcripts do not display them, though the browser
+labels the tool card with the skill names, such as `Skills: +review`.
 Observations are scoped to the session runtime and thread: a new thread receives
 skills again when it next operates where they are visible. Discovery has bounded
 directory, metadata, and notice limits. A partial catalog reports omissions or
@@ -569,9 +573,9 @@ result is an ordinary, visible tool result:
 ```
 
 Omitting `host` selects `local`; omitting `path` selects that host worker's launch
-directory. Relative paths use that launch directory. Shell-internal `cd` commands
-and retained shell working directories are not inferred. After changing a shell's
-directory, pass its new path explicitly. Remote discovery and subsequent editor
+directory. Relative paths use that launch directory. A `cd` inside an `exec`
+command ends with that call and is not inferred, since commands are not parsed;
+pass the directory explicitly after working there. Remote discovery and subsequent editor
 reads happen on the selected host; the startup catalog does not connect remotes.
 
 Frontmatter supports plain, quoted, literal (`|`), and folded (`>`) scalar values

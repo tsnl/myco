@@ -81,7 +81,7 @@ class Provider(http.server.BaseHTTPRequestHandler):
             if not isinstance(content, str):
                 content = " ".join(part.get("text", "") for part in content)
             resuming |= '# Resumption\n\n' in content
-            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links|profile|getlink|view image|timer|autonomy|event|thinking)\b", content)
+            match = re.search(r"(Alpha|Beta) (shell|read marker|wait|stream|markdown|rename|parallel|generate|fail|images|links|profile|getlink|view image|timer|autonomy|event|thinking|skills)\b", content)
             if match:
                 prompts.append(match.group(0))
         prompt = prompts[-1] if prompts else 'Alpha images'
@@ -139,6 +139,10 @@ class Provider(http.server.BaseHTTPRequestHandler):
             events = tool({"path": fixture.static_path}, "getlink")
         elif "view image" in prompt:
             events = tool({"path": str(fixture.workspace / 'pixel.png')}, "view_image")
+        elif "skills" in prompt:
+            skill = "---\\nname: review\\ndescription: Review changes\\n---\\nBody\\n"
+            events = tool({"command": f"mkdir -p .agents/skills/review && printf -- '{skill}' > .agents/skills/review/SKILL.md",
+                           "timeout_ms": 1000})
         elif "rename" in prompt:
             events = tool({"action": "set_title", "title": f"Renamed {name}"}, "session_meta")
         elif "parallel" in prompt:
@@ -1477,6 +1481,20 @@ context_window = 100000
             page.clock.set_fixed_time('2026-11-01T09:02:00Z')
             expect(timestamps.nth(1)).to_have_text(fall + ' (4 minutes ago)')
             context.close()
+
+    def test_tool_cards_label_newly_reported_skills_without_showing_the_notice(self):
+        page = self.session(self.page)
+        self.submit(page, 'Alpha skills')
+        expect(page.locator('.assistant .body').last).to_have_text('Alpha finished.')
+        outputs = [item['output'] for item in self.requests[-1]['input'] if item.get('type') == 'function_call_output']
+        self.assertIn('Skill catalog changes', outputs[-1])
+        for reload in [False, True]:
+            if reload:
+                page.reload()
+            expect(page.locator('.tool .tool-skills')).to_have_text('Skills: +review')
+            page.locator('.tool summary').click()
+            expect(page.locator('.tool .output')).to_contain_text('Exit code')
+            expect(page.locator('.tool .output')).not_to_contain_text('Skill catalog')
 
     def test_urls_are_clickable_in_messages_and_tool_output_after_reload(self):
         page = self.session(self.page)
@@ -3845,7 +3863,7 @@ context_window = 100000
             self.assertIn('<h1>Review</h1>', assistant['html'])
             self.assertNotIn('html', user)
 
-    def test_streaming_coalesces_renders_and_late_html_cannot_overwrite_a_snapshot(self):
+    def test_streaming_coalesces_renders_and_the_settled_turn_keeps_the_streamed_block(self):
         page = self.session(self.page)
         expect(page.locator(".notice")).to_contain_text("prelude directory unreadable")
         held = []
@@ -3855,14 +3873,22 @@ context_window = 100000
         expect(page.locator("#model")).to_be_enabled()
         page.wait_for_timeout(200)
         self.assertEqual(len(held), 1, "Only one render of the streaming block may be in flight")
-        expect(page.locator(".markdown p").last).to_have_text("Chunk 29.")
         first = held.pop()
         first.fulfill(response=first.fetch())
-        page.wait_for_timeout(150)
+        # The settled turn keeps the streamed block instead of refetching the
+        # transcript, so one more render covers the text that arrived meanwhile.
+        for _ in range(40):
+            if held:
+                break
+            page.wait_for_timeout(50)
+        self.assertEqual(len(held), 1, "One render covers the rest of the streamed text")
+        last = held.pop()
+        last.fulfill(response=last.fetch())
         expect(page.locator(".markdown p").last).to_have_text("Chunk 29.")
-        self.assertEqual(held, [], 'The snapshot already supplied the latest rendered output')
+        page.wait_for_timeout(150)
+        self.assertEqual(held, [], 'The final text needs no further render')
 
-    def test_hidden_tabs_defer_stream_rendering_and_catch_up_without_losing_drafts(self):
+    def test_hidden_tabs_defer_stream_rendering_and_catch_up_without_reconnecting_or_losing_drafts(self):
         self.stream_chunks = 100
         self.event_gates = {1: threading.Event()}
         self.addCleanup(self.event_gates[1].set)
@@ -3882,12 +3908,20 @@ context_window = 100000
         expect(observer.locator('#model')).to_be_enabled()
         expect(page.locator('.markdown p')).to_have_text('Chunk 0.')
         self.assertEqual(renders, [], 'Hidden tabs must not format streamed output')
+        page.evaluate("""() => {
+            window.connectionStates = [];
+            const node = document.querySelector('#connection');
+            new MutationObserver(() => window.connectionStates.push(node.textContent))
+                .observe(node, {childList: true, characterData: true, subtree: true});
+        }""")
         page.evaluate("Object.defineProperty(document, 'hidden', {configurable: true, value: false}); document.dispatchEvent(new Event('visibilitychange'))")
         expect(page.locator('.markdown p').last).to_have_text('Chunk 99.')
         expect(page.locator('.markdown p')).to_have_count(100)
         expect(page.locator('#model')).to_be_enabled()
         expect(page.locator('#prompt')).to_have_value('Keep this unsent draft.')
-        self.assertEqual(renders, [], 'Returning to the tab uses the rendered snapshot')
+        self.assertEqual(len(renders), 1, 'Returning formats only the message that streamed while hidden')
+        self.assertNotIn('Reconnecting…', page.evaluate('window.connectionStates'),
+                         'Returning applies buffered changes without refetching the session')
 
     def test_26_concurrent_sessions_do_not_replay_unobserved_histories(self):
         # Keep large-history transport independent of automatic compaction.

@@ -72,11 +72,24 @@ pub struct HostController {
 // Connection ownership and observations
 //
 
-#[derive(Clone)]
-struct HostFailure {
-    at: chrono::DateTime<chrono::Utc>,
+/// A remote host's last transport failure; cleared after a successful connect.
+/// Displays with its age, which only live status shows.
+#[derive(Clone, Debug)]
+pub struct HostFailure {
+    pub at: chrono::DateTime<chrono::Utc>,
     since: Instant,
-    message: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for HostFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}s ago: {}",
+            self.since.elapsed().as_secs(),
+            self.message
+        )
+    }
 }
 
 impl HostFailure {
@@ -293,19 +306,9 @@ impl HostController {
         }
     }
 
-    /// Last transport failure and age, if any (cleared after a successful connect).
+    /// Last transport failure, if any (cleared after a successful connect).
     /// Always `None` for in-process hosts.
-    pub fn last_error(&self) -> Option<String> {
-        self.last_failure().map(|failure| {
-            format!(
-                "{}s ago: {}",
-                failure.since.elapsed().as_secs(),
-                failure.message
-            )
-        })
-    }
-
-    fn last_failure(&self) -> Option<HostFailure> {
+    pub fn last_failure(&self) -> Option<HostFailure> {
         match &self.backend {
             Backend::InProcess { .. } => None,
             Backend::Subprocess { last_error, .. } => last_error.lock().unwrap().clone(),

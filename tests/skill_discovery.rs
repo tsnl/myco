@@ -455,3 +455,48 @@ async fn bash_uses_launch_scope_while_successful_images_discover_their_operated_
     assert!(host.view(owner, "thread", "work/file.txt").await.is_empty());
     host.finish().await;
 }
+
+#[tokio::test]
+async fn a_live_shell_session_discovers_skills_where_it_changed_directory() {
+    let fixture = Fixture::new();
+    let mut host = Host::start(&fixture).await;
+    let owner = uuid::Uuid::new_v4();
+    let shell = |input: Value| {
+        let mut input = input;
+        input["session_id"] = "shell".into();
+        input
+    };
+    let start = host
+        .call(
+            owner,
+            "thread",
+            "bash",
+            shell(json!({"action":"start", "command":"bash"})),
+        )
+        .await;
+    assert!(!start.is_error, "{start:?}");
+    let launch = notice(&start);
+    assert!(
+        launch.contains("launch metadata") && !launch.contains("project metadata"),
+        "{launch}"
+    );
+    let moved = host
+        .call(
+            owner,
+            "thread",
+            "bash",
+            shell(json!({"action":"write", "stdin":"cd work && echo moved\n"})),
+        )
+        .await;
+    assert!(text(&moved).contains("moved"), "{moved:?}");
+    let moved = notice(&moved);
+    assert!(
+        moved.contains("project metadata") && !moved.contains("launch metadata"),
+        "{moved}"
+    );
+    let close = host
+        .call(owner, "thread", "bash", shell(json!({"action":"close"})))
+        .await;
+    assert!(!close.is_error, "{close:?}");
+    host.finish().await;
+}

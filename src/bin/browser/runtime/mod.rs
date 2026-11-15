@@ -136,6 +136,16 @@ struct Metadata {
     queued: VecDeque<QueuedMessage>,
     timers: Vec<timers::Timer>,
     inbox: Vec<InboxEntry>,
+    down_hosts: Vec<DownHost>,
+}
+
+/// A remote host whose last connection attempt or connection failed. Its
+/// next tool call retries; idle hosts are not down.
+#[derive(Clone, PartialEq, Serialize)]
+struct DownHost {
+    name: String,
+    since: DateTime<Utc>,
+    error: String,
 }
 
 fn serialize_busy<S: serde::Serializer>(
@@ -185,15 +195,20 @@ pub(super) struct Update {
 
 impl Update {
     // The browser fetches histories only for subscribed sessions. Relaying full
-    // snapshots of every running session can make lag recovery itself lag.
+    // snapshots of every running session can make lag recovery itself lag. A
+    // bounded splice rides along; tabs that cannot apply it refetch as before.
     pub(super) fn live_update(&self) -> Cow<'_, Self> {
         if self.change["kind"] != "snapshot" {
             return Cow::Borrowed(self);
         }
+        let mut change = json!({"kind":"refresh"});
+        if let Some(splice) = self.change.get("splice") {
+            change["splice"] = splice.clone();
+        }
         Cow::Owned(Self {
             session_id: self.session_id.clone(),
             revision: self.revision,
-            change: json!({"kind":"refresh"}),
+            change,
         })
     }
 }

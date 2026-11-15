@@ -41,7 +41,8 @@ pub use chat::{Compactor, ModelCompactor, SessionRunner, WorkflowEvent};
 pub use config::{Config, ConfigUserSettings};
 pub use core::{CancelToken, HostResources, ModelInfo, ToolResource, uuid_simple_hex};
 pub use harness::{
-    Harness, HarnessConfig, HostConfig, HostController, StartupPreflight, load_ssh_host_aliases,
+    Harness, HarnessConfig, HostConfig, HostController, HostFailure, HostStatus, StartupPreflight,
+    load_ssh_host_aliases,
 };
 pub use host::HostWorker;
 pub use manual::Article as ManualArticle;

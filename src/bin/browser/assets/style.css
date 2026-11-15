@@ -81,6 +81,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .session-state { display: flex; flex: none; align-items: center; gap: 8px; }
 #auto-continue-status { color: var(--cyan); }
 .archive-indicator { display: inline-block; padding: 0 6px; border: 1px solid var(--glass-border); color: var(--dim); font-size: 12px; white-space: nowrap; }
+.hosts-down { display: inline-block; padding: 0 6px; border: 1px solid var(--amber); color: var(--amber); font-size: 12px; white-space: nowrap; }
 .activity-indicator { display: inline-flex; align-items: center; gap: 8px; color: var(--dim); white-space: nowrap; }
 .activity-indicator::before { content: ''; flex: none; width: 7px; height: 7px; background: currentColor; }
 .activity-indicator[data-state="ready"] { color: var(--green); }
@@ -169,6 +170,7 @@ html.viewing-image { overflow: hidden; }
 .tool-name { font-weight: 700; }
 .tool-status { margin-left: 12px; }
 .tool-duration { margin-left: 12px; color: var(--dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tool-skills { margin-left: 12px; color: var(--dim); overflow-wrap: anywhere; }
 .background-tool { padding: 4px 9px; margin: 8px 0 0; min-height: 32px; font-size: 12px; color: var(--cyan); border-color: var(--line); background: var(--glass-control); }
 .tool-args { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; margin-top: 4px; color: var(--dim); }
 .tool-content { padding: 0 15px 10px; border-top: 1px solid var(--line); }

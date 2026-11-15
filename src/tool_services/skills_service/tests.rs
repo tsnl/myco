@@ -98,33 +98,43 @@ async fn notices_follow_metadata_changes_and_removal_without_repeating() {
     let call = view(temp.path());
     let first = service
         .clone()
-        .observe_successful_call(call.clone(), ctx.clone())
+        .observe_successful_call(call.clone(), None, ctx.clone())
         .await
         .unwrap();
-    assert!(first.contains("first description"), "{first}");
-    assert!(!first.contains("PRIVATE_INSTRUCTIONS"));
+    assert!(first.text.contains("first description"), "{first:?}");
+    assert!(!first.text.contains("PRIVATE_INSTRUCTIONS"));
+    let summary = |listed: &[&str], removed: &[&str], warnings: usize| json!({"skills": {"listed": listed, "removed": removed, "warnings": warnings}});
+    assert_eq!(first.data, summary(&["project"], &[], 0));
     assert!(
         service
             .clone()
-            .observe_successful_call(call.clone(), ctx.clone())
+            .observe_successful_call(call.clone(), None, ctx.clone())
             .await
             .is_none()
     );
     skill(temp.path(), "second description");
     let changed = service
         .clone()
-        .observe_successful_call(call.clone(), ctx.clone())
+        .observe_successful_call(call.clone(), None, ctx.clone())
         .await
         .unwrap();
-    assert!(changed.contains("second description"), "{changed}");
+    assert!(changed.text.contains("second description"), "{changed:?}");
+    assert_eq!(changed.data, summary(&["project"], &[], 0));
     std::fs::remove_file(path).unwrap();
     let removed = service
         .clone()
-        .observe_successful_call(call.clone(), ctx.clone())
+        .observe_successful_call(call.clone(), None, ctx.clone())
         .await
         .unwrap();
-    assert!(!removed.contains("second description"), "{removed}");
-    assert!(service.observe_successful_call(call, ctx).await.is_none());
+    assert!(!removed.text.contains("second description"), "{removed:?}");
+    // The skill directory remains without a manifest, which is also a warning.
+    assert_eq!(removed.data, summary(&[], &["project"], 1));
+    assert!(
+        service
+            .observe_successful_call(call, None, ctx)
+            .await
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -138,14 +148,14 @@ async fn new_owner_and_new_thread_receive_the_catalog_and_cleanup_releases_cache
     assert!(
         service
             .clone()
-            .observe_successful_call(call.clone(), ctx.clone())
+            .observe_successful_call(call.clone(), None, ctx.clone())
             .await
             .is_some()
     );
     assert!(
         service
             .clone()
-            .observe_successful_call(call.clone(), ctx.clone())
+            .observe_successful_call(call.clone(), None, ctx.clone())
             .await
             .is_none()
     );
@@ -153,21 +163,26 @@ async fn new_owner_and_new_thread_receive_the_catalog_and_cleanup_releases_cache
     assert!(
         service
             .clone()
-            .observe_successful_call(call.clone(), ctx.clone())
+            .observe_successful_call(call.clone(), None, ctx.clone())
             .await
             .is_some()
     );
     assert!(
         service
             .clone()
-            .observe_successful_call(call.clone(), context())
+            .observe_successful_call(call.clone(), None, context())
             .await
             .is_some()
     );
     assert!(service.resources(ctx.agent_id).is_empty());
     service.on_agent_finished(ctx.agent_id);
     assert!(!service.owners.lock().unwrap().contains_key(&ctx.agent_id));
-    assert!(service.observe_successful_call(call, ctx).await.is_some());
+    assert!(
+        service
+            .observe_successful_call(call, None, ctx)
+            .await
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -222,7 +237,7 @@ async fn explicit_scans_resolve_on_the_host_and_shell_text_is_not_parsed() {
     assert!(
         service
             .clone()
-            .observe_successful_call(bash, ctx.clone())
+            .observe_successful_call(bash, None, ctx.clone())
             .await
             .is_none()
     );
@@ -258,7 +273,7 @@ async fn concurrent_calls_dedupe_and_cancelled_scans_do_not_consume_notices() {
     assert!(
         service
             .clone()
-            .observe_successful_call(call.clone(), ctx.clone())
+            .observe_successful_call(call.clone(), None, ctx.clone())
             .await
             .is_none()
     );
@@ -267,8 +282,8 @@ async fn concurrent_calls_dedupe_and_cancelled_scans_do_not_consume_notices() {
     let (first, second) = tokio::join!(
         service
             .clone()
-            .observe_successful_call(call.clone(), ctx.clone()),
-        service.clone().observe_successful_call(call, ctx),
+            .observe_successful_call(call.clone(), None, ctx.clone()),
+        service.clone().observe_successful_call(call, None, ctx),
     );
     assert_ne!(first.is_some(), second.is_some());
 }
@@ -290,15 +305,21 @@ async fn a_thread_starts_from_the_skills_its_prompt_lists() {
     let observe = |ctx: &HostDispatchContext| {
         service
             .clone()
-            .observe_successful_call(bash.clone(), ctx.clone())
+            .observe_successful_call(bash.clone(), None, ctx.clone())
     };
     assert_eq!(observe(&ctx).await, None, "repeated the prompt's catalog");
     skill(temp.path(), "changed after startup");
     let changed = observe(&ctx).await.unwrap();
-    assert!(changed.contains("changed after startup"), "{changed}");
+    assert!(
+        changed.text.contains("changed after startup"),
+        "{changed:?}"
+    );
     assert_eq!(observe(&ctx).await, None);
     // A rebuilt model's prompt replaces the old one, even within a thread.
     ctx.prompt_skills = Some(Arc::new(Reported::default()));
     let rebuilt = observe(&ctx).await.unwrap();
-    assert!(rebuilt.contains("changed after startup"), "{rebuilt}");
+    assert!(
+        rebuilt.text.contains("changed after startup"),
+        "{rebuilt:?}"
+    );
 }

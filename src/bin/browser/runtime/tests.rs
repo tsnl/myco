@@ -52,6 +52,7 @@ fn snapshot_and_meta_updates_carry_the_keys_the_browser_reads() {
         "auto_continue",
         "busy",
         "context_window_tokens",
+        "down_hosts",
         "inbox",
         "model",
         "queued",
@@ -1533,6 +1534,60 @@ fn markdown_text_parts_join_without_crossing_images_thinking_or_message_boundari
 }
 
 #[test]
+fn tool_blocks_summarize_reported_skills_without_showing_the_notice() {
+    let observation = |data: Value| Content::System {
+        kind: "host_observation".into(),
+        text: "[myco: host \"local\"] Skill catalog changes for \"/repo\"".into(),
+        data,
+    };
+    let mut reported = ToolResult::text("actual output");
+    reported
+        .content
+        .push(observation(json!({"host": "local", "skills": {
+            "listed": ["a", "b", "c", "d"], "removed": ["old"], "warnings": 2,
+        }})));
+    // Notices saved before summaries carry only the host.
+    let mut unsummarized = ToolResult::text("earlier output");
+    unsummarized
+        .content
+        .push(observation(json!({"host": "local"})));
+    let bash = ToolUse {
+        name: "bash".into(),
+        input: json!({"command":"pwd"}),
+        thought_signature: None,
+    };
+    let mut session = Session::new("test");
+    session.replace_context(
+        vec![
+            Message::UserMessage {
+                content: vec![Content::Text { text: "go".into() }],
+            },
+            Message::AssistantMessage {
+                content: vec![],
+                tool_uses: vec![bash.clone(), bash],
+                turn_end_reason: None,
+            },
+            Message::ToolResults {
+                tool_use_results: vec![reported, unsummarized],
+            },
+        ],
+        None,
+    );
+    let blocks = serde_json::to_value(view::history(session.active_thread())).unwrap();
+    let tools: Vec<_> = blocks
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|block| block["kind"] == "tool")
+        .collect();
+    assert_eq!(tools.len(), 2, "{blocks}");
+    assert_eq!(tools[0]["text"], "actual output");
+    assert_eq!(tools[0]["skills"], "Skills: +a, +b, +c, 2 more, 2 warnings");
+    assert!(tools[1].get("skills").is_none(), "{}", tools[1]);
+    assert!(!blocks.to_string().contains("Skill catalog changes"));
+}
+
+#[test]
 fn prelude_notices_stay_hidden_in_user_messages_and_tool_results() {
     let text = |text: &str| Content::Text { text: text.into() };
     let notices = vec![
@@ -1652,9 +1707,16 @@ impl myco::generative_model::GenerativeModel for UnusedModel {
 }
 
 async fn settlement_boot(app: &Arc<App>) -> Boot {
+    history_boot(app, vec![]).await
+}
+
+async fn history_boot(app: &Arc<App>, history: Vec<Message>) -> Boot {
     let config = test_config();
     let mut saved = Session::new("test");
     saved.id = app.snapshot().session_id;
+    if !history.is_empty() {
+        saved.replace_context(history, None);
+    }
     let session = ActiveSession::new(saved);
     let harness = myco::Harness::local_with_services(vec![]);
     let runtime = myco::SessionRuntime::new(harness.clone(), session.clone());
@@ -1670,6 +1732,63 @@ async fn settlement_boot(app: &Arc<App>) -> Boot {
             .await
             .unwrap(),
     }
+}
+
+#[tokio::test]
+async fn a_rebuilt_history_relays_only_its_changed_tail_on_the_same_thread() {
+    let (app, _work) = app();
+    let text = |text: String| vec![Content::Text { text }];
+    let boot = history_boot(
+        &app,
+        vec![
+            Message::UserMessage {
+                content: text("saved request".into()),
+            },
+            Message::AssistantMessage {
+                content: text("long answer ".repeat(10_000)),
+                tool_uses: vec![],
+                turn_end_reason: None,
+            },
+        ],
+    )
+    .await;
+    let mut events = app.events.subscribe();
+    let mut relayed = || -> String {
+        let update = events.try_recv().unwrap();
+        serde_json::to_string(&update.live_update()).unwrap()
+    };
+    app.sync_with(&boot, Status::Ready, |_| {});
+    relayed();
+    let saved_blocks = app.live.lock().unwrap().snapshot.blocks.len();
+    app.notice("shown only until the turn settles");
+    relayed();
+
+    app.sync_with(&boot, Status::Ready, |_| {});
+    let event = relayed();
+    assert!(
+        event.len() < 4096,
+        "the history must not be relayed: {}",
+        event.len()
+    );
+    let change = &serde_json::from_str::<Value>(&event).unwrap()["change"];
+    assert_eq!(change["kind"], "refresh");
+    assert_eq!(change["splice"]["start"], saved_blocks);
+    assert_eq!(change["splice"]["blocks"], json!([]));
+    assert_eq!(change["splice"]["snapshot"]["status"], "Ready");
+
+    // A tail too large to relay, or another thread, is fetched instead.
+    app.live.lock().unwrap().snapshot.blocks.clear();
+    app.sync_with(&boot, Status::Ready, |_| {});
+    assert_eq!(
+        serde_json::from_str::<Value>(&relayed()).unwrap()["change"],
+        json!({"kind":"refresh"})
+    );
+    app.live.lock().unwrap().snapshot.meta.thread_id = "replaced".into();
+    app.sync_with(&boot, Status::Ready, |_| {});
+    assert_eq!(
+        serde_json::from_str::<Value>(&relayed()).unwrap()["change"],
+        json!({"kind":"refresh"})
+    );
 }
 
 #[tokio::test]
@@ -1737,4 +1856,49 @@ async fn receipt_completion_and_next_admission_share_the_settlement_lock() {
             assert!(!work.cancel.is_cancelled());
         }
     }
+}
+
+#[tokio::test]
+async fn a_failed_remote_host_is_published_as_down_once_and_idle_hosts_are_not() {
+    let (app, _work) = app();
+    let harness = myco::Harness::attach(myco::HarnessConfig {
+        attach_timeout_secs: 10,
+        remote_hosts: vec![myco::HostConfig {
+            name: "ghost".into(),
+            command: vec!["/nonexistent/myco-please-fail".into()],
+        }],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let mut events = app.events.subscribe();
+    app.hosts(harness.host_status());
+    assert!(events.try_recv().is_err(), "an idle remote is not down");
+
+    let failed = harness
+        .clone()
+        .dispatch_tool_use(
+            ToolUse {
+                name: "bash".into(),
+                input: json!({"command": "true", "host": "ghost"}),
+                thought_signature: None,
+            },
+            Uuid::new_v4(),
+            CancelToken::new(),
+        )
+        .await;
+    assert!(failed.is_error);
+    app.hosts(harness.host_status());
+    let update = events.try_recv().unwrap();
+    assert_eq!(update.change["kind"], "meta");
+    let down = &update.change["meta"]["down_hosts"];
+    assert_eq!(down.as_array().unwrap().len(), 1, "{down}");
+    assert_eq!(down[0]["name"], "ghost");
+    assert!(!down[0]["error"].as_str().unwrap().is_empty());
+    app.hosts(harness.host_status());
+    assert!(
+        events.try_recv().is_err(),
+        "an unchanged failure is not republished"
+    );
+    assert_eq!(app.snapshot().change["snapshot"]["down_hosts"], *down);
 }

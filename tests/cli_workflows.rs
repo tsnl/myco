@@ -6,7 +6,6 @@ use std::process::{Output, Stdio};
 use std::time::Duration;
 
 use myco::Session;
-use myco::generative_model::{Content, Message};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -570,31 +569,34 @@ async fn startup_skills_are_not_repeated_but_later_changes_are_reported() {
     .unwrap();
     let output = env.run(&["-p", "work"], b"").await;
     assert_eq!(success(&output), "Done.\n");
-    let saved = env.saved(&session_id(&output));
-    let notices: Vec<_> = saved
-        .active_thread()
-        .messages
-        .iter()
-        .filter_map(|message| match message {
-            Message::ToolResults { tool_use_results } => Some(tool_use_results),
-            _ => None,
-        })
-        .flatten()
-        .flat_map(|result| &result.content)
-        .filter_map(|part| match part {
-            Content::System { kind, text, .. } if kind == "host_observation" => Some(text),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(notices.len(), 1, "{notices:?}");
+    // What the model received on each turn.
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    let outputs = |turn: usize| -> Vec<String> {
+        requests[turn].body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .map(|item| item["output"].as_str().unwrap().to_owned())
+            .collect()
+    };
     assert!(
-        notices[0].contains("revised") && !notices[0].contains("listed at startup"),
-        "{notices:?}"
-    );
-    let first = provider.captured().await.body.to_string();
-    assert!(
-        first.contains("listed at startup"),
+        requests[0].body.to_string().contains("listed at startup"),
         "prompt omitted the skill"
+    );
+    let first = outputs(1);
+    assert!(
+        first.len() == 1 && !first[0].contains("Skill catalog changes"),
+        "{first:?}"
+    );
+    let second = outputs(2);
+    assert_eq!(second.len(), 2, "{second:?}");
+    assert!(
+        second[1].contains("Skill catalog changes")
+            && second[1].contains(r#""description":"revised""#)
+            && !second[1].contains("listed at startup"),
+        "{second:?}"
     );
 }
 

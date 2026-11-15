@@ -227,7 +227,9 @@ function blockNode(block) {
     const outcome = toolState(block);
     const details = element('details', `tool ${outcome}`);
     const summary = element('summary');
-    summary.append(element('span', 'tool-name', block.tool.name), element('span', `tool-status ${outcome}`, block.status), toolDuration(block), element('span', 'tool-args', argumentPreview(block.tool.input)));
+    summary.append(element('span', 'tool-name', block.tool.name), element('span', `tool-status ${outcome}`, block.status), toolDuration(block));
+    if (block.skills) summary.append(element('span', 'tool-skills', block.skills));
+    summary.append(element('span', 'tool-args', argumentPreview(block.tool.input)));
     if (block.running && block.background_id) summary.append(backgroundButton(block));
     const body = element('div', 'tool-content');
     body.append(element('span', 'tool-label', 'Input'), toolArguments(block.tool.input));
@@ -354,6 +356,11 @@ function metadata() {
   $('archive').disabled = !connected || !state.session_id || archiving;
   $('archive').textContent = state.archived ? 'Restore' : 'Archive';
   $('archived-status').hidden = !state.archived;
+  const down = state.down_hosts || [];
+  $('hosts-down').hidden = !down.length;
+  $('hosts-down').textContent = down.length === 1 ? `${down[0].name} down` : `${down.length} hosts down`;
+  $('hosts-down').title = down.map(host => `${host.name} failed at ${new Date(host.since).toLocaleTimeString()}: ${host.error}`)
+    .concat(down.length ? ['Tools retry the connection on their next call.'] : []).join('\n');
   $('rename').disabled = !connected || !state.session_id || archiving;
   $('session-title').textContent = state.title || 'Session';
   $('session-title').title = state.title || 'Session';
@@ -422,6 +429,11 @@ function updateSession(update) {
   revision = update.revision;
   const change = update.change;
   if (change.kind === 'snapshot') snapshot(change.snapshot);
+  else if (change.kind === 'refresh') {
+    // A rebuilt history keeps this view's unchanged prefix and rendered nodes.
+    const { start, blocks, snapshot: rest } = change.splice;
+    snapshot({ ...rest, blocks: [...state.blocks.slice(0, start), ...blocks] });
+  }
   else if (change.kind === 'meta') { Object.assign(state, change.meta); metadata(); }
   else if (change.kind === 'block') { replaceBlock(change.index, change.block, state.blocks[change.index]); state.blocks[change.index] = change.block; navigation.refresh(); activity(); }
   else if (change.kind === 'append') {

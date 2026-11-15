@@ -166,13 +166,20 @@ times, and live activity indicators. A pulsing square beside **Running** in the
 session header and browser list means generation or a tool process is running.
 Shells remain **Running** between model turns; you can submit a new message while
 an existing process continues. **Ready**, **Stopped**, and **Saved** are idle;
-**Reconnecting…** means the current state is unknown. Reduced-motion preferences
+**Reconnecting…** means the current state is unknown. An amber **NAME down** chip
+beside the status names a remote host whose last connection attempt failed, or
+whose connection dropped; hover it for the time and error. Its next tool call
+retries, and the chip clears once the host connects. Idle remotes, which connect
+on first use, are not down. Reduced-motion preferences
 disable the pulse. Status changes arrive through the shared event stream; the
 browser also polls for changes made by other server processes.
 
 Hidden tabs defer live transcript rendering to save browser CPU. Generation,
-tools, and timers continue on the server. Returning to a tab loads the current
-transcript and activity state while preserving your unsent draft.
+tools, and timers continue on the server. While the live connection stays up, a
+hidden session tab keeps its own changes in the shared worker, so returning
+applies them without downloading the transcript; it formats only messages that
+streamed meanwhile. A dropped connection, a resynchronization, or a long absence
+loads the current transcript instead. Either way your unsent draft is preserved.
 
 The input border also shows the session's state. **Running** and **Compacting**
 carry a travelling highlight and soft glow using the sky's current light color.
@@ -297,6 +304,10 @@ and in the Activity drawer. Running timers update every 0.1 seconds and survive
 page refreshes; completion, failure, or cancellation freezes the final duration.
 Durations are observed by the running browser server and retained while viewing
 the same thread. Saved history opened after a server restart has no timing data.
+
+When a host reports skill changes with a tool result, the header also shows a
+short label such as `Skills: +review, -old, 1 warning`, listing up to three names.
+The notice itself is model context and stays out of the transcript.
 
 **Activity** opens a right-hand drawer containing all running tools in one list.
 Scheduled follow-ups appear in a separate **Timers** section with their own
@@ -577,7 +588,9 @@ fails, the input draft remains available. Tabs share a live-output connection
 through a browser SharedWorker so a tab group does not exhaust HTTP connections.
 Only tabs viewing a session fetch its full history. Live events carry deltas and
 small refresh notices; a slow connection resynchronizes subscribed views without
-replaying every running session's history. Activity bursts coalesce into a session
+replaying every running session's history. When a turn settles on the same thread,
+its refresh notice carries the rebuilt history's changed tail (up to 64 KiB), so
+open views update in place instead of downloading the whole transcript. Activity bursts coalesce into a session
 list refresh, and each session view allows one snapshot request at a time.
 Reload open tabs after upgrading the server to use the updated browser worker.
 
