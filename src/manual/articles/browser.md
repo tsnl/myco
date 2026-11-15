@@ -166,7 +166,11 @@ times, and live activity indicators. A pulsing square beside **Running** in the
 session header and browser list means generation or a tool process is running.
 Shells remain **Running** between model turns; you can submit a new message while
 an existing process continues. **Ready**, **Stopped**, and **Saved** are idle;
-**Reconnecting…** means the current state is unknown. Reduced-motion preferences
+**Reconnecting…** means the current state is unknown. An amber **NAME down** chip
+beside the status names a remote host whose last connection attempt failed, or
+whose connection dropped; hover it for the time and error. Its next tool call
+retries, and the chip clears once the host connects. Idle remotes, which connect
+on first use, are not down. Reduced-motion preferences
 disable the pulse. Status changes arrive through the shared event stream; the
 browser also polls for changes made by other server processes.
 

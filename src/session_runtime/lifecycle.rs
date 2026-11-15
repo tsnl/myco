@@ -151,9 +151,10 @@ mod tests {
                 .iter()
                 .find(|host| host.name == "offline")
                 .unwrap()
-                .error
+                .failure
                 .as_ref()
                 .unwrap()
+                .to_string()
                 .contains("10s ago")
         );
     }

@@ -160,6 +160,7 @@ fn app_for(id: &str, events: broadcast::Sender<Arc<Update>>) -> (Arc<App>, mpsc:
                 queued: VecDeque::new(),
                 timers: vec![],
                 inbox: vec![],
+                down_hosts: vec![],
                 blocks: vec![],
             },
             cancel: None,
@@ -1801,4 +1802,49 @@ async fn receipt_completion_and_next_admission_share_the_settlement_lock() {
             assert!(!work.cancel.is_cancelled());
         }
     }
+}
+
+#[tokio::test]
+async fn a_failed_remote_host_is_published_as_down_once_and_idle_hosts_are_not() {
+    let (app, _work) = app();
+    let harness = myco::Harness::attach(myco::HarnessConfig {
+        attach_timeout_secs: 10,
+        remote_hosts: vec![myco::HostConfig {
+            name: "ghost".into(),
+            command: vec!["/nonexistent/myco-please-fail".into()],
+        }],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let mut events = app.events.subscribe();
+    app.hosts(harness.host_status());
+    assert!(events.try_recv().is_err(), "an idle remote is not down");
+
+    let failed = harness
+        .clone()
+        .dispatch_tool_use(
+            ToolUse {
+                name: "bash".into(),
+                input: json!({"command": "true", "host": "ghost"}),
+                thought_signature: None,
+            },
+            Uuid::new_v4(),
+            CancelToken::new(),
+        )
+        .await;
+    assert!(failed.is_error);
+    app.hosts(harness.host_status());
+    let update = events.try_recv().unwrap();
+    assert_eq!(update.change["kind"], "meta");
+    let down = &update.change["meta"]["down_hosts"];
+    assert_eq!(down.as_array().unwrap().len(), 1, "{down}");
+    assert_eq!(down[0]["name"], "ghost");
+    assert!(!down[0]["error"].as_str().unwrap().is_empty());
+    app.hosts(harness.host_status());
+    assert!(
+        events.try_recv().is_err(),
+        "an unchanged failure is not republished"
+    );
+    assert_eq!(app.snapshot().change["snapshot"]["down_hosts"], *down);
 }

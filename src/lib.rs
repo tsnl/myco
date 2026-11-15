@@ -44,8 +44,8 @@ pub use chat::{
 pub use config::{Config, ConfigUserSettings, load_file_config};
 pub use core::{CancelToken, HostResources, ModelInfo, ToolResource, uuid_simple_hex};
 pub use harness::{
-    ExecutableCheckReport, Harness, HarnessConfig, HostConfig, HostController, HostStatus,
-    SshAgentPreflightReport, StartupPreflight, default_ssh_config_path,
+    ExecutableCheckReport, Harness, HarnessConfig, HostConfig, HostController, HostFailure,
+    HostStatus, SshAgentPreflightReport, StartupPreflight, default_ssh_config_path,
     ensure_remote_ssh_identities, load_ssh_host_aliases, ssh_config_host_aliases,
 };
 pub use host::HostWorker;
