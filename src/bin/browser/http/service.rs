@@ -9,7 +9,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use super::{Error, Server, blocking};
-use crate::service_protocol::{Identity, Output, Submit};
+use crate::service_protocol::{Identity, Output, Submit, is_full_session_id};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -23,7 +23,7 @@ fn validate(server: &Server, id: &str, instance: Uuid) -> Result<(), Error> {
     if instance != server.identity.instance {
         return Err(Error::Conflict("The service instance changed. The previous request's outcome is unknown; inspect the saved session before submitting new work. No request was replayed.".into()));
     }
-    if Uuid::parse_str(id).is_err() || id.len() != 32 || id.to_ascii_lowercase() != id {
+    if !is_full_session_id(id) {
         return Err(Error::Invalid(
             "Service requests require the full 32-character session id.".into(),
         ));
